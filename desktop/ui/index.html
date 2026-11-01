@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Telegram File Explorer</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/vendor/videojs/video-js.min.css">
+  <link rel="stylesheet" href="/static/vendor/viewerjs/viewer.min.css">
+  <link rel="stylesheet" href="/static/vendor/overlayscrollbars/overlayscrollbars.min.css">
+  <link rel="stylesheet" href="/static/styles.css?v=22">
+</head>
+<body>
+  <div class="app">
+    <header class="titlebar">
+      <div class="brand">
+        <button class="app-quit" id="quitBtn" type="button" title="Quit Telegram File Explorer" aria-label="Quit Telegram File Explorer"></button>
+        <span class="brand-logo" id="brandLogo" aria-hidden="true"></span>
+        <span class="brand-name">Telegram File Explorer</span>
+        <div class="vault-wrap" id="vaultWrap" hidden>
+          <button class="vault-chip" id="vaultChip" type="button" aria-haspopup="menu" aria-expanded="false" title="Switch storage vault">
+            <span class="vault-chip-icon" id="vaultChipIcon" aria-hidden="true"></span>
+            <span class="vault-chip-text" id="vaultChipText"></span>
+            <span class="vault-chip-caret" id="vaultChipCaret" aria-hidden="true"></span>
+          </button>
+          <div class="vault-menu" id="vaultMenu" role="menu" aria-label="Storage vaults" hidden>
+            <div class="vault-menu-head">
+              <span>Storage vaults</span>
+              <button class="icon-btn small" id="vaultRefreshBtn" type="button" title="Scan Telegram for vaults" aria-label="Scan Telegram for vaults"></button>
+            </div>
+            <div class="vault-list" id="vaultList"></div>
+            <div class="vault-menu-note" id="vaultMenuNote" hidden></div>
+            <div class="vault-menu-foot">
+              <button class="vault-new" id="vaultBotBtn" type="button" title="Add the storage bot as an admin of this vault">
+                <span class="vault-new-icon" id="vaultBotIcon" aria-hidden="true"></span>
+                <span>Add storage bot</span>
+              </button>
+              <button class="vault-new" id="vaultNewBtn" type="button">
+                <span class="vault-new-icon" id="vaultNewIcon" aria-hidden="true"></span>
+                <span>New vault…</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="titlebar-center">
+        <span class="conn-dot" id="connDot"></span>
+        <span class="conn-text" id="connText">Connecting…</span>
+        <button class="server-chip" id="serverChip" type="button" hidden title="Storage bot on your server">
+          <span class="server-dot" id="serverDot"></span>
+          <span class="server-text" id="serverText">Checking server…</span>
+        </button>
+      </div>
+      <div class="titlebar-actions">
+        <button class="icon-btn" id="lockBtn" title="Lock the app" aria-label="Lock the app" hidden></button>
+        <button class="icon-btn" id="cacheBtn" title="Clear temporary files" aria-label="Clear temporary files" disabled></button>
+        <button class="icon-btn" id="syncBtn" title="Sync with Telegram" aria-label="Sync with Telegram" disabled></button>
+        <div class="upload-split">
+          <button class="btn primary upload-main" id="uploadBtn" disabled>
+            <span class="btn-icon" id="uploadIcon" aria-hidden="true"></span>
+            <span>Upload</span>
+          </button>
+          <button class="btn primary upload-caret" id="uploadCaret" title="More upload options" aria-label="More upload options" disabled>▾</button>
+          <div class="upload-menu" id="uploadMenu" hidden>
+            <button type="button" id="uploadFilesOption"><span class="menu-icon" id="uploadFilesIcon"></span>Upload files…</button>
+            <button type="button" id="uploadFolderOption"><span class="menu-icon" id="uploadFolderIcon"></span>Upload folder…</button>
+          </div>
+        </div>
+        <button class="icon-btn" id="moreBtn" title="Settings and help" aria-label="Settings and help"></button>
+      </div>
+    </header>
+
+    <div class="shell">
+      <aside class="sidebar">
+        <nav class="nav" id="nav" aria-label="Library">
+          <button class="nav-item active" data-nav="all">
+            <span class="nav-icon" data-icon="home"></span>
+            <span class="nav-label">All files</span>
+            <span class="nav-count" id="countAll"></span>
+          </button>
+          <button class="nav-item" data-nav="recent">
+            <span class="nav-icon" data-icon="clock"></span>
+            <span class="nav-label">Recent</span>
+          </button>
+          <button class="nav-item" data-nav="continue">
+            <span class="nav-icon" data-icon="play"></span>
+            <span class="nav-label">Continue</span>
+            <span class="nav-count" id="countPlaying"></span>
+          </button>
+          <button class="nav-item" data-nav="favorites">
+            <span class="nav-icon" data-icon="star"></span>
+            <span class="nav-label">Favorites</span>
+            <span class="nav-count" id="countFav"></span>
+          </button>
+          <button class="nav-item" data-nav="stars">
+            <span class="nav-icon" data-icon="user"></span>
+            <span class="nav-label">Stars</span>
+            <span class="nav-count" id="countStars"></span>
+          </button>
+          <button class="nav-item" data-nav="hidden">
+            <span class="nav-icon" data-icon="eyeOff"></span>
+            <span class="nav-label">Hidden</span>
+            <span class="nav-count" id="countHidden"></span>
+          </button>
+        </nav>
+
+        <div class="side-heading">
+          <span>Folders</span>
+          <span class="side-heading-actions">
+            <button class="mini-btn" id="foldToggleBtn" title="Collapse all folders" hidden></button>
+            <button class="mini-btn" id="newFolderBtn" title="New folder">+</button>
+          </span>
+        </div>
+        <div class="side-list" id="folderList"></div>
+
+        <div class="side-heading">
+          <span>Collections</span>
+          <button class="mini-btn" id="newCollectionBtn" title="New collection">+</button>
+        </div>
+        <div class="side-list" id="collectionList"></div>
+
+        <div class="side-heading">
+          <span>Saved views</span>
+          <button class="mini-btn" id="saveViewBtn" title="Save the current filters as a view">+</button>
+        </div>
+        <div class="side-list" id="viewList"></div>
+
+        <div class="side-heading">
+          <span>Tags</span>
+          <span class="side-heading-actions">
+            <button class="mini-btn" id="tagMetaBtn" title="Tag colours and groups">⋯</button>
+            <button class="mini-btn" id="clearTagBtn" title="Clear tag filter" hidden>×</button>
+          </span>
+        </div>
+        <div class="tag-cloud" id="tagList"></div>
+
+        <div class="side-storage">
+          <div class="storage-row"><span id="storageCount">0 files</span><span id="storageSize"></span></div>
+          <div class="storage-bar"><i id="storageBar"></i></div>
+          <div class="storage-note">Stored in Telegram's cloud</div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="toolbar">
+          <div class="nav-btns">
+            <button class="icon-btn" id="backBtn" title="Back (Alt+Left)" aria-label="Back" disabled></button>
+            <button class="icon-btn" id="forwardBtn" title="Forward (Alt+Right)" aria-label="Forward" disabled></button>
+            <button class="icon-btn" id="upBtn" title="Up one level" aria-label="Up" disabled></button>
+          </div>
+          <div class="breadcrumb" id="breadcrumb"></div>
+          <div class="toolbar-spacer"></div>
+          <div class="toolbar-tools">
+            <label class="searchbox">
+              <span class="search-icon" aria-hidden="true"></span>
+              <input id="searchInput" type="search" placeholder="Search files and stars" autocomplete="off" spellcheck="false">
+              <kbd>Ctrl F</kbd>
+            </label>
+            <select class="select" id="kindSelect" title="Filter by type" aria-label="Filter by type">
+              <option value="">All types</option>
+            </select>
+            <button class="icon-btn filter-btn" id="filterBtn" title="Advanced filters" aria-label="Advanced filters">
+              <span class="icon-slot" id="filterIcon"></span>
+              <span class="filter-badge" id="filterBadge" hidden></span>
+            </button>
+            <select class="select" id="sortSelect" title="Sort by" aria-label="Sort by">
+              <option value="date">Date modified</option>
+              <option value="name">Name</option>
+              <option value="size">Size</option>
+              <option value="kind">Type</option>
+              <option value="folder">Folder</option>
+              <option value="star">Star</option>
+              <option value="added">Date added</option>
+            </select>
+            <button class="icon-btn" id="sortDirBtn" title="Descending" aria-label="Toggle sort direction"></button>
+            <div class="view-toggle" role="group" aria-label="View">
+              <button class="active" data-view="details" title="Details view"></button>
+              <button data-view="tiles" title="Large icons"></button>
+            </div>
+          </div>
+        </div>
+
+        <div class="content" id="content">
+          <div class="drop-overlay" id="dropOverlay">
+            <div class="drop-card">
+              <span class="drop-icon"></span>
+              <strong>Drop to upload</strong>
+              <span id="dropTarget">All files</span>
+            </div>
+          </div>
+
+          <div class="star-catalogue" id="starCatalogue" hidden>
+            <div class="star-cat-head">
+              <div>
+                <h2>Stars</h2>
+                <p>Performer pages with a portrait, details and every file they appear in.</p>
+              </div>
+              <button class="btn primary" id="starNewBtn" type="button">New star</button>
+            </div>
+            <div class="star-grid" id="starGrid"></div>
+            <div class="star-empty" id="starEmpty" hidden>
+              <strong id="starEmptyTitle">No stars yet</strong>
+              <p id="starEmptyText">Create a star, then assign files from a file's Stars menu.</p>
+            </div>
+          </div>
+
+          <div class="star-banner" id="starBanner" hidden></div>
+
+          <div class="details" id="detailsView">
+            <div class="details-header" id="detailsHeader">
+              <button class="col col-name" data-sort="name">Name<span class="sort-arrow"></span></button>
+              <button class="col col-type" data-sort="kind">Type<span class="sort-arrow"></span></button>
+              <button class="col col-size" data-sort="size">Size<span class="sort-arrow"></span></button>
+              <button class="col col-date" data-sort="date">Modified<span class="sort-arrow"></span></button>
+              <button class="col col-folder" data-sort="folder">Folder<span class="sort-arrow"></span></button>
+            </div>
+            <div class="rows" id="rows"></div>
+          </div>
+
+          <div class="tiles" id="tilesView" hidden></div>
+
+          <div class="empty" id="emptyView" hidden>
+            <div class="empty-icon"></div>
+            <h2 id="emptyTitle">No files here yet</h2>
+            <p id="emptyText">Sync with Telegram to bring your files into this window.</p>
+            <div class="empty-actions">
+              <button class="btn primary" id="emptySyncBtn">Sync now</button>
+              <button class="btn" id="emptyUploadBtn">Upload a file</button>
+              <button class="btn" id="emptyFolderBtn">Upload a folder</button>
+            </div>
+          </div>
+
+          <div class="loading" id="loadingView" hidden>
+            <div class="spinner"></div>
+            <span>Loading library…</span>
+          </div>
+
+          <div class="load-more" id="loadMoreWrap" hidden>
+            <button class="btn" id="loadMoreBtn">Load more</button>
+            <span id="loadMoreText"></span>
+          </div>
+        </div>
+
+        <div class="bulkbar" id="bulkBar" hidden>
+          <span class="bulk-count" id="bulkCount">0 selected</span>
+          <span class="bulk-size" id="bulkSize"></span>
+          <span class="bulk-spacer"></span>
+          <button class="btn" id="bulkDownload" title="Download the selected files as one ZIP">Download</button>
+          <button class="btn" id="bulkFavorite" title="Add the selected files to favorites">Favorite</button>
+          <button class="btn" id="bulkStars" title="Assign the selected files to stars">Stars</button>
+          <button class="btn" id="bulkCollections" title="Add the selected files to a collection">Collection</button>
+          <button class="btn" id="bulkRename" title="Rename the selected files from a template">Rename</button>
+          <button class="btn" id="bulkMove" title="Move the selected files to a folder">Move</button>
+          <button class="btn" id="bulkLinks" title="Copy the Telegram links of the selected files">Copy links</button>
+          <button class="btn danger" id="bulkDelete" title="Delete the selected files">Delete</button>
+          <button class="icon-btn" id="bulkClear" title="Clear selection (Esc)" aria-label="Clear selection">×</button>
+        </div>
+
+        <footer class="statusbar">
+          <span id="countText">0 items</span>
+          <span id="sizeText"></span>
+          <span class="status-spacer"></span>
+          <span id="statusText" class="status-text"></span>
+          <span id="syncStatus" class="sync-status" hidden>
+            <span class="sync-track"><i id="syncBar"></i></span>
+            <span id="syncLabel"></span>
+          </span>
+        </footer>
+
+        <section class="uploads" id="uploadPanel" hidden aria-label="Uploads">
+          <div class="uploads-head">
+            <span>Uploads</span>
+            <button class="icon-btn small" id="uploadsClose" title="Hide uploads" aria-label="Hide uploads"></button>
+          </div>
+          <div class="upload-list" id="uploadList"></div>
+        </section>
+      </main>
+
+      <aside class="preview" id="previewPane">
+        <button class="preview-head" id="previewToggle" type="button" title="Hide details" aria-label="Hide details" aria-expanded="true">
+          <span class="preview-head-title">Details</span>
+          <span class="preview-head-icon" id="previewToggleIcon"></span>
+        </button>
+        <div class="preview-scroll" id="previewScroll">
+          <div class="preview-empty" id="previewEmpty">
+            <span class="preview-empty-icon"></span>
+            <p>Select a file to see details and a preview.</p>
+            <small>Space or double-click opens the player.</small>
+          </div>
+          <div class="preview-body" id="previewBody" hidden>
+            <div class="preview-media" id="previewMedia"></div>
+            <div class="preview-info">
+              <h3 id="previewName"></h3>
+              <div class="preview-kind" id="previewKind"></div>
+              <div class="preview-movie" id="previewMovie" hidden></div>
+              <dl id="previewMeta"></dl>
+              <div class="preview-tags" id="previewTags"></div>
+              <div class="preview-stars" id="previewStars"></div>
+              <div class="preview-inspect" id="previewInspect" hidden>
+                <div class="preview-note-head">
+                  <span>File details</span>
+                  <button class="link-btn" id="inspectBtn" type="button">Read again</button>
+                </div>
+                <dl id="previewInspectFields"></dl>
+                <p class="preview-inspect-note" id="previewInspectNote" hidden></p>
+              </div>
+              <div class="preview-revisions" id="previewRevisions" hidden>
+                <div class="preview-note-head"><span>Other revisions</span></div>
+                <div class="revision-list" id="revisionList"></div>
+              </div>
+              <div class="preview-actions" id="fileActions">
+                <button class="btn primary" id="openBtn">Open</button>
+                <button class="btn" id="modelBtn" hidden title="Open this model in the built-in 3D viewer">View 3D</button>
+                <button class="btn" id="cadBtn" hidden title="Open this CAD file in its Windows app">Open in app</button>
+                <button class="btn" id="downloadBtn">Download</button>
+                <button class="btn" id="thumbBtn" hidden title="Pick the thumbnail shown in the library">Thumbnail</button>
+                <button class="btn" id="movieBtn" hidden title="Look up this file on IMDb">IMDb</button>
+                <button class="btn" id="completeBtn" hidden title="Download every part and join them into the original file">Download complete file</button>
+                <button class="btn" id="favoriteBtn">Favorite</button>
+                <button class="btn" id="restoreBtn" hidden>Restore</button>
+                <a class="btn" id="tgLink" target="_blank" rel="noopener noreferrer" hidden>Open in Telegram</a>
+              </div>
+              <div class="preview-actions" id="folderActions" hidden>
+                <button class="btn primary" id="folderOpenBtn">Open</button>
+                <button class="btn" id="folderZipBtn">Download ZIP</button>
+                <button class="btn" id="folderPropsBtn">Properties</button>
+              </div>
+              <div class="preview-more" id="fileMore">
+                <button class="link-btn" id="renameBtn">Rename</button>
+                <span>·</span>
+                <button class="link-btn" id="moveBtn">Move</button>
+                <span>·</span>
+                <button class="link-btn" id="tagsBtn">Tags</button>
+                <span>·</span>
+                <button class="link-btn" id="starsBtn">Stars</button>
+                <span>·</span>
+                <button class="link-btn" id="collectionsBtn">Collections</button>
+                <span>·</span>
+                <button class="link-btn" id="inspectLink">File details</button>
+                <span>·</span>
+                <button class="link-btn danger" id="deleteBtn">Delete</button>
+              </div>
+              <div class="preview-more" id="folderMore" hidden>
+                <button class="link-btn" id="folderNewBtn">New subfolder</button>
+                <span>·</span>
+                <button class="link-btn" id="folderPropsLink">Icon &amp; note</button>
+                <span>·</span>
+                <button class="link-btn" id="folderRenameBtn">Rename</button>
+                <span>·</span>
+                <button class="link-btn danger" id="folderDeleteBtn">Delete</button>
+              </div>
+              <div class="preview-note" id="previewNote" hidden>
+                <div class="preview-note-head">
+                  <span>Note</span>
+                  <button class="link-btn" id="noteBtn" type="button">Edit</button>
+                </div>
+                <p id="previewNoteText"></p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </aside>
+    </div>
+  </div>
+
+  <div class="overlay viewer" id="viewerOverlay" hidden>
+    <div class="viewer-bar">
+      <div class="viewer-nav">
+        <button class="icon-btn" id="viewerPrev" type="button" title="Previous (P)" aria-label="Previous"></button>
+        <span class="viewer-counter" id="viewerCounter"></span>
+        <button class="icon-btn" id="viewerNext" type="button" title="Next (N)" aria-label="Next"></button>
+      </div>
+      <div class="viewer-name" id="viewerTitle"></div>
+      <div class="viewer-actions">
+        <button class="viewer-chip" id="viewerPreviews" type="button" hidden title="Build seek preview thumbnails with ffmpeg">Seek previews</button>
+        <button class="icon-btn" id="viewerMpv" type="button" title="Open in mpv" aria-label="Open in mpv" hidden></button>
+        <a class="icon-btn" id="viewerDownload" title="Download" download>↓</a>
+        <button class="icon-btn" id="viewerClose" title="Close (Esc)" aria-label="Close">×</button>
+      </div>
+    </div>
+    <div class="viewer-stage" id="viewerStage"></div>
+    <button class="viewer-close-float" id="viewerCloseFloat" type="button" title="Close (Esc)" aria-label="Close preview">×</button>
+  </div>
+
+  <div class="overlay lock" id="lockOverlay" hidden>
+    <div class="lock-card" id="lockCard">
+      <div class="lock-logo" id="lockLogo"></div>
+      <h2 id="lockTitle">Enter your PIN</h2>
+      <p class="lock-sub" id="lockSub">Telegram File Explorer is locked</p>
+      <div class="lock-dots" id="lockDots">
+        <span></span><span></span><span></span><span></span>
+      </div>
+      <div class="lock-error" id="lockError" hidden></div>
+      <div class="lock-pad" id="lockPad"></div>
+      <button class="lock-vault" id="lockVaultBtn" type="button" title="Choose the storage vault to open">
+        <span class="lock-vault-icon" data-icon="archive" aria-hidden="true"></span>
+        <span class="lock-vault-label">
+          <span class="lock-vault-kicker">Storage vault</span>
+          <span class="lock-vault-name" id="lockVaultName">—</span>
+        </span>
+        <span class="lock-vault-caret" data-icon="chevron" aria-hidden="true"></span>
+      </button>
+      <p class="lock-vault-note" id="lockVaultNote" hidden></p>
+      <div class="lock-vaults" id="lockVaults" hidden>
+        <div class="lock-vault-list" id="lockVaultList"></div>
+        <button class="lock-link" id="lockVaultBack" type="button">Back to PIN</button>
+      </div>
+      <button class="lock-link" id="lockForgot" type="button">Forgot PIN?</button>
+      <div class="lock-recover" id="lockRecover" hidden>
+        <h3>Reset PIN with Telegram</h3>
+        <p class="lock-sub">A 6-digit code is sent to Saved Messages in your Telegram account. It works on this PC only and expires in 10 minutes.</p>
+        <div class="lock-error" id="recoverError" hidden></div>
+        <button class="btn wide" id="recoverSend" type="button">Send code to Telegram</button>
+        <p class="lock-sub" id="recoverStatus" hidden></p>
+        <div class="lock-recover-form" id="recoverForm" hidden>
+          <label class="lock-field"><span>Recovery code</span>
+            <input id="recoverCode" type="text" inputmode="numeric" maxlength="6" autocomplete="one-time-code" placeholder="6 digits">
+          </label>
+          <label class="lock-field"><span>New PIN</span>
+            <input id="recoverPin" type="password" inputmode="numeric" maxlength="4" autocomplete="new-password" placeholder="4 digits">
+          </label>
+          <label class="lock-field"><span>Repeat new PIN</span>
+            <input id="recoverPin2" type="password" inputmode="numeric" maxlength="4" autocomplete="new-password" placeholder="Repeat">
+          </label>
+          <button class="btn primary wide" id="recoverApply" type="button">Set new PIN</button>
+        </div>
+        <button class="lock-link" id="lockBack" type="button">Back to PIN</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="overlay login" id="loginOverlay" hidden>
+    <div class="login-shell">
+      <section class="login-art">
+        <div class="login-logo" id="loginLogo"></div>
+        <h1>Your Telegram files,<br>in a real file explorer.</h1>
+        <p class="login-lead">One window for the files you keep in your private Telegram channel — no downloads to sort through, no bot to type at.</p>
+        <ul class="login-points">
+          <li><span data-icon="play"></span>Play videos and audio instantly</li>
+          <li><span data-icon="upload"></span>Upload large files up to Telegram's limit</li>
+          <li><span data-icon="search"></span>Search, sort, folders, tags, rename</li>
+          <li><span data-icon="lock"></span>Only this PC can open the app</li>
+        </ul>
+        <div class="login-art-foot">Files remain in Telegram. The index stays on this PC.</div>
+      </section>
+      <section class="login-card">
+        <div class="login-steps" id="loginSteps"></div>
+        <div class="login-content" id="loginContent"></div>
+        <div class="login-error" id="loginError" hidden></div>
+        <div class="login-foot" id="loginFoot">Your Telegram login stays on this computer.</div>
+      </section>
+    </div>
+  </div>
+
+  <div class="modal-root" id="modalRoot" hidden>
+    <div class="modal-backdrop" id="modalBackdrop"></div>
+    <div class="modal" role="dialog" aria-modal="true" id="modalBox">
+      <div class="modal-head">
+        <div>
+          <h2 id="modalTitle"></h2>
+          <p id="modalSubtitle" hidden></p>
+        </div>
+        <button class="icon-btn" id="modalClose" aria-label="Close">×</button>
+      </div>
+      <div class="modal-body" id="modalBody"></div>
+      <div class="modal-actions" id="modalActions"></div>
+    </div>
+  </div>
+
+  <div class="context-menu" id="contextMenu" hidden></div>
+  <div class="toasts" id="toastRoot" aria-live="polite"></div>
+  <input type="file" id="fileInput" multiple hidden>
+  <input type="file" id="folderInput" webkitdirectory directory multiple hidden>
+
+  <script src="/static/vendor/videojs/video.min.js"></script>
+  <script src="/static/vendor/sprite-thumbnails/videojs-sprite-thumbnails.min.js"></script>
+  <script src="/static/vendor/viewerjs/viewer.min.js"></script>
+  <script src="/static/vendor/three/three.min.js"></script>
+  <script src="/static/vendor/three/libs/fflate.min.js"></script>
+  <script src="/static/vendor/three/loaders/STLLoader.js"></script>
+  <script src="/static/vendor/three/loaders/OBJLoader.js"></script>
+  <script src="/static/vendor/three/loaders/PLYLoader.js"></script>
+  <script src="/static/vendor/three/loaders/3MFLoader.js"></script>
+  <script src="/static/vendor/three/controls/OrbitControls.js"></script>
+  <script src="/static/vendor/overlayscrollbars/overlayscrollbars.browser.es6.min.js"></script>
+  <script src="/static/viewer3d.js?v=2"></script>
+  <script src="/static/app.js?v=22"></script>
+</body>
+</html>

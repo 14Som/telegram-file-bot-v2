@@ -1,0 +1,10 @@
+# Telegram File Explorer desktop app (uses the project .venv)
+fastapi==0.146.0
+uvicorn==0.54.0
+python-multipart==0.0.32
+telethon==1.45.0
+cryptg==0.6.0
+segno==1.6.6
+pywebview==6.2.1
+Pillow==13.0.0
+olefile==0.47
