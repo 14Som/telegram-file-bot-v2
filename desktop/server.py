@@ -15,7 +15,9 @@ import struct
 import sys
 import threading
 import time
+import urllib.parse
 import uuid
+import webbrowser
 import zlib
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -80,6 +82,7 @@ LOCK_OPEN_PATHS = {
     "/api/pin/recover",
     "/api/pin/reset",
     "/api/quit",
+    "/api/logout",
 }
 # Files above Telegram's per-file cap are split into volumes; this is the
 # largest source file the app will accept and split.
@@ -97,8 +100,8 @@ def _upload_semaphore() -> asyncio.Semaphore:
     return _upload_gate
 CSP = (
     "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; "
-    "font-src 'self' data:; "
-    "style-src 'self' 'unsafe-inline'; "
+    "font-src 'self' data: blob:; "
+    "style-src 'self' 'unsafe-inline' blob:; "
     "script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; "
     "connect-src 'self' blob:; "
     "frame-src 'self' blob:; object-src 'none'; base-uri 'none'; "
@@ -166,6 +169,10 @@ class PinBody(BaseModel):
 class PinResetBody(BaseModel):
     code: str = ""
     pin: str = ""
+
+
+class OpenUrlBody(BaseModel):
+    url: str = ""
 
 
 class ItemPatch(BaseModel):
@@ -1555,7 +1562,30 @@ async def login_password(body: PasswordBody, request: Request):
 @app.post("/api/logout")
 async def logout(request: Request):
     state = _state(request)
-    return await state.service.logout()
+    service = state.service
+    if service.sync_state.get("running"):
+        raise TGError("Wait for the current sync to finish before signing out.")
+    info = service.status()
+    if info.get("authorized") and info.get("vault"):
+        try:
+            # Same vault snapshot the app writes on close: sign-out must not
+            # lose names, folders, tags, covers or settings.
+            await asyncio.wait_for(vaultstore.save(service), timeout=120.0)
+        except Exception as exc:
+            log.exception("Vault snapshot before sign-out failed")
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "The library snapshot could not be saved to your vault, so "
+                    "sign-out was cancelled. Check the connection and try again."
+                ),
+            ) from exc
+    payload = await service.logout()
+    # The sign-in screen must be reachable without the PIN; the PIN itself
+    # stays set and locks the app again on the next launch.
+    state.locked = False
+    payload["locked"] = False
+    return payload
 
 
 @app.post("/api/reconnect")
@@ -2270,6 +2300,35 @@ async def set_thumb_image(item_id: int, body: ThumbImageBody, request: Request):
     public = public_item(updated or item, _vault(state.service.status()))
     await _attach_stars(state, [public])
     return {"item": public, "ok": True}
+
+
+@app.get("/api/reader/state")
+async def get_reader_state():
+    return {"state": appconfig.load_reader_state()}
+
+
+@app.put("/api/reader/state/{item_id}")
+async def put_reader_state(item_id: int, body: Dict[str, Any]):
+    record = body.get("record") if isinstance(body.get("record"), dict) else body
+    if not isinstance(record, dict):
+        raise TGError("Reader state must be an object.")
+    if len(json.dumps(record)) > 200_000:
+        raise TGError("Reader state is too large.")
+    state = await run_in_threadpool(appconfig.save_reader_entry, item_id, record)
+    return {"saved": True, "count": len(state)}
+
+
+@app.post("/api/reader/open-url")
+async def open_reader_url(body: OpenUrlBody):
+    url = (body.url or "").strip()
+    parts = urllib.parse.urlsplit(url)
+    if len(url) > 2048 or parts.scheme.lower() not in {"http", "https"} or not parts.netloc:
+        raise TGError("Only http and https links can be opened.")
+    if os.name == "nt":
+        await run_in_threadpool(os.startfile, url)
+    else:
+        await run_in_threadpool(webbrowser.open, url)
+    return {"opened": True}
 
 
 @app.post("/api/items/{item_id}/open-external")

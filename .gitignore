@@ -8,3 +8,4 @@ build/
 *.session
 TelegramFileBot.exe
 installer/__pycache__/
+dist/

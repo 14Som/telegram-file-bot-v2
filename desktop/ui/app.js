@@ -1277,6 +1277,7 @@ function restoreLockView() {
   $("lockDots").hidden = false;
   $("lockPad").hidden = false;
   $("lockForgot").hidden = false;
+  $("lockLogout").hidden = !(S.status && S.status.authorized);
   $("lockError").hidden = true;
   $("lockRecover").hidden = true;
   $("lockVaults").hidden = true;
@@ -1314,6 +1315,7 @@ function backToPin() {
   $("lockDots").hidden = false;
   $("lockPad").hidden = false;
   $("lockForgot").hidden = false;
+  $("lockLogout").hidden = !(S.status && S.status.authorized);
   $("lockVaultBtn").hidden = false;
   $("lockError").hidden = true;
   $("lockRecover").hidden = true;
@@ -1397,6 +1399,7 @@ async function showLockVaults() {
   $("lockDots").hidden = true;
   $("lockPad").hidden = true;
   $("lockForgot").hidden = true;
+  $("lockLogout").hidden = true;
   $("lockVaultBtn").hidden = true;
   $("lockVaultNote").hidden = true;
   $("lockError").hidden = true;
@@ -1420,6 +1423,7 @@ function showRecovery() {
   $("lockDots").hidden = true;
   $("lockPad").hidden = true;
   $("lockForgot").hidden = true;
+  $("lockLogout").hidden = true;
   $("lockVaultBtn").hidden = true;
   $("lockVaultNote").hidden = true;
   $("lockVaults").hidden = true;
@@ -2686,9 +2690,8 @@ function updateBreadcrumb() {
   }
   if (S.folder) {
     const parts = S.folder.split("/");
-    let path = "";
     parts.forEach((part, index) => {
-      path = path ? `${path}/${part}` : part;
+      const path = parts.slice(0, index + 1).join("/");
       nodes.push(h("span", { class: "sep", text: "›" }));
       const last = index === parts.length - 1 && !S.tag;
       if (last) {
@@ -2937,7 +2940,7 @@ function renderItems() {
   updateSortArrows();
   renderSelection();
   renderPreview();
-  queueModelThumbnails(S.items);
+  queueAutoThumbnails(S.items);
 }
 function appendItemRows(items) {
   if (!items || !items.length) return;
@@ -2949,7 +2952,7 @@ function appendItemRows(items) {
   }
   $("rows").append(rowFrag);
   $("tilesView").append(tileFrag);
-  queueModelThumbnails(items);
+  queueAutoThumbnails(items);
 }
 function folderSelected(folder) {
   return Boolean(S.selectedFolderPath && S.selectedFolderPath.toLowerCase() === folder.folder.toLowerCase());
@@ -3089,10 +3092,13 @@ function patchFolderCovers(paths) {
     else fillFolderThumb(host, folder);
   }
 }
+function thumbImageClass(item) {
+  return isPdf(item) ? "doc-thumb" : "";
+}
 function buildThumb(item) {
   const thumb = h("span", { class: "thumb" });
   if (item.has_thumb && item.thumb_url) {
-    const image = h("img", { src: item.thumb_url, alt: "", loading: "lazy", decoding: "async" });
+    const image = h("img", { class: thumbImageClass(item), src: item.thumb_url, alt: "", loading: "lazy", decoding: "async" });
     image.addEventListener("error", () => {
       image.remove();
       thumb.append(fileIcon(item.kind));
@@ -3231,7 +3237,7 @@ function startHoverPreview(tile, item) {
 function buildTile(item) {
   const media = h("div", { class: "tile-media" });
   if (item.has_thumb && item.thumb_url) {
-    const image = h("img", { src: item.thumb_url, alt: "", loading: "lazy", decoding: "async" });
+    const image = h("img", { class: thumbImageClass(item), src: item.thumb_url, alt: "", loading: "lazy", decoding: "async" });
     image.addEventListener("error", () => { image.remove(); media.append(fileIcon(item.kind)); });
     media.append(image);
   } else {
@@ -4575,7 +4581,7 @@ function confirmDeleteStar(star) {
 function promptStarLookup(star) {
   if (!star) return;
   const overwrite = inputEl({ type: "checkbox" });
-  const status = h("p", { class: "modal-note", text: "IAFD is checked first, then Wikipedia. This needs an internet connection." });
+  const status = h("p", { class: "modal-note", text: "Wikipedia is checked for details and a portrait. This needs an internet connection." });
   const overwriteRow = h("label", { class: "check" },
     overwrite,
     h("span", {},
@@ -4597,7 +4603,7 @@ function promptStarLookup(star) {
         class: "primary",
         onClick: async (setBusy) => {
           setBusy(true);
-          status.textContent = "Searching IAFD…";
+          status.textContent = "Searching Wikipedia…";
           try {
             const data = await api(`/api/stars/${star.id}/lookup`, {
               method: "POST",
@@ -5343,6 +5349,7 @@ function openModal(options) {
     actions.append(button);
   }
   $("modalBox").classList.toggle("wide", Boolean(options.wide));
+  root.classList.toggle("above-lock", !$("lockOverlay").hidden);
   root.hidden = false;
   const firstInput = body.querySelector("input, textarea, select");
   if (firstInput) setTimeout(() => firstInput.focus(), 30);
@@ -6101,76 +6108,90 @@ async function windowsThumbnail(item) {
   } catch (error) { toast(error.message, "error"); }
 }
 
-/* ---------------------------------------------- automatic 3D thumbnails */
-const MODEL_THUMB_KEY = "tfe.modelthumbs.v1";
-const MODEL_THUMB_MAX = 256 * 1024 * 1024;
-const modelThumbQueue = [];
-const modelThumbTried = loadModelThumbTried();
-let modelThumbBusy = false;
+/* --------------------------------------- automatic thumbnails (3D, PDFs) */
+const AUTO_THUMB_KEY = "tfe.autothumbs.v2";
+const AUTO_THUMB_MAX = 256 * 1024 * 1024;
+const autoThumbQueue = [];
+const autoThumbTried = loadAutoThumbTried();
+let autoThumbBusy = false;
 
-function loadModelThumbTried() {
+function loadAutoThumbTried() {
   try {
-    const raw = JSON.parse(localStorage.getItem(MODEL_THUMB_KEY) || "[]");
+    const raw = JSON.parse(localStorage.getItem(AUTO_THUMB_KEY) || "[]");
     return new Set(Array.isArray(raw) ? raw : []);
   } catch (_) {
     return new Set();
   }
 }
-function modelThumbKey(item) {
+function autoThumbKey(item) {
   return `${item.id}:${Number(item.size) || 0}`;
 }
-function saveModelThumbTried() {
+function saveAutoThumbTried() {
   try {
-    localStorage.setItem(MODEL_THUMB_KEY, JSON.stringify(Array.from(modelThumbTried).slice(-400)));
+    localStorage.setItem(AUTO_THUMB_KEY, JSON.stringify(Array.from(autoThumbTried).slice(-400)));
   } catch (_) {}
 }
-function rememberModelThumb(item) {
-  modelThumbTried.add(modelThumbKey(item));
-  saveModelThumbTried();
+function rememberAutoThumb(item) {
+  autoThumbTried.add(autoThumbKey(item));
+  saveAutoThumbTried();
 }
-function forgetModelThumb(item) {
-  modelThumbTried.delete(modelThumbKey(item));
-  saveModelThumbTried();
+function forgetAutoThumb(item) {
+  autoThumbTried.delete(autoThumbKey(item));
+  saveAutoThumbTried();
 }
-function queueModelThumbnails(items) {
+function autoThumbKind(item) {
+  if (!item || item.has_thumb) return "";
+  if (Number(item.size) > AUTO_THUMB_MAX) return "";
+  if (item.viewer) return "model";
+  if (isPdf(item)) return "pdf";
+  return "";
+}
+function queueAutoThumbnails(items) {
   for (const item of items || []) {
-    if (!item || !item.viewer || item.has_thumb) continue;
-    if (Number(item.size) > MODEL_THUMB_MAX) continue;
-    if (modelThumbTried.has(modelThumbKey(item))) continue;
-    if (modelThumbQueue.some((entry) => entry.id === item.id)) continue;
-    modelThumbQueue.push(item);
+    if (!autoThumbKind(item)) continue;
+    if (autoThumbTried.has(autoThumbKey(item))) continue;
+    if (autoThumbQueue.some((entry) => entry.id === item.id)) continue;
+    autoThumbQueue.push(item);
   }
-  runModelThumbQueue();
+  runAutoThumbQueue();
 }
-async function renderModelThumb(item) {
-  if (!window.TFE3D || typeof window.TFE3D.renderThumbnail !== "function") {
-    throw new Error("The 3D renderer is not available.");
+async function renderAutoThumb(item) {
+  let image;
+  if (isPdf(item)) {
+    if (!window.TFEReader || typeof window.TFEReader.renderThumbnail !== "function") {
+      throw new Error("The PDF renderer is not available.");
+    }
+    image = await window.TFEReader.renderThumbnail(item, 640);
+  } else {
+    if (!window.TFE3D || typeof window.TFE3D.renderThumbnail !== "function") {
+      throw new Error("The 3D renderer is not available.");
+    }
+    image = await window.TFE3D.renderThumbnail(item, 640);
   }
-  const image = await window.TFE3D.renderThumbnail(item);
   return api(`/api/items/${item.id}/thumb/image`, { method: "POST", body: { image } });
 }
-async function runModelThumbQueue() {
-  if (modelThumbBusy) return;
-  const item = modelThumbQueue.shift();
+async function runAutoThumbQueue() {
+  if (autoThumbBusy) return;
+  const item = autoThumbQueue.shift();
   if (!item) return;
-  modelThumbBusy = true;
+  autoThumbBusy = true;
   try {
-    const data = await renderModelThumb(item);
+    const data = await renderAutoThumb(item);
     window.__tfeThumbUpdated(data.item, { silent: true });
   } catch (_) {
     /* remember the failed attempt so a broken file is not retried every render */
-    rememberModelThumb(item);
+    rememberAutoThumb(item);
   } finally {
-    modelThumbBusy = false;
-    if (modelThumbQueue.length) setTimeout(runModelThumbQueue, 250);
+    autoThumbBusy = false;
+    if (autoThumbQueue.length) setTimeout(runAutoThumbQueue, 250);
   }
 }
-async function generateModelThumbnail(item) {
-  if (!item || !item.viewer) return;
-  forgetModelThumb(item);
-  toast("Rendering a 3D thumbnail…", "info", 6000);
+async function generateAutoThumbnail(item) {
+  if (!item || (!item.viewer && !isPdf(item))) return;
+  forgetAutoThumb(item);
+  toast(isPdf(item) ? "Rendering a PDF thumbnail…" : "Rendering a 3D thumbnail…", "info", 6000);
   try {
-    const data = await renderModelThumb(item);
+    const data = await renderAutoThumb(item);
     window.__tfeThumbUpdated(data.item, { silent: false });
   } catch (error) {
     toast(error.message || "The thumbnail could not be rendered.", "error");
@@ -6179,7 +6200,7 @@ async function generateModelThumbnail(item) {
 function patchThumbNode(node, item) {
   if (!node) return;
   node.replaceChildren();
-  if (item.thumb_url) node.append(h("img", { src: item.thumb_url, alt: "", loading: "lazy", decoding: "async" }));
+  if (item.thumb_url) node.append(h("img", { class: thumbImageClass(item), src: item.thumb_url, alt: "", loading: "lazy", decoding: "async" }));
   else node.append(fileIcon(item.kind));
 }
 function patchTileThumb(tile, item) {
@@ -6188,12 +6209,13 @@ function patchTileThumb(tile, item) {
   if (!media) return;
   let image = media.querySelector("img");
   if (!image) {
-    image = h("img", { src: item.thumb_url, alt: "", loading: "lazy", decoding: "async" });
+    image = h("img", { class: thumbImageClass(item), src: item.thumb_url, alt: "", loading: "lazy", decoding: "async" });
     image.addEventListener("error", () => image.remove());
     const icon = media.querySelector(".ficon");
     if (icon) icon.remove();
     media.prepend(image);
   } else {
+    image.className = thumbImageClass(item);
     image.src = item.thumb_url;
   }
 }
@@ -6847,42 +6869,57 @@ async function quitApp() {
   } catch (_) { /* the server may stop before answering */ }
   try { window.close(); } catch (_) { /* WebView window is closed by the app */ }
 }
+function resetAfterLogout() {
+  pinBuffer = "";
+  pendingVault = null;
+  S.authStage = "";
+  S.selectedChannel = null;
+  S.items = [];
+  S.nav = { folders: [], tags: [], kinds: [], stats: { count: 0, size: 0, favorites: 0 } };
+  S.selectedId = null;
+  S.navMode = "all";
+  S.hiddenOnly = false;
+  S.folder = "";
+  S.tag = "";
+  S.kind = "";
+  S.q = "";
+  resetHistory();
+  closeModal();
+  hideLock();
+  clearSelection();
+  renderSidebar();
+  renderItems();
+  updateChrome();
+  renderLogin();
+  showLogin();
+  toast("Logged out.", "success", 6000);
+}
 function promptLogout() {
   openModal({
     title: "Log out of Telegram?",
     content: h("div", {},
-      h("p", { text: "The Telegram session on this PC will be removed. Your files stay in the channel, and the local library keeps its names and folders." }),
-      h("p", { class: "modal-note", text: "You will need a new login code to use the explorer again." })
+      h("p", { text: "The library snapshot is saved to your Telegram vault first, then this PC's Telegram session is removed." }),
+      h("p", { class: "modal-note", text: "Your files and snapshots stay in the channel. Your PIN also stays set, so the app locks again next time. You will need a new login code to use the explorer again." })
     ),
     actions: [
       { label: "Cancel", onClick: closeModal },
       {
-        label: "Log out",
+        label: "Save and log out",
         class: "danger",
-        onClick: async () => {
+        onClick: async (setBusy) => {
+          setBusy(true);
           try {
-            S.status = await api("/api/logout", { method: "POST" });
-            S.authStage = "";
-            S.selectedChannel = null;
-            S.items = [];
-            S.nav = { folders: [], tags: [], kinds: [], stats: { count: 0, size: 0, favorites: 0 } };
-            S.selectedId = null;
-            S.navMode = "all";
-            S.hiddenOnly = false;
-            S.folder = "";
-            S.tag = "";
-            S.kind = "";
-            S.q = "";
-            resetHistory();
-            closeModal();
-            clearSelection();
-            renderSidebar();
-            renderItems();
-            updateChrome();
-            renderLogin();
-            showLogin();
-            toast("Logged out.", "success");
-          } catch (error) { toast(error.message, "error"); }
+            const payload = await api("/api/logout", { method: "POST" });
+            try {
+              S.status = await api("/api/status");
+            } catch (_) {
+              S.status = payload;
+            }
+            resetAfterLogout();
+          } catch (error) {
+            setBusy(false);
+            toast(error.message || "Could not log out.", "error", 8000);
+          }
         }
       }
     ]
@@ -6948,8 +6985,8 @@ function openItemMenu(event, item) {
     (item.family === "model" || item.family === "cad")
       ? { label: "Use Windows thumbnail", icon: "image", onClick: () => windowsThumbnail(item) }
       : null,
-    item.viewer
-      ? { label: "Generate 3D thumbnail", icon: "image", onClick: () => generateModelThumbnail(item) }
+    item.viewer || isPdf(item)
+      ? { label: isPdf(item) ? "Generate PDF thumbnail" : "Generate 3D thumbnail", icon: "image", onClick: () => generateAutoThumbnail(item) }
       : null,
     { label: "Stars…", icon: "user", onClick: () => promptStars(item) },
     (item.kind === "video" || item.kind === "document") && !item.part_of
@@ -7608,6 +7645,7 @@ function bindEvents() {
   $("lockVaultBtn").addEventListener("click", showLockVaults);
   $("lockVaultBack").addEventListener("click", backToPin);
   $("lockForgot").addEventListener("click", showRecovery);
+  $("lockLogout").addEventListener("click", promptLogout);
   $("lockBack").addEventListener("click", backToPin);
   $("recoverSend").addEventListener("click", sendRecoveryCode);
   $("recoverApply").addEventListener("click", applyRecovery);
@@ -7685,7 +7723,12 @@ function bindEvents() {
     });
   });
   $("viewerStage").addEventListener("click", (event) => {
-    if (event.target === $("viewerStage")) closeViewer();
+    if (event.target !== $("viewerStage")) return;
+    if ($("viewerOverlay").classList.contains("reading")) {
+      if (window.TFEReader && window.TFEReader.edgeClick) window.TFEReader.edgeClick(event);
+      return;
+    }
+    closeViewer();
   });
   $("modalClose").addEventListener("click", closeModal);
   $("modalBackdrop").addEventListener("click", closeModal);
@@ -7738,11 +7781,18 @@ function bindEvents() {
 }
 
 function handleViewerKey(event) {
-  if (event.ctrlKey || event.altKey || event.metaKey) return;
   if (window.TFEReader && window.TFEReader.isOpen()) {
+    if (event.ctrlKey || event.altKey || event.metaKey) {
+      if (window.TFEReader.keydown(event)) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+      return;
+    }
     window.TFEReader.keydown(event);
     return;
   }
+  if (event.ctrlKey || event.altKey || event.metaKey) return;
   const key = event.key.toLowerCase();
   if (key === "n" || key === "p") {
     event.preventDefault();
@@ -7832,6 +7882,10 @@ function moveSelectionBy(delta) {
 function handleKeydown(event) {
   if (event.key === "Escape") {
     if (document.fullscreenElement) return;
+    if (window.TFEReader && window.TFEReader.isOpen() && window.TFEReader.escape()) {
+      event.preventDefault();
+      return;
+    }
     if (!$("modalRoot").hidden) { closeModal(); event.preventDefault(); return; }
     if (!$("viewerOverlay").hidden) {
       if (VIEWER.gallery && VIEWER.gallery.fulled) { VIEWER.gallery.exit(); event.preventDefault(); return; }
@@ -7861,7 +7915,16 @@ function handleKeydown(event) {
   }
   if (!$("loginOverlay").hidden) return;
   if (!$("modalRoot").hidden) return;
-  if (!$("viewerOverlay").hidden) { handleViewerKey(event); return; }
+  if (!$("viewerOverlay").hidden) {
+    if (window.TFEReader && window.TFEReader.isOpen()
+      && event.ctrlKey && event.key.toLowerCase() === "f") {
+      event.preventDefault();
+      window.TFEReader.keydown(event);
+      return;
+    }
+    handleViewerKey(event);
+    return;
+  }
   if (event.ctrlKey && event.key.toLowerCase() === "f") {
     event.preventDefault();
     $("searchInput").focus();

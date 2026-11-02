@@ -34,6 +34,9 @@ click the chip for the last heartbeat, bot version and the file count it indexes
    your Telegram account; enter it to set a new PIN.
 5. To open a different storage vault, use **Storage vault** on the lock screen
    before entering. The dropdown in the title bar still switches vaults later.
+6. **Log out of Telegram** on the lock screen saves the library snapshot to your
+   vault first, then removes this PC's Telegram session. The PIN stays set for the
+   next launch.
 
 That's all. Needs Windows 10/11 (WebView2 is built into Windows 11). The app's server
 listens on `127.0.0.1` only and never leaves your PC.
@@ -98,7 +101,7 @@ survives on the boot volume.
   portrait, details and aliases, then assign files from a file's **Stars** menu or
   select several and use **Stars** in the bulk bar. The Stars page lists every file
   they appear in; search matches names and aliases. *Look up online* fills the details
-  and portrait from IAFD (Wikipedia when IAFD has nothing)
+  and portrait from Wikipedia
 - **IMDb details** — select a movie file and use **IMDb** (or its **⋯** menu) to look
   it up by name. The app fills title, year, rating and votes, genres, runtime,
   director, writers, cast, plot, country, language and poster, and shows them in the
@@ -117,10 +120,14 @@ survives on the boot volume.
   the built-in player can't decode can be opened in **mpv** instead. PDF and text
   preview inline; downloads keep the original filename
 - **Read documents** — EPUB/EPUB3, FB2, PDF, DOC/DOCX, HTML/HTM/XML, Markdown and
-  TXT open in a built-in reader. Books get a contents panel and page turning; PDFs
-  get page and zoom controls. Reading position and text size are remembered per
-  file. Legacy `.doc` files are converted with Microsoft Word the first time and
-  cached on the PC
+  TXT open in a built-in reader. PDFs scroll continuously with lazy page rendering,
+  fit-width or fit-page zoom, an outline, find with highlights, night colours and a
+  remembered page. Books switch between page turning and scrolling, change text
+  size, line spacing and light/sepia/dark themes, scrub through the book and search
+  inside it. Reading position is remembered per file. PDF tiles show a thumbnail of
+  the first page, rendered automatically the first time the file is listed;
+  right-click and choose *Generate PDF thumbnail* to render it again. Legacy `.doc`
+  files are converted with Microsoft Word the first time and cached on the PC
 - **Hover previews** — in tiles view, rest the mouse on a video tile to play a short
   muted loop from the middle of the clip; image tiles zoom. Leaving the tile stops it
 - **3D & CAD files** — STL, 3MF (including Bambu Studio projects), OBJ and PLY open

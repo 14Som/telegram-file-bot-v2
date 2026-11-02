@@ -283,7 +283,7 @@ class View {
         })
     }
     render(layout) {
-        if (!layout) return
+        if (!layout || !this.document) return
         this.#column = layout.flow !== 'scrolled'
         this.#layout = layout
         if (this.#column) this.columnize(layout)
@@ -752,7 +752,7 @@ export class Paginator extends HTMLElement {
         return { height, width, margin, gap, columnWidth }
     }
     render() {
-        if (!this.#view) return
+        if (!this.#view || !this.#view.document) return
         this.#view.render(this.#beforeRender({
             vertical: this.#vertical,
             rtl: this.#rtl,
@@ -1119,8 +1119,8 @@ export class Paginator extends HTMLElement {
         this.#view.document.defaultView.focus()
     }
     destroy() {
-        this.#observer.unobserve(this)
-        this.#view.destroy()
+        this.#observer.disconnect()
+        this.#view?.destroy()
         this.#view = null
         this.sections[this.#index]?.unload?.()
         this.#mediaQuery.removeEventListener('change', this.#mediaQueryListener)

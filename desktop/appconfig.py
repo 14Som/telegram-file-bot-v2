@@ -7,6 +7,7 @@ import json
 import os
 import random
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -20,6 +21,7 @@ PROJECT_DIR = (
 
 HOME = Path(os.environ.get("TFE_HOME") or (Path(os.environ.get("APPDATA") or Path.home()) / APP_NAME))
 SETTINGS_PATH = HOME / "settings.json"
+READER_STATE_PATH = HOME / "reader-state.json"
 LIBRARY_PATH = HOME / "library.db"
 SESSION_DIR = HOME / "session"
 SESSION_PATH = SESSION_DIR / "telegram"
@@ -108,6 +110,54 @@ def save_settings(values: Dict[str, Any]) -> Dict[str, Any]:
     tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
     os.replace(tmp, SETTINGS_PATH)
     return data
+
+
+READER_STATE_LIMIT = 1000
+_READER_STATE_LOCK = threading.Lock()
+
+
+def load_reader_state() -> Dict[str, Any]:
+    """Reading positions, bookmarks and notes, keyed by Telegram message id.
+
+    The local server listens on a fresh port every launch, so browser storage
+    belongs to a different origin each run. This file survives restarts.
+    """
+    try:
+        raw = json.loads(READER_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    state: Dict[str, Any] = {}
+    for key, entry in raw.items():
+        if isinstance(entry, dict) and str(key).isdigit():
+            state[str(key)] = entry
+    return state
+
+
+def save_reader_entry(item_id: Any, record: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        key = str(int(item_id))
+    except (TypeError, ValueError):
+        return load_reader_state()
+    with _READER_STATE_LOCK:
+        state = load_reader_state()
+        if record:
+            previous = state.get(key) or {}
+            merged = dict(previous)
+            merged.update(record)
+            merged["at"] = int(record.get("at") or 0) or previous.get("at") or 0
+            state[key] = merged
+        else:
+            state.pop(key, None)
+        if len(state) > READER_STATE_LIMIT:
+            newest = sorted(state.items(), key=lambda pair: int(pair[1].get("at") or 0), reverse=True)
+            state = dict(newest[:READER_STATE_LIMIT])
+        ensure_dirs()
+        tmp = READER_STATE_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, READER_STATE_PATH)
+    return state
 
 
 def clear_session_files() -> None:
