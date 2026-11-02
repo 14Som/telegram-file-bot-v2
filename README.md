@@ -58,6 +58,10 @@ started on a PC — it lives on the server, so setup is identical everywhere.
 Avoid syncing from both PCs at the same moment: each close writes a backup of the
 library and the newest one wins.
 
+Updates are in-app: open **Settings** (⋯) → **Check for updates**; the new version
+downloads, the app restarts itself and keeps the same shortcuts and data. The
+installer is only needed for the first setup on a PC.
+
 Telegram allows only one running bot. If an old copy of the app (version 1) left a
 `TelegramFileBot.exe` running, the Explorer stops it at launch so the server's bot
 keeps working.

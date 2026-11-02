@@ -6789,7 +6789,7 @@ function promptSettings() {
   const sectionConnection = h("div", { class: "settings-section" },
     h("h3", { text: "Connection" }),
     h("div", { class: "settings-row" }, h("span", { text: "Telegram" }), h("span", { class: "value", text: st.authorized ? "Signed in" : "Not signed in" })),
-    h("div", { class: "settings-row" }, h("span", { text: "Explorer version" }), h("span", { class: "value", text: "2.1" })),
+    h("div", { class: "settings-row" }, h("span", { text: "Explorer version" }), h("span", { class: "value", text: st.version || "2.2" })),
     h("div", { class: "settings-row" },
       h("span", { text: "Server bot" }),
       h("span", { class: "value", text: S.server ? (SERVER_LABELS[S.server.state] || "Unknown") : "Checking…" })
@@ -6807,6 +6807,7 @@ function promptSettings() {
         } catch (error) { toast(error.message, "error"); }
       }),
       st.authorized ? btn("Log out…", "btn danger", () => promptLogout()) : null,
+      btn("Check for updates…", "btn", promptUpdate),
       btn("Server details…", "btn", () => { closeModal(); showServerDetails(); }),
       btn("Quit app", "btn", quitApp)
     )
@@ -6838,6 +6839,52 @@ function promptSettings() {
     actions: [{ label: "Close", onClick: closeModal }]
   });
 }
+async function promptUpdate() {
+  const status = h("p", { class: "modal-note", text: "Looking up the latest release on GitHub…" });
+  openModal({
+    title: "Check for updates",
+    content: h("div", {}, status),
+    actions: [{ label: "Close", onClick: closeModal }]
+  });
+  let info;
+  try {
+    info = await api("/api/update/check");
+  } catch (error) {
+    status.textContent = error.message || "Could not check for updates.";
+    return;
+  }
+  if (!info.available) {
+    status.textContent = `This is the latest version (${info.current}).`;
+    return;
+  }
+  const notes = (info.notes || "").split("\n").map((line) => line.trim()).filter(Boolean).slice(0, 6).join("\n");
+  closeModal();
+  openModal({
+    title: `Update to version ${info.latest}?`,
+    content: h("div", {},
+      h("p", { text: `A newer version is available (${info.latest}). The download is ${fmtSize(info.size || 0)}.` }),
+      notes ? h("p", { class: "modal-note", text: notes }) : null,
+      h("p", { class: "modal-note", text: "The app saves the library snapshot to your vault, closes, replaces itself and reopens on the new version." })
+    ),
+    actions: [
+      { label: "Cancel", onClick: closeModal },
+      {
+        label: "Download and restart",
+        class: "primary",
+        onClick: async (setBusy) => {
+          setBusy(true);
+          try {
+            const result = await api("/api/update/install", { method: "POST" });
+            quitApp(`Installing version ${result.version}. The app closes, replaces itself and reopens in a moment.`);
+          } catch (error) {
+            setBusy(false);
+            toast(error.message || "The update could not be installed.", "error", 8000);
+          }
+        }
+      }
+    ]
+  });
+}
 function confirmQuit() {
   openModal({
     title: "Quit Telegram File Explorer?",
@@ -6851,16 +6898,19 @@ function confirmQuit() {
     ]
   });
 }
-async function quitApp() {
+async function quitApp(note) {
   if (S.quitting) return;
   S.quitting = true;
+  const message = typeof note === "string" && note
+    ? note
+    : "Saving the library snapshot to your vault. The window closes by itself; the bot stays online.";
   closeModal();
   document.body.replaceChildren(
     h("div", { class: "quit-screen" },
       h("div", { class: "quit-card" },
         h("span", { class: "spinner" }),
         h("strong", { text: "Shutting down…" }),
-        h("p", { text: "Saving the library snapshot to your vault. The window closes by itself; the bot stays online." })
+        h("p", { text: message })
       )
     )
   );

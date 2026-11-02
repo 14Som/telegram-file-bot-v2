@@ -44,6 +44,7 @@ from . import (
     storyboard,
     streamcache,
     thumbpick,
+    updater,
     vaultstore,
     winshell,
 )
@@ -70,6 +71,7 @@ log = logging.getLogger("tfe.server")
 
 QUIT = threading.Event()
 COOKIE = "tfe_session"
+APP_VERSION = "2.2"
 UI_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent)) / "desktop" / "ui"
 UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 # API paths that stay reachable while the app is PIN-locked (status, lock
@@ -789,23 +791,36 @@ async def on_unhandled(request: Request, exc: Exception):
 
 
 # ------------------------------------------------------------------- UI files
+# The UI ships inside the EXE and WebView2 keeps a disk cache between runs, so
+# these files must never be cached: an app update has to show up on the next
+# launch instead of after the browser decides the old copy went stale.
+FRESH = {"Cache-Control": "no-store"}
+
+
+class FreshStaticFiles(StaticFiles):
+    async def get_response(self, path: str, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+
 @app.get("/", include_in_schema=False)
 async def index():
-    return FileResponse(UI_DIR / "index.html", media_type="text/html")
+    return FileResponse(UI_DIR / "index.html", media_type="text/html", headers=FRESH)
 
 
 @app.get("/favicon.svg", include_in_schema=False)
 async def favicon():
-    return FileResponse(UI_DIR / "favicon.svg", media_type="image/svg+xml")
+    return FileResponse(UI_DIR / "favicon.svg", media_type="image/svg+xml", headers=FRESH)
 
 
-app.mount("/static", StaticFiles(directory=str(UI_DIR)), name="static")
+app.mount("/static", FreshStaticFiles(directory=str(UI_DIR)), name="static")
 
 
 # --------------------------------------------------------------------- status
 @app.get("/api/ping")
 async def ping():
-    return {"app": "telegram-file-explorer", "version": "2.1"}
+    return {"app": "telegram-file-explorer", "version": APP_VERSION}
 
 
 @app.get("/api/status")
@@ -818,6 +833,7 @@ async def status(request: Request):
     payload["folder_count"] = len(state.catalog.folders(chat_id))
     payload["tag_count"] = len(state.catalog.tags(chat_id))
     payload["locked"] = state.locked
+    payload["version"] = APP_VERSION
     payload["pin_set"] = applock.has_pin()
     payload["pin_skipped"] = applock.pin_skipped()
     payload["pin_recovery"] = bool(payload.get("authorized")) and applock.has_pin()
@@ -1598,6 +1614,30 @@ async def reconnect(request: Request):
 async def quit_app(request: Request):
     QUIT.set()
     return {"quitting": True}
+
+
+# -------------------------------------------------------------------- updates
+@app.get("/api/update/check")
+async def update_check():
+    try:
+        return await run_in_threadpool(updater.check, APP_VERSION)
+    except updater.UpdateError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/update/install")
+async def update_install():
+    try:
+        info = await run_in_threadpool(updater.check, APP_VERSION)
+        if not info["available"]:
+            raise updater.UpdateError("This is already the latest version.")
+        path = await run_in_threadpool(
+            updater.download, info["asset_url"], info["size"], info["digest"]
+        )
+        result = await run_in_threadpool(updater.schedule_install, path)
+    except updater.UpdateError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {**result, "version": info["latest"], "restart": True}
 
 
 # ----------------------------------------------------------------------- sync

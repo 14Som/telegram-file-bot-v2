@@ -1125,8 +1125,14 @@
     setStatus("");
   }
 
+  function fileUrl(item) {
+    // A file that was replaced in Telegram gets a new message id, so the URL
+    // changes with it and WebView2 cannot answer with the old document.
+    return `/api/file/${item.id}?v=${Number(item.message_id) || 0}-${Number(item.size) || 0}`;
+  }
+
   async function fetchFull(item) {
-    const response = await fetch(`/api/file/${item.id}`, { credentials: "same-origin" });
+    const response = await fetch(fileUrl(item), { credentials: "same-origin" });
     if (!response.ok) throw new Error(`The file could not be downloaded (${response.status}).`);
     return response;
   }
@@ -1153,7 +1159,7 @@
   async function renderThumbnail(item, size) {
     const lib = await pdfjs();
     const doc = await lib.getDocument({
-      url: `/api/file/${item.id}`,
+      url: fileUrl(item),
       cMapUrl: "/static/vendor/pdfjs/cmaps/",
       cMapPacked: true,
       standardFontDataUrl: "/static/vendor/pdfjs/standard_fonts/",
@@ -1541,7 +1547,7 @@
     try {
       const source = options && options.buffer
         ? lib.getDocument({ data: options.buffer, ...params })
-        : lib.getDocument({ url: `/api/file/${item.id}`, ...params });
+        : lib.getDocument({ url: fileUrl(item), ...params });
       doc = await source.promise;
     } catch (error) {
       throw new Error(error && error.message ? `The PDF could not be opened: ${error.message}` : "The PDF could not be opened.");
