@@ -32,6 +32,7 @@ from starlette.concurrency import run_in_threadpool
 from . import (
     appconfig,
     applock,
+    docconvert,
     filetypes,
     iteminfo,
     mediatools,
@@ -97,7 +98,9 @@ def _upload_semaphore() -> asyncio.Semaphore:
 CSP = (
     "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; "
     "font-src 'self' data:; "
-    "style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; "
+    "style-src 'self' 'unsafe-inline'; "
+    "script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; "
+    "connect-src 'self' blob:; "
     "frame-src 'self' blob:; object-src 'none'; base-uri 'none'; "
     "form-action 'self'; frame-ancestors 'self'"
 )
@@ -388,6 +391,9 @@ def public_item(item: Dict[str, Any], vault: Optional[Dict[str, Any]]) -> Dict[s
         str(item.get("name") or ""), str(item.get("kind") or "")
     )
     data["viewer"] = filetypes.viewer_format(str(item.get("name") or ""))
+    data["reader"] = filetypes.reader_format(
+        str(item.get("name") or ""), str(item.get("mime") or "")
+    )
     return data
 
 
@@ -792,7 +798,7 @@ app.mount("/static", StaticFiles(directory=str(UI_DIR)), name="static")
 # --------------------------------------------------------------------- status
 @app.get("/api/ping")
 async def ping():
-    return {"app": "telegram-file-explorer", "version": "2.0"}
+    return {"app": "telegram-file-explorer", "version": "2.1"}
 
 
 @app.get("/api/status")
@@ -3298,13 +3304,27 @@ async def download_head(item_id: int, request: Request):
     return await _serve_media(request, item_id, download=True)
 
 
+# Readers (PDF.js, EPUB, Word) ask for exact byte ranges or the whole file,
+# so they bypass the 32 MB playback window that keeps players buffered.
+@app.get("/api/file/{item_id}")
+async def read_file(item_id: int, request: Request):
+    return await _serve_media(request, item_id, download=False, full=True)
+
+
+@app.head("/api/file/{item_id}")
+async def read_file_head(item_id: int, request: Request):
+    return await _serve_media(request, item_id, download=False, full=True)
+
+
 # Players ask for "bytes=0-"; serving a large slice up front gives them a
 # comfortable buffer instead of a stream of tiny requests. Blocks are cached
 # on disk by streamcache, so repeats and seeks stay local.
 INLINE_STREAM_WINDOW = 32 * 1024 * 1024
 
 
-async def _serve_media(request: Request, item_id: int, download: bool) -> Response:
+async def _serve_media(
+    request: Request, item_id: int, download: bool, full: bool = False
+) -> Response:
     state = _state(request)
     item = await _scoped_item(state, item_id)
     message, size, mime = await state.service.media_info(item)
@@ -3322,13 +3342,13 @@ async def _serve_media(request: Request, item_id: int, download: bool) -> Respon
             headers["Content-Range"] = f"bytes */{size}"
             return Response(status_code=416, headers=headers)
         start, end = parsed
-        if not download:
+        if not download and not full:
             end = min(end, start + INLINE_STREAM_WINDOW - 1)
         length = end - start + 1
         headers["Content-Range"] = f"bytes {start}-{end}/{size}"
         headers["Content-Length"] = str(length)
         status_code = 206
-    elif not download and size > INLINE_STREAM_WINDOW:
+    elif not download and not full and size > INLINE_STREAM_WINDOW:
         start, length = 0, INLINE_STREAM_WINDOW
         headers["Content-Range"] = f"bytes 0-{INLINE_STREAM_WINDOW - 1}/{size}"
         headers["Content-Length"] = str(length)
@@ -3366,4 +3386,44 @@ async def _serve_media(request: Request, item_id: int, download: bool) -> Respon
 
     return StreamingResponse(
         body(), status_code=status_code, headers=headers, media_type=mime
+    )
+
+
+# ------------------------------------------------------------- word conversion
+DOC_PDF_DIR = appconfig.CACHE_DIR / "docpdf"
+_DOC_CONVERT_LOCK = asyncio.Lock()
+
+
+@app.get("/api/doc/{item_id}/pdf")
+async def doc_pdf(item_id: int, request: Request):
+    state = _state(request)
+    item = await _scoped_item(state, item_id)
+    name = str(item.get("name") or "")
+    if filetypes.extension(name) != ".doc":
+        raise HTTPException(
+            status_code=400, detail="Only legacy .doc files are converted to PDF."
+        )
+    size = int(item.get("size") or 0)
+    cache = DOC_PDF_DIR / f"{item.get('chat_id')}-{item['message_id']}-{size}.pdf"
+    if not cache.is_file():
+        async with _DOC_CONVERT_LOCK:
+            if not cache.is_file():
+                await run_in_threadpool(DOC_PDF_DIR.mkdir, parents=True, exist_ok=True)
+                message, _size, _mime = await state.service.media_info(item)
+                token = uuid.uuid4().hex
+                source = DOC_PDF_DIR / f"{token}.doc"
+                partial = DOC_PDF_DIR / f"{token}.pdf"
+                try:
+                    await state.service.download_to(message, source)
+                    await run_in_threadpool(docconvert.convert_to_pdf, source, partial)
+                    os.replace(partial, cache)
+                except docconvert.ConversionError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                finally:
+                    source.unlink(missing_ok=True)
+                    partial.unlink(missing_ok=True)
+    return FileResponse(
+        cache,
+        media_type="application/pdf",
+        headers={"Cache-Control": "private, max-age=86400"},
     )

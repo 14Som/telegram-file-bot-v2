@@ -138,8 +138,7 @@
     return Math.round(triangles);
   }
 
-  function prepareModel(loaded, format) {
-    const THREE = window.THREE;
+  function prepareModel(loaded, format) {    const THREE = window.THREE;
     let root = loaded;
     if (format === "stl" || format === "ply") {
       const geometry = loaded;
@@ -335,7 +334,7 @@
   async function postJson(path, payload) {
     const response = await fetch(path, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "X-TFE": "1" },
       credentials: "same-origin",
       body: JSON.stringify(payload || {}),
     });
@@ -386,6 +385,92 @@
     }
   }
 
+  function disposeRoot(root) {
+    if (!root) return;
+    root.traverse((child) => {
+      if (child.geometry) child.geometry.dispose();
+      const material = child.material;
+      if (Array.isArray(material)) material.forEach((entry) => entry.dispose && entry.dispose());
+      else if (material && material.dispose) material.dispose();
+    });
+  }
+
+  /* Render a model to a square JPEG without opening the viewer. Used for the
+     automatic library thumbnails and the "Generate 3D thumbnail" action. */
+  function renderThumbnail(item, size) {
+    return new Promise((resolve, reject) => {
+      const THREE = window.THREE;
+      if (!THREE || !item || !item.viewer) {
+        reject(new Error("This file has no built-in 3D preview."));
+        return;
+      }
+      const loader = makeLoader(item.viewer);
+      if (!loader) {
+        reject(new Error("This format has no built-in preview."));
+        return;
+      }
+      const pixels = size || 640;
+      const renderer = new THREE.WebGLRenderer({
+        antialias: true,
+        alpha: false,
+        preserveDrawingBuffer: true,
+      });
+      renderer.setPixelRatio(1);
+      renderer.setSize(pixels, pixels, false);
+      renderer.outputEncoding = THREE.sRGBEncoding;
+      renderer.setClearColor(0x161a20, 1);
+      const scene = createScene();
+      scene.background = new THREE.Color(0x161a20);
+      const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 100000);
+      let settled = false;
+      const finish = (error, image) => {
+        if (settled) return;
+        settled = true;
+        renderer.dispose();
+        if (renderer.domElement && renderer.domElement.parentNode) {
+          renderer.domElement.parentNode.removeChild(renderer.domElement);
+        }
+        if (error) reject(error);
+        else resolve(image);
+      };
+      loader.load(
+        `/api/download/${item.id}`,
+        (loaded) => {
+          let root;
+          try {
+            root = prepareModel(loaded, item.viewer);
+          } catch (error) {
+            finish(error);
+            return;
+          }
+          try {
+            const box = new THREE.Box3().setFromObject(root);
+            const extent = box.getSize(new THREE.Vector3());
+            const center = box.getCenter(new THREE.Vector3());
+            root.position.sub(center);
+            const maxDim = Math.max(extent.x, extent.y, extent.z) || 1;
+            camera.near = Math.max(maxDim / 1000, 0.001);
+            camera.far = maxDim * 200;
+            camera.position.set(maxDim * 1.4, maxDim * 1.05, maxDim * 1.7);
+            camera.lookAt(0, 0, 0);
+            camera.updateProjectionMatrix();
+            scene.add(root);
+            renderer.render(scene, camera);
+            const image = renderer.domElement.toDataURL("image/jpeg", 0.88);
+            scene.remove(root);
+            disposeRoot(root);
+            finish(null, image);
+          } catch (error) {
+            disposeRoot(root);
+            finish(error);
+          }
+        },
+        undefined,
+        () => finish(new Error("This model could not be downloaded."))
+      );
+    });
+  }
+
   async function openExternal() {
     if (!state.item) return;
     state.openBtn.disabled = true;
@@ -399,5 +484,5 @@
     }
   }
 
-  window.TFE3D = { open, close };
+  window.TFE3D = { open, close, renderThumbnail };
 })();

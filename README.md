@@ -116,13 +116,20 @@ survives on the boot volume.
   across syncs, sign-outs and vault restores. MKV, HEVC and other formats
   the built-in player can't decode can be opened in **mpv** instead. PDF and text
   preview inline; downloads keep the original filename
+- **Read documents** — EPUB/EPUB3, FB2, PDF, DOC/DOCX, HTML/HTM/XML, Markdown and
+  TXT open in a built-in reader. Books get a contents panel and page turning; PDFs
+  get page and zoom controls. Reading position and text size are remembered per
+  file. Legacy `.doc` files are converted with Microsoft Word the first time and
+  cached on the PC
 - **Hover previews** — in tiles view, rest the mouse on a video tile to play a short
   muted loop from the middle of the clip; image tiles zoom. Leaving the tile stops it
-- **3D & CAD files** — STL, 3MF, OBJ and PLY open in a built-in 3D viewer: drag to
-  orbit, wheel to zoom, right-drag to pan, and save the current view as the file's
-  thumbnail. STEP, IGES, Solid Edge (`.par`, `.psm`, `.asm`) and other CAD documents
-  open in their Windows app in one click; models and CAD files can also use the
-  Windows shell thumbnail
+- **3D & CAD files** — STL, 3MF (including Bambu Studio projects), OBJ and PLY open
+  in a built-in 3D viewer: drag to orbit, wheel to zoom, right-drag to pan, and save
+  the current view as the file's thumbnail. A thumbnail is rendered automatically the
+  first time a model is shown; right-click a model and choose *Generate 3D thumbnail*
+  to render it again. STEP, IGES, Solid Edge (`.par`, `.psm`, `.asm`) and other CAD
+  documents open in their Windows app in one click; models and CAD files can also use
+  the Windows shell thumbnail
 - **File details** — *File details* on a file shows type-aware metadata: triangle
   counts and bounding-box dimensions for models, 3MF title, designer and slicer,
   image EXIF, video specs, and CAD title, author and revision
@@ -154,7 +161,8 @@ survives on the boot volume.
   portraits stay). Files you open again are re-fetched from Telegram as needed.
 - **Keyboard** — arrows move, Enter opens, F2 renames, Delete removes, Ctrl+F
   searches, Alt+←/→ goes back/forward. In the viewer: Space/K play-pause, ←/→ 5 s,
-  J/L 10 s, M mute, F fullscreen, N/P next or previous file
+  J/L 10 s, M mute, F fullscreen, N/P next or previous file. In the reader:
+  ←/→ or N/P page or turn the page, +/- text size (PDF zoom), Esc closes
 - **Automatic backup** — on close and after every sync, the index, settings and your
   picked covers/star portraits are zipped into the vault channel (newest 10 kept,
   older copies deleted automatically, hidden from the file list). Thumbnails and
@@ -257,6 +265,7 @@ into `TelegramFileExplorerSetup.exe`. Desktop dependencies:
 ## Limits & safety
 
 - Telegram allows 2 GB per file (4 GB with Premium); the app splits anything larger
+- Legacy `.doc` reading needs Microsoft Word installed; `.docx` does not
 - `/delete` removes the index entry only — the message in your chat is the actual copy
 - A restored index works only with the **same bot token**, because Telegram file IDs
   are bot-specific. With a new bot, re-send the files to rebuild it

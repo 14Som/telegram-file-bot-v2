@@ -9,7 +9,7 @@
   <link rel="stylesheet" href="/static/vendor/videojs/video-js.min.css">
   <link rel="stylesheet" href="/static/vendor/viewerjs/viewer.min.css">
   <link rel="stylesheet" href="/static/vendor/overlayscrollbars/overlayscrollbars.min.css">
-  <link rel="stylesheet" href="/static/styles.css?v=22">
+  <link rel="stylesheet" href="/static/styles.css?v=25">
 </head>
 <body>
   <div class="app">
@@ -380,7 +380,6 @@
       </div>
     </div>
     <div class="viewer-stage" id="viewerStage"></div>
-    <button class="viewer-close-float" id="viewerCloseFloat" type="button" title="Close (Esc)" aria-label="Close preview">×</button>
   </div>
 
   <div class="overlay lock" id="lockOverlay" hidden>
@@ -481,10 +480,14 @@
   <script src="/static/vendor/three/loaders/STLLoader.js"></script>
   <script src="/static/vendor/three/loaders/OBJLoader.js"></script>
   <script src="/static/vendor/three/loaders/PLYLoader.js"></script>
-  <script src="/static/vendor/three/loaders/3MFLoader.js"></script>
+  <script src="/static/vendor/three/loaders/3MFLoader.js?v=2"></script>
   <script src="/static/vendor/three/controls/OrbitControls.js"></script>
   <script src="/static/vendor/overlayscrollbars/overlayscrollbars.browser.es6.min.js"></script>
-  <script src="/static/viewer3d.js?v=2"></script>
-  <script src="/static/app.js?v=22"></script>
+  <script src="/static/vendor/marked/marked.umd.js"></script>
+  <script src="/static/vendor/dompurify/purify.min.js"></script>
+  <script src="/static/vendor/mammoth/mammoth.browser.min.js"></script>
+  <script src="/static/viewer3d.js?v=3"></script>
+  <script src="/static/reader.js?v=2"></script>
+  <script src="/static/app.js?v=27"></script>
 </body>
 </html>

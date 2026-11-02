@@ -2937,6 +2937,7 @@ function renderItems() {
   updateSortArrows();
   renderSelection();
   renderPreview();
+  queueModelThumbnails(S.items);
 }
 function appendItemRows(items) {
   if (!items || !items.length) return;
@@ -2948,6 +2949,7 @@ function appendItemRows(items) {
   }
   $("rows").append(rowFrag);
   $("tilesView").append(tileFrag);
+  queueModelThumbnails(items);
 }
 function folderSelected(folder) {
   return Boolean(S.selectedFolderPath && S.selectedFolderPath.toLowerCase() === folder.folder.toLowerCase());
@@ -3726,6 +3728,8 @@ function renderInlinePreview(container, item, token) {
     container.append(h("audio", { src: item.stream_url, controls: "", preload: "metadata" }));
   } else if (kind === "sticker") {
     container.append(h("img", { src: item.stream_url, alt: item.name, loading: "lazy" }));
+  } else if (item.reader) {
+    renderDocCard(container, item);
   } else if (isPdf(item)) {
     container.append(h("iframe", { src: item.stream_url, title: item.name }));
   } else if (isText(item)) {
@@ -3741,6 +3745,22 @@ function renderInlinePreview(container, item, token) {
   } else {
     container.append(h("div", { class: "preview-file" }, fileIcon(kind), h("span", { text: "Preview isn’t available for this file type." }), h("span", { text: "Use Download or open it in Telegram." })));
   }
+}
+function renderDocCard(container, item) {
+  const label = window.TFEReader ? window.TFEReader.label(item.reader) : "Document";
+  const note = item.reader === "doc" ? " · converted with Word on first open" : "";
+  container.append(h("div", { class: "doc-card" },
+    h("div", { class: "doc-card-head" },
+      h("div", { class: "doc-card-icon" }, fileIcon(item.kind)),
+      h("div", { class: "doc-card-copy" },
+        h("div", { class: "doc-card-format", text: label }),
+        h("div", { class: "doc-card-name", text: item.name })
+      )
+    ),
+    h("div", { class: "doc-card-meta", text: `${fmtSize(item.size || 0)}${note}` }),
+    h("button", { class: "btn primary doc-card-read", type: "button", text: `Read ${label.toLowerCase()}`, onclick: () => openViewerFor(item) }),
+    h("div", { class: "doc-card-hint", text: "Opens in the built-in reader. Your reading position is remembered." })
+  ));
 }
 const VIEWER = {
   item: null,
@@ -3791,6 +3811,7 @@ function updateViewerBar() {
 function openViewerFor(item) {
   if (!item) return;
   if (item.viewer) { openModelViewer(item); return; }
+  if (item.reader) { openReaderFor(item); return; }
   if (item.family === "cad" || item.family === "model") { openExternalItem(item); return; }
   stopHoverPreview();
   VIEWER.list = buildViewerList(item);
@@ -3799,6 +3820,14 @@ function openViewerFor(item) {
   // measures a zero-height stage and stays invisible.
   $("viewerOverlay").hidden = false;
   showViewerItem(VIEWER.list[VIEWER.index]);
+  $("viewerClose").focus();
+}
+function openReaderFor(item) {
+  stopHoverPreview();
+  VIEWER.list = [item];
+  VIEWER.index = 0;
+  $("viewerOverlay").hidden = false;
+  showViewerItem(item);
   $("viewerClose").focus();
 }
 function showViewerItem(item) {
@@ -3812,8 +3841,14 @@ function showViewerItem(item) {
   const stage = $("viewerStage");
   stage.className = "viewer-stage";
   stage.replaceChildren();
+  $("viewerOverlay").classList.toggle("reading", !!(item.reader && window.TFEReader));
   VIEWER.index = Math.max(0, VIEWER.list.findIndex((entry) => entry.id === item.id));
   updateViewerBar();
+  if (item.reader && window.TFEReader) {
+    stage.classList.add("reader");
+    window.TFEReader.open(stage, item);
+    return;
+  }
   if (isVideoLike(item)) initVideoViewer(item, token);
   else if (item.kind === "image" || item.kind === "sticker") initImageViewer(item, token);
   else if (item.kind === "audio" || item.kind === "voice") {
@@ -4027,6 +4062,7 @@ function toggleViewerSlideshow(button) {
   }, SLIDESHOW_MS);
 }
 function destroyViewerMedia() {
+  if (window.TFEReader && window.TFEReader.isOpen()) window.TFEReader.close();
   stopViewerSlideshow();
   if (VIEWER.spriteTimer) { clearTimeout(VIEWER.spriteTimer); VIEWER.spriteTimer = null; }
   VIEWER.sprites = null;
@@ -4041,6 +4077,7 @@ function closeViewer() {
   }
   destroyViewerMedia();
   VIEWER.item = null;
+  $("viewerOverlay").classList.remove("reading");
   $("viewerStage").className = "viewer-stage";
   $("viewerStage").replaceChildren();
   $("viewerOverlay").hidden = true;
@@ -6063,19 +6100,117 @@ async function windowsThumbnail(item) {
     window.__tfeThumbUpdated(data.item);
   } catch (error) { toast(error.message, "error"); }
 }
-window.__tfeThumbUpdated = function (item) {
+
+/* ---------------------------------------------- automatic 3D thumbnails */
+const MODEL_THUMB_KEY = "tfe.modelthumbs.v1";
+const MODEL_THUMB_MAX = 256 * 1024 * 1024;
+const modelThumbQueue = [];
+const modelThumbTried = loadModelThumbTried();
+let modelThumbBusy = false;
+
+function loadModelThumbTried() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(MODEL_THUMB_KEY) || "[]");
+    return new Set(Array.isArray(raw) ? raw : []);
+  } catch (_) {
+    return new Set();
+  }
+}
+function modelThumbKey(item) {
+  return `${item.id}:${Number(item.size) || 0}`;
+}
+function saveModelThumbTried() {
+  try {
+    localStorage.setItem(MODEL_THUMB_KEY, JSON.stringify(Array.from(modelThumbTried).slice(-400)));
+  } catch (_) {}
+}
+function rememberModelThumb(item) {
+  modelThumbTried.add(modelThumbKey(item));
+  saveModelThumbTried();
+}
+function forgetModelThumb(item) {
+  modelThumbTried.delete(modelThumbKey(item));
+  saveModelThumbTried();
+}
+function queueModelThumbnails(items) {
+  for (const item of items || []) {
+    if (!item || !item.viewer || item.has_thumb) continue;
+    if (Number(item.size) > MODEL_THUMB_MAX) continue;
+    if (modelThumbTried.has(modelThumbKey(item))) continue;
+    if (modelThumbQueue.some((entry) => entry.id === item.id)) continue;
+    modelThumbQueue.push(item);
+  }
+  runModelThumbQueue();
+}
+async function renderModelThumb(item) {
+  if (!window.TFE3D || typeof window.TFE3D.renderThumbnail !== "function") {
+    throw new Error("The 3D renderer is not available.");
+  }
+  const image = await window.TFE3D.renderThumbnail(item);
+  return api(`/api/items/${item.id}/thumb/image`, { method: "POST", body: { image } });
+}
+async function runModelThumbQueue() {
+  if (modelThumbBusy) return;
+  const item = modelThumbQueue.shift();
+  if (!item) return;
+  modelThumbBusy = true;
+  try {
+    const data = await renderModelThumb(item);
+    window.__tfeThumbUpdated(data.item, { silent: true });
+  } catch (_) {
+    /* remember the failed attempt so a broken file is not retried every render */
+    rememberModelThumb(item);
+  } finally {
+    modelThumbBusy = false;
+    if (modelThumbQueue.length) setTimeout(runModelThumbQueue, 250);
+  }
+}
+async function generateModelThumbnail(item) {
+  if (!item || !item.viewer) return;
+  forgetModelThumb(item);
+  toast("Rendering a 3D thumbnail…", "info", 6000);
+  try {
+    const data = await renderModelThumb(item);
+    window.__tfeThumbUpdated(data.item, { silent: false });
+  } catch (error) {
+    toast(error.message || "The thumbnail could not be rendered.", "error");
+  }
+}
+function patchThumbNode(node, item) {
+  if (!node) return;
+  node.replaceChildren();
+  if (item.thumb_url) node.append(h("img", { src: item.thumb_url, alt: "", loading: "lazy", decoding: "async" }));
+  else node.append(fileIcon(item.kind));
+}
+function patchTileThumb(tile, item) {
+  if (!tile || !item.thumb_url) return;
+  const media = tile.querySelector(".tile-media");
+  if (!media) return;
+  let image = media.querySelector("img");
+  if (!image) {
+    image = h("img", { src: item.thumb_url, alt: "", loading: "lazy", decoding: "async" });
+    image.addEventListener("error", () => image.remove());
+    const icon = media.querySelector(".ficon");
+    if (icon) icon.remove();
+    media.prepend(image);
+  } else {
+    image.src = item.thumb_url;
+  }
+}
+window.__tfeThumbUpdated = function (item, options) {
   if (!item) return;
   const index = S.items.findIndex((entry) => entry.id === item.id);
   if (index >= 0) S.items[index] = item;
+  if (options && options.silent) {
+    patchTileThumb(document.querySelector(`#tilesView .tile[data-id="${item.id}"]`), item);
+    patchThumbNode(document.querySelector(`#rows .row[data-id="${item.id}"] .thumb`), item);
+    if (S.selectedId === item.id) renderPreview();
+    return;
+  }
   if (S.view === "tiles") {
     renderItems();
   } else {
-    const thumb = document.querySelector(`.row[data-id="${item.id}"] .thumb`);
-    if (thumb) {
-      thumb.replaceChildren();
-      if (item.thumb_url) thumb.append(h("img", { src: item.thumb_url, alt: "", loading: "lazy" }));
-      else thumb.append(fileIcon(item.kind));
-    }
+    patchThumbNode(document.querySelector(`.row[data-id="${item.id}"] .thumb`), item);
   }
   if (S.selectedId === item.id) renderPreview();
   toast("Thumbnail updated.", "success");
@@ -6632,7 +6767,7 @@ function promptSettings() {
   const sectionConnection = h("div", { class: "settings-section" },
     h("h3", { text: "Connection" }),
     h("div", { class: "settings-row" }, h("span", { text: "Telegram" }), h("span", { class: "value", text: st.authorized ? "Signed in" : "Not signed in" })),
-    h("div", { class: "settings-row" }, h("span", { text: "Explorer version" }), h("span", { class: "value", text: "2.0" })),
+    h("div", { class: "settings-row" }, h("span", { text: "Explorer version" }), h("span", { class: "value", text: "2.1" })),
     h("div", { class: "settings-row" },
       h("span", { text: "Server bot" }),
       h("span", { class: "value", text: S.server ? (SERVER_LABELS[S.server.state] || "Unknown") : "Checking…" })
@@ -6812,6 +6947,9 @@ function openItemMenu(event, item) {
     { label: "File details…", icon: "info", onClick: () => inspectItem(item) },
     (item.family === "model" || item.family === "cad")
       ? { label: "Use Windows thumbnail", icon: "image", onClick: () => windowsThumbnail(item) }
+      : null,
+    item.viewer
+      ? { label: "Generate 3D thumbnail", icon: "image", onClick: () => generateModelThumbnail(item) }
       : null,
     { label: "Stars…", icon: "user", onClick: () => promptStars(item) },
     (item.kind === "video" || item.kind === "document") && !item.part_of
@@ -7533,7 +7671,6 @@ function bindEvents() {
     if (item) promptNote(item);
   });
   $("viewerClose").addEventListener("click", closeViewer);
-  $("viewerCloseFloat").addEventListener("click", closeViewer);
   $("viewerPrev").addEventListener("click", () => stepViewer(-1));
   $("viewerNext").addEventListener("click", () => stepViewer(1));
   $("viewerMpv").addEventListener("click", () => openInMpv(VIEWER.item));
@@ -7602,6 +7739,10 @@ function bindEvents() {
 
 function handleViewerKey(event) {
   if (event.ctrlKey || event.altKey || event.metaKey) return;
+  if (window.TFEReader && window.TFEReader.isOpen()) {
+    window.TFEReader.keydown(event);
+    return;
+  }
   const key = event.key.toLowerCase();
   if (key === "n" || key === "p") {
     event.preventDefault();

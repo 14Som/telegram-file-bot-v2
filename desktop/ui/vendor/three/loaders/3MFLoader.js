@@ -486,6 +486,15 @@
 
 				}
 
+				// Production extension: the object can live in another model part.
+				const path = componentNode.getAttribute( 'p:path' );
+
+				if ( path ) {
+
+					componentData[ 'path' ] = path;
+
+				}
+
 				return componentData;
 
 			}
@@ -1178,6 +1187,38 @@
 
 			}
 
+			// Production extension objects live in separate model parts; index
+			// them so components can resolve meshes across the archive.
+			const partObjects = {};
+			const partPaths = {};
+
+			function resolveObjectSource( objectId, modelData, path ) {
+
+				if ( path ) {
+
+					const key = path.replace( /^\/+/, '' );
+					const owner = partPaths[ key ];
+
+					if ( owner && owner[ 'resources' ] && owner[ 'resources' ][ 'object' ][ objectId ] ) {
+
+						return { objectData: owner[ 'resources' ][ 'object' ][ objectId ], modelData: owner };
+
+					}
+
+				}
+
+				if ( partObjects[ objectId ] ) return partObjects[ objectId ];
+
+				if ( modelData && modelData[ 'resources' ] && modelData[ 'resources' ][ 'object' ][ objectId ] ) {
+
+					return { objectData: modelData[ 'resources' ][ 'object' ][ objectId ], modelData: modelData };
+
+				}
+
+				return null;
+
+			}
+
 			function buildComposite( compositeData, objects, modelData, textureData ) {
 
 				const composite = new THREE.Group();
@@ -1189,10 +1230,12 @@
 
 					if ( build === undefined ) {
 
-						buildObject( component.objectId, objects, modelData, textureData );
+						buildObject( component.objectId, objects, modelData, textureData, component.path );
 						build = objects[ component.objectId ];
 
 					}
+
+					if ( build === undefined ) continue;
 
 					const object3D = build.clone(); // apply component transform
 
@@ -1212,9 +1255,13 @@
 
 			}
 
-			function buildObject( objectId, objects, modelData, textureData ) {
+			function buildObject( objectId, objects, modelData, textureData, path ) {
 
-				const objectData = modelData[ 'resources' ][ 'object' ][ objectId ];
+				const source = resolveObjectSource( objectId, modelData, path );
+				if ( ! source ) return;
+
+				const objectData = source.objectData;
+				modelData = source.modelData;
 
 				if ( objectData[ 'mesh' ] ) {
 
@@ -1224,7 +1271,7 @@
 					applyExtensions( extensions, meshData, modelXml );
 					objects[ objectData.id ] = getBuild( meshData, objects, modelData, textureData, objectData, buildGroup );
 
-				} else {
+				} else if ( objectData[ 'components' ] ) {
 
 					const compositeData = objectData[ 'components' ];
 					objects[ objectData.id ] = getBuild( compositeData, objects, modelData, textureData, objectData, buildComposite );
@@ -1256,14 +1303,37 @@
 
 					}
 
-				} // start build
-
+				} // index every model part before resolving cross-part components
 
 				for ( let i = 0; i < modelsKeys.length; i ++ ) {
 
 					const modelsKey = modelsKeys[ i ];
 					const modelData = modelsData[ modelsKey ];
-					const objectIds = Object.keys( modelData[ 'resources' ][ 'object' ] );
+					partPaths[ modelsKey ] = modelData;
+					const resources = modelData[ 'resources' ];
+					const partObjectsData = resources ? resources[ 'object' ] : null;
+
+					if ( ! partObjectsData ) continue;
+
+					for ( const objectId of Object.keys( partObjectsData ) ) {
+
+						if ( ! partObjects[ objectId ] ) {
+
+							partObjects[ objectId ] = { objectData: partObjectsData[ objectId ], modelData: modelData };
+
+						}
+
+					}
+
+				} // start build
+
+				for ( let i = 0; i < modelsKeys.length; i ++ ) {
+
+					const modelsKey = modelsKeys[ i ];
+					const modelData = modelsData[ modelsKey ];
+					const resources = modelData[ 'resources' ];
+					if ( ! resources || ! resources[ 'object' ] ) continue;
+					const objectIds = Object.keys( resources[ 'object' ] );
 
 					for ( let j = 0; j < objectIds.length; j ++ ) {
 
@@ -1300,6 +1370,8 @@
 
 					const buildItem = buildData[ i ];
 					const object3D = objects[ buildItem[ 'objectId' ] ]; // apply transform
+
+					if ( ! object3D ) continue;
 
 					const transform = buildItem[ 'transform' ];
 
