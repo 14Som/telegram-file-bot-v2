@@ -29,7 +29,6 @@ TIMEOUT = 30
 CHUNK = 1024 * 1024
 UPDATE_DIR = appconfig.HOME / "update"
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-DETACHED_PROCESS = 0x00000008
 
 
 class UpdateError(Exception):
@@ -150,25 +149,32 @@ def download(asset_url: str, size: int, digest: str) -> Path:
     return target
 
 
-def _script(source: Path, target: Path, pid: int, size: int) -> str:
+def _script(source: Path, target: Path, pid: int, size: int, digest: str) -> str:
     def quoted(path: Path) -> str:
         return "'" + str(path).replace("'", "''") + "'"
 
+    check = (
+        "((Test-Path -LiteralPath {0}) -and "
+        "((Get-Item -LiteralPath {0}).Length -eq " + str(size) + ") -and "
+        "((Get-FileHash -LiteralPath {0} -Algorithm SHA256).Hash -eq '" + digest + "'))"
+    )
     return (
         "$ErrorActionPreference = 'SilentlyContinue'\n"
         f"Wait-Process -Id {pid} -Timeout 180\n"
+        f"Wait-Process -Name {quoted(target.stem)} -Timeout 60\n"
         f"$source = {quoted(source)}\n"
         f"$target = {quoted(target)}\n"
         "$installed = $false\n"
         "for ($i = 0; $i -lt 240; $i++) {\n"
         "  Copy-Item -LiteralPath $source -Destination ($target + '.new') -Force\n"
-        f"  if ((Test-Path -LiteralPath ($target + '.new')) -and ((Get-Item -LiteralPath ($target + '.new')).Length -eq {size})) {{\n"
+        "  if (" + check.format("($target + '.new')") + ") {\n"
         "    Move-Item -LiteralPath ($target + '.new') -Destination $target -Force\n"
-        f"    if ((Test-Path -LiteralPath $target) -and ((Get-Item -LiteralPath $target).Length -eq {size})) {{ $installed = $true; break }}\n"
+        "    if (" + check.format("$target") + ") { $installed = $true; break }\n"
         "  }\n"
         "  Start-Sleep -Milliseconds 500\n"
         "}\n"
         "if ($installed) {\n"
+        "  Start-Sleep -Seconds 2\n"
         "  Start-Process -FilePath $target -WorkingDirectory (Split-Path -LiteralPath $target)\n"
         "  Remove-Item -LiteralPath $source -Force\n"
         "}\n"
@@ -184,11 +190,26 @@ def schedule_install(source: Path, target: Optional[Path] = None) -> Dict[str, A
     if not source.exists():
         raise UpdateError("The downloaded update is missing.")
     UPDATE_DIR.mkdir(parents=True, exist_ok=True)
+    hasher = hashlib.sha256()
+    with source.open("rb") as handle:
+        for block in iter(lambda: handle.read(CHUNK), b""):
+            hasher.update(block)
     script_path = UPDATE_DIR / "apply-update.ps1"
     script_path.write_text(
-        _script(source, dest, os.getpid(), source.stat().st_size),
+        _script(
+            source,
+            dest,
+            os.getpid(),
+            source.stat().st_size,
+            hasher.hexdigest().upper(),
+        ),
         encoding="utf-8",
     )
+    clean_env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.upper().startswith("_PYI_") and key.upper() != "_MEIPASS2"
+    }
     subprocess.Popen(
         [
             "powershell.exe",
@@ -200,7 +221,8 @@ def schedule_install(source: Path, target: Optional[Path] = None) -> Dict[str, A
             "-File",
             str(script_path),
         ],
-        creationflags=CREATE_NO_WINDOW | DETACHED_PROCESS,
+        creationflags=CREATE_NO_WINDOW,
         close_fds=True,
+        env=clean_env,
     )
     return {"scheduled": True, "size": source.stat().st_size}

@@ -5,11 +5,11 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
   <title>Telegram File Explorer</title>
-  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="icon" href="/favicon.svg?v=2" type="image/svg+xml">
   <link rel="stylesheet" href="/static/vendor/videojs/video-js.min.css">
   <link rel="stylesheet" href="/static/vendor/viewerjs/viewer.min.css">
   <link rel="stylesheet" href="/static/vendor/overlayscrollbars/overlayscrollbars.min.css">
-  <link rel="stylesheet" href="/static/styles.css?v=36">
+  <link rel="stylesheet" href="/static/styles.css?v=41">
 </head>
 <body>
   <div class="app">
@@ -268,12 +268,16 @@
           </span>
         </footer>
 
-        <section class="uploads" id="uploadPanel" hidden aria-label="Uploads">
-          <div class="uploads-head">
-            <span>Uploads</span>
-            <button class="icon-btn small" id="uploadsClose" title="Hide uploads" aria-label="Hide uploads"></button>
+        <section class="transfers" id="transferBar" hidden aria-label="Transfers">
+          <div class="transfers-head">
+            <button class="transfers-toggle" id="transferToggle" type="button" aria-expanded="true" title="Collapse transfers">
+              <span class="transfers-title" id="transferTitle">Transfers</span>
+              <span class="transfers-summary" id="transferSummary"></span>
+              <span class="transfers-chev" id="transferChev"></span>
+            </button>
+            <button class="icon-btn small" id="transferClose" title="Hide transfers" aria-label="Hide transfers"></button>
           </div>
-          <div class="upload-list" id="uploadList"></div>
+          <div class="transfer-list" id="transferList"></div>
         </section>
       </main>
 
@@ -457,6 +461,7 @@
     <div class="modal-backdrop" id="modalBackdrop"></div>
     <div class="modal" role="dialog" aria-modal="true" id="modalBox">
       <div class="modal-head">
+        <span class="modal-logo" id="modalLogo" aria-hidden="true"></span>
         <div>
           <h2 id="modalTitle"></h2>
           <p id="modalSubtitle" hidden></p>
@@ -489,6 +494,6 @@
   <script src="/static/vendor/mammoth/mammoth.browser.min.js"></script>
   <script src="/static/viewer3d.js?v=3"></script>
   <script src="/static/reader.js?v=18"></script>
-  <script src="/static/app.js?v=35"></script>
+  <script src="/static/app.js?v=43"></script>
 </body>
 </html>

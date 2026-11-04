@@ -3,6 +3,71 @@
 (function () {
   "use strict";
 
+  // PDF.js 5.5 needs these, added after Chrome 124; older Android WebViews lack them.
+  if (typeof URL.parse !== "function") {
+    URL.parse = function (value, base) {
+      try { return new URL(value, base); } catch (error) { return null; }
+    };
+  }
+  if (typeof Promise.try !== "function") {
+    Promise.try = function (callback) {
+      const args = Array.prototype.slice.call(arguments, 1);
+      return new Promise((resolve) => resolve(callback.apply(undefined, args)));
+    };
+  }
+  if (typeof Uint8Array.prototype.toHex !== "function") {
+    Uint8Array.prototype.toHex = function () {
+      let out = "";
+      for (let i = 0; i < this.length; i += 1) out += this[i].toString(16).padStart(2, "0");
+      return out;
+    };
+  }
+  if (typeof Uint8Array.prototype.toBase64 !== "function") {
+    Uint8Array.prototype.toBase64 = function () {
+      let binary = "";
+      for (let i = 0; i < this.length; i += 1) binary += String.fromCharCode(this[i]);
+      return btoa(binary);
+    };
+  }
+  if (typeof Map.prototype.getOrInsert !== "function") {
+    Map.prototype.getOrInsert = function (key, value) {
+      if (this.has(key)) return this.get(key);
+      this.set(key, value);
+      return value;
+    };
+  }
+  if (typeof Map.prototype.getOrInsertComputed !== "function") {
+    Map.prototype.getOrInsertComputed = function (key, compute) {
+      if (this.has(key)) return this.get(key);
+      const value = compute(key);
+      this.set(key, value);
+      return value;
+    };
+  }
+  if (typeof WeakMap.prototype.getOrInsert !== "function") {
+    WeakMap.prototype.getOrInsert = function (key, value) {
+      if (this.has(key)) return this.get(key);
+      this.set(key, value);
+      return value;
+    };
+  }
+  if (typeof WeakMap.prototype.getOrInsertComputed !== "function") {
+    WeakMap.prototype.getOrInsertComputed = function (key, compute) {
+      if (this.has(key)) return this.get(key);
+      const value = compute(key);
+      this.set(key, value);
+      return value;
+    };
+  }
+  const responseBytes = () =>
+    this.arrayBuffer().then((buffer) => new Uint8Array(buffer));
+  if (typeof Response.prototype.bytes !== "function") {
+    Response.prototype.bytes = responseBytes;
+  }
+  if (typeof Blob.prototype.bytes !== "function") {
+    Blob.prototype.bytes = responseBytes;
+  }
+
   const FORMAT_LABELS = {
     pdf: "PDF",
     epub: "EPUB",
@@ -1587,6 +1652,7 @@
     state.page = clamp(Number(saved && saved.page) || 1, 1, state.pages);
     state.pageOffset = clamp(Number(saved && saved.offset) || 0, 0, 1);
     state.zoom = clamp(Number(saved && saved.zoom) || 1, PDF_ZOOM_MIN, PDF_ZOOM_MAX);
+    if (window.AndroidBridge) state.zoom = Math.min(state.zoom, 1);
     state.pdfScrollEl = h("div", "reader-pdf-scroll" + (state.pdfNight ? " night" : ""));
     state.pdfStackEl = h("div", "reader-pdf-stack");
     state.pdfScrollEl.append(state.pdfStackEl);

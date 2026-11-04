@@ -113,15 +113,21 @@ survives on the boot volume.
   actors to your star catalogue and gives new stars an IMDb portrait. **Remove** clears
   the details; the poster is kept across syncs and vault restores. Details come from
   IMDb, one lookup per click
-- **Previews** — video plays in a Video.js player that resumes where you stopped,
-  steps to the next/previous video, shows seek-preview thumbnails on the progress
-  bar and adjusts playback speed. Images open in Viewer.js with zoom, pan,
-  rotate, flip, one-to-one size, slideshow and a thumbnail strip for stepping
-  through the folder. Videos with a poor Telegram cover can get a new one from
-  *Thumbnail*: five frames are pulled from the stream and you keep the one you
-  like, or shuffle for five more taken from random points; the pick is kept
-  across syncs, sign-outs and vault restores. MKV, HEVC and other formats
-  the built-in player can't decode can be opened in **mpv** instead. PDF and text
+- **Previews** — video opens in a VLC-style player that resumes where you stopped,
+  steps to the next/previous video and shows seek-preview thumbnails on the progress
+  bar. **CC** lists subtitles inside the movie and every subtitle file in its folder
+  (including a `Subs` folder), searches OpenSubtitles and downloads a pick into the
+  player — no need to leave the app. Subtitle delay, text size and playback speed
+  are adjustable. **Audio** switches language tracks, rebuilding the file on the PC
+  without downloading the movie again. MKV, HEVC and other formats are remuxed with
+  ffmpeg on the fly, and anything it still can't decode opens in **mpv** instead.
+  On the phone the player is libVLC, so every format, embedded subtitle and audio
+  track plays natively, with lock, PiP and fit-to-screen controls. Images open in
+  Viewer.js with zoom, pan, rotate, flip, one-to-one size, slideshow and a
+  thumbnail strip for stepping through the folder. Videos with a poor Telegram
+  cover can get a new one from *Thumbnail*: five frames are pulled from the stream
+  and you keep the one you like, or shuffle for five more taken from random
+  points; the pick is kept across syncs, sign-outs and vault restores. PDF and text
   preview inline; downloads keep the original filename
 - **Read documents** — EPUB/EPUB3, FB2, PDF, DOC/DOCX, HTML/HTM/XML, Markdown and
   TXT open in a built-in reader. PDFs scroll continuously with lazy page rendering,
@@ -153,6 +159,10 @@ survives on the boot volume.
 - **Library reports** — *Duplicate files* finds identical copies to clean up, and
   *Storage report* shows what takes space by type, collection and file
 - **Shortcuts** — press `?` for a keyboard cheat-sheet
+- **Activity bar** — a status bar above the file list tracks every running upload
+  and download with progress, speed and size. Collapse it when idle. Pause a
+  download at any point and resume it from the bar — even after restarting the
+  app — and cancel anything that is no longer needed
 - **Uploads** — drag & drop files or whole folder trees with per-file progress;
   cancel a running upload from the Uploads panel. Video, audio and image files are
   recognized from their content (even without a file extension) so they preview and
@@ -253,6 +263,37 @@ official GitHub releases and verified by checksum before use:
 
 Nothing is uploaded; the tools run on your PC against the same local stream the app
 uses. You can skip both — the app plays video and images without them.
+
+## Android app (viewer)
+
+Download the APK from
+[telegram-file-explorer-android → Releases](https://github.com/14Som/telegram-file-explorer-android/releases/latest)
+and open it on your phone (Android 7.0+, arm64). The app runs the same backend and the
+same Telegram connection inside the
+APK, so there is no extra server to host. It can view, stream and download, and
+it never offers uploads — the server also rejects them.
+
+First launch: sign in with your own Telegram account (phone code or QR), pick
+the vault channel, then tap sync. Downloads go to **Downloads/Telegram Files**.
+Files split into parts are joined automatically before download. A downloads
+bar above the tabs shows progress, speed and size; pause or resume a transfer,
+cancel it, or open a finished file from there.
+
+Build it with JDK 17, Android SDK 35 and Python 3.13:
+
+```bat
+set TFE_BUILD_PYTHON=C:\Path\To\Python313\python.exe
+cd android
+gradlew.bat assembleRelease
+```
+
+The signed APK lands in `android\app\build\outputs\apk\release\app-release.apk`.
+Signing reads `android\app\keystore.properties` (`storeFile` may start with `~`);
+that file and the keystore are git-ignored, so back both up — Android will only
+install updates signed with the same key. Use `assembleDebug` for a quick
+test build instead. Install on an arm64 phone (Android 7.0 or newer) or an
+x86_64 emulator. A debug and a release APK cannot replace each other; uninstall
+the old one first.
 
 ## Where your data lives
 

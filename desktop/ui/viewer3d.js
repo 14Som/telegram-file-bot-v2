@@ -51,6 +51,11 @@
     state.status = overlay.querySelector("#viewer3dStatus");
     state.saveBtn = overlay.querySelector("#viewer3dSaveBtn");
     state.openBtn = overlay.querySelector("#viewer3dOpenBtn");
+    if (window.AndroidBridge) state.openBtn.hidden = true;
+    if (window.AndroidBridge) {
+      const help = overlay.querySelector(".viewer3d-help");
+      if (help) help.textContent = "Drag to orbit · Pinch to zoom";
+    }
     overlay.querySelector("#viewer3dClose").addEventListener("click", close);
     state.saveBtn.addEventListener("click", saveThumbnail);
     state.openBtn.addEventListener("click", openExternal);
@@ -269,7 +274,7 @@
     state.status.textContent = "Loading model…";
     state.saveBtn.disabled = true;
     state.saveBtn.hidden = false;
-    state.openBtn.hidden = false;
+    state.openBtn.hidden = !!window.AndroidBridge;
 
     state.renderer = createRenderer();
     state.scene = createScene();

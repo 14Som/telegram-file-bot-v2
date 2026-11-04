@@ -62,7 +62,7 @@ const SVG = {
   foldExpand: '<path d="m7 9 5-5 5 5"/><path d="m7 15 5 5 5-5"/>'
 };
 
-const LOGO = '<svg viewBox="0 0 64 64" aria-hidden="true"><rect width="64" height="64" rx="15" fill="#229ED9"/><path d="M50.5 15.2 13.8 29.4c-1.5.6-1.4 2.6.1 3.1l9.2 2.9 3.5 10.9c.4 1.3 2.1 1.6 3 .5l5.3-5.9 9.4 6.9c1.1.8 2.7.2 3-1.2l5.1-24.8c.3-1.4-1-2.4-2.9-2.6zM24 35.6l20.6-13.4-16.5 16.3-.6 5.9z" fill="#fff"/><path d="m24 35.6 20.6-13.4-16.5 16.3-.6 5.9-1.2-4.2z" fill="#d8efff"/></svg>';
+const LOGO = '<svg viewBox="0 0 204 204" aria-hidden="true"><defs><linearGradient id="tfeBg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#23a6ff"/><stop offset=".45" stop-color="#0b84ff"/><stop offset="1" stop-color="#0247f3"/></linearGradient><linearGradient id="tfeBack" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ffbc0c"/><stop offset="1" stop-color="#ee8e05"/></linearGradient><linearGradient id="tfeFront" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ffe356"/><stop offset=".55" stop-color="#ffdb3e"/><stop offset="1" stop-color="#ffcb25"/></linearGradient><linearGradient id="tfeBevel" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#faf0b4" stop-opacity=".86"/><stop offset="1" stop-color="#faf0b4" stop-opacity="0"/></linearGradient><linearGradient id="tfeSq" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#1e5385"/><stop offset="1" stop-color="#123d6a"/></linearGradient><clipPath id="tfeFrontClip"><rect x="35" y="72" width="141" height="91" rx="12"/></clipPath></defs><rect width="204" height="204" rx="44" fill="url(#tfeBg)"/><path d="M35 50a9 9 0 0 1 9-9h62c8 0 14 11 20 16 2 1 5 2 10 2h22a10 10 0 0 1 10 10v79a10 10 0 0 1-10 10H45a10 10 0 0 1-10-10z" fill="url(#tfeBack)"/><rect x="35" y="72" width="141" height="91" rx="12" fill="url(#tfeFront)"/><g clip-path="url(#tfeFrontClip)"><rect x="35" y="72" width="141" height="9" fill="url(#tfeBevel)"/></g><g fill="url(#tfeSq)"><rect x="86" y="101" width="19" height="18" rx="4"/><rect x="110" y="101" width="19" height="18" rx="4"/><rect x="86" y="124" width="19" height="18" rx="4"/><rect x="110" y="124" width="19" height="18" rx="4"/></g></svg>';
 
 const FILE_GLYPHS = {
   image: "image",
@@ -316,6 +316,7 @@ const S = {
   syncFinalHandled: null,
   transferTimer: null,
   transfers: [],
+  transferRates: {},
   localUpload: null,
   seenTransfers: new Set(),
   refreshTimer: null,
@@ -484,6 +485,7 @@ function init() {
   setIcon($("vaultNewIcon"), "plus");
   setIcon($("vaultBotIcon"), "bot");
   $("lockLogo").innerHTML = LOGO;
+  $("modalLogo").innerHTML = LOGO;
   buildLockPad();
   setIcon($("backBtn"), "back");
   setIcon($("forwardBtn"), "forward");
@@ -492,7 +494,8 @@ function init() {
   document.querySelector(".search-icon").innerHTML = svgRaw("search");
   $("sortDirBtn").innerHTML = svgRaw(S.dir === "asc" ? "sortAsc" : "sortDesc");
   setupScrollbars();
-  $("uploadsClose").innerHTML = svgRaw("close");
+  $("transferClose").innerHTML = svgRaw("close");
+  $("transferChev").innerHTML = svgRaw("chevron");
   $("viewerClose").innerHTML = svgRaw("close");
   $("viewerDownload").innerHTML = svgRaw("download");
   $("viewerPrev").innerHTML = svgRaw("chevronLeft");
@@ -3875,8 +3878,15 @@ function showViewerItem(item) {
   }
 }
 function initVideoViewer(item, token) {
+  if (item.kind === "gif") {
+    initGifViewer(item, token);
+    return;
+  }
+  playMovie(item, token);
+}
+
+function initGifViewer(item, token) {
   const stage = $("viewerStage");
-  const isGif = item.kind === "gif";
   stage.classList.add("video");
   const element = h("video-js", {
     id: "tfePlayer",
@@ -3894,66 +3904,710 @@ function initVideoViewer(item, token) {
     fill: true,
     fluid: false,
     preload: "metadata",
-    playbackRates: [0.5, 0.75, 1, 1.25, 1.5, 2],
+    poster: item.thumb_url || ""
+  });
+  VIEWER.player = player;
+  player.loop(true);
+  player.muted(true);
+  player.ready(() => {
+    if (token !== VIEWER.token) return;
+    try { const playing = player.play(); if (playing && playing.catch) playing.catch(() => {}); } catch (_) {}
+  });
+}
+
+/* ------------------------------------------------------- movie playback */
+const PLAY = {
+  info: null,
+  item: null,
+  online: [],
+  panel: null,
+  panelKind: "",
+  trackEl: null,
+  subKey: "",
+  shift: 0,
+  scale: 1,
+  audio: 0,
+  audioBusy: false,
+  hintTimer: null,
+  cover: null
+};
+
+const PLAY_LANGS = [
+  ["eng", "English"], ["hin", "Hindi"], ["spa", "Spanish"], ["fre", "French"],
+  ["ger", "German"], ["ara", "Arabic"], ["chi", "Chinese"], ["jpn", "Japanese"],
+  ["kor", "Korean"], ["por", "Portuguese"], ["rus", "Russian"], ["tam", "Tamil"],
+  ["tel", "Telugu"], ["mal", "Malayalam"], ["urd", "Urdu"], ["tur", "Turkish"]
+];
+
+function playPrefs(itemId) {
+  try { return JSON.parse(localStorage.getItem(`tfe.play.${itemId}`) || "null") || {}; } catch (_) { return {}; }
+}
+function savePlayPrefs() {
+  if (!PLAY.item) return;
+  try {
+    localStorage.setItem(`tfe.play.${PLAY.item.id}`, JSON.stringify({
+      sub: PLAY.subKey, shift: PLAY.shift, scale: PLAY.scale, audio: PLAY.audio
+    }));
+  } catch (_) {}
+}
+function cueLang(code) {
+  const value = String(code || "").toLowerCase();
+  if (value.length === 3) {
+    const two = value.slice(0, 2);
+    if (two === "en" || two === "hi" || two === "es" || two === "fr" || two === "de"
+      || two === "it" || two === "pt" || two === "ru" || two === "ar" || two === "zh"
+      || two === "ja" || two === "ko" || two === "tr" || two === "nl" || two === "pl"
+      || two === "sv" || two === "no" || two === "da" || two === "fi" || two === "cs"
+      || two === "sk" || two === "hu" || two === "ro" || two === "bg" || two === "el"
+      || two === "he" || two === "uk" || two === "vi" || two === "th" || two === "id"
+      || two === "ms" || two === "ta" || two === "te" || two === "ml" || two === "ur"
+      || two === "bn" || two === "fa") return two;
+    if (two === "ge") return "de";
+    if (two === "du") return "nl";
+    if (two === "ma") return "ms";
+    if (two === "pe") return "fa";
+    if (two === "ch") return "zh";
+    return "en";
+  }
+  return value || "en";
+}
+function langName(code) {
+  const value = String(code || "").toLowerCase();
+  const found = PLAY_LANGS.find(([key]) => key === value || key.slice(0, 2) === value.slice(0, 2));
+  return found ? found[1] : (value ? value.toUpperCase() : "");
+}
+
+function showPlayHint(text, kind) {
+  const player = VIEWER.player;
+  if (!player) return;
+  let node = player.el().querySelector(".play-hint");
+  if (!node) {
+    node = h("div", { class: "play-hint" });
+    player.el().append(node);
+  }
+  node.textContent = text;
+  node.classList.toggle("error", kind === "error");
+  node.hidden = false;
+  if (PLAY.hintTimer) clearTimeout(PLAY.hintTimer);
+  PLAY.hintTimer = setTimeout(() => { node.hidden = true; }, kind === "error" ? 8000 : 3200);
+}
+
+function makePlayCover(item) {
+  const bar = h("span");
+  const status = h("div", { class: "play-cover-status", text: "Opening…" });
+  const detail = h("div", { class: "play-cover-detail" });
+  const actions = h("div", { class: "play-cover-actions" });
+  const art = item.thumb_url
+    ? h("img", { src: item.thumb_url, alt: "" })
+    : h("div", { class: "play-cover-icon" }, fileIcon(item.kind));
+  const root = h("div", { class: "play-cover" },
+    h("div", { class: "play-cover-card" }, art,
+      h("div", { class: "play-cover-copy" },
+        h("h3", { text: item.name || "Movie" }),
+        status,
+        h("div", { class: "play-cover-bar" }, bar),
+        detail,
+        actions
+      )
+    )
+  );
+  status.hidden = false;
+  return {
+    root,
+    progress(ratio, text, note) {
+      status.hidden = false;
+      status.textContent = text || "Preparing…";
+      bar.style.width = `${Math.max(2, Math.min(100, Math.round((ratio || 0) * 100)))}%`;
+      detail.textContent = note || "";
+      actions.replaceChildren();
+    },
+    message(text, note) {
+      status.textContent = text;
+      bar.style.width = "0%";
+      detail.textContent = note || "";
+    },
+    buttons(entries) {
+      actions.replaceChildren(...entries.map((entry) => h("button", {
+        class: `btn${entry.primary ? " primary" : ""}`,
+        type: "button",
+        text: entry.label,
+        onclick: entry.onClick
+      })));
+    },
+    remove() { root.remove(); }
+  };
+}
+
+function playUrl(item, token) {
+  return `/api/play/${item.id}/info`;
+}
+
+async function prepareMovie(item, token, video, audio, onProgress) {
+  const query = `video=${encodeURIComponent(video)}&audio=${audio}`;
+  try {
+    await api(`/api/play/${item.id}/prepare`, { method: "POST", body: { video, audio } });
+  } catch (error) {
+    return { error: error.message || "Could not start preparing this movie." };
+  }
+  let misses = 0;
+  while (token === VIEWER.token) {
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    if (token !== VIEWER.token) return { error: "cancelled" };
+    let state = null;
+    try { state = await api(`/api/play/${item.id}/prepare?${query}`); } catch (_) {
+      misses += 1;
+      if (misses > 20) return { error: "The preparation job stopped." };
+      continue;
+    }
+    misses = 0;
+    if (state.state === "ready") {
+      return {
+        url: state.source_url || `/api/play/${item.id}/video?${query}&token=${PLAY.info.token}`,
+        state
+      };
+    }
+    if (state.state === "error") {
+      return { error: state.error || "This movie could not be prepared.", state };
+    }
+    if (onProgress) onProgress(state);
+  }
+  return { error: "cancelled" };
+}
+
+function mergePreparedTracks(state) {
+  if (!state || !PLAY.info) return;
+  const tracks = PLAY.info.tracks || (PLAY.info.tracks = { duration: 0, audio: [], embedded: [] });
+  if (Array.isArray(state.embedded)) tracks.embedded = state.embedded;
+  if (Array.isArray(state.audio_tracks) && state.audio_tracks.length) {
+    tracks.audio = state.audio_tracks;
+  }
+  if (state.duration) PLAY.info.duration = Number(state.duration);
+}
+
+function restoreSubtitleChoice(prefs) {
+  const saved = (prefs && prefs.sub) || "";
+  const entries = subtitleEntries();
+  if (saved && entries.some((entry) => entry.key === saved)) {
+    PLAY.subKey = saved;
+    return;
+  }
+  // VLC shows an attached subtitle track by default; sidecar folders stay off.
+  const embedded = (PLAY.info && PLAY.info.tracks && PLAY.info.tracks.embedded) || [];
+  PLAY.subKey = embedded.length ? `emb:${embedded[0].index}` : "";
+}
+
+async function playMovie(item, token, options) {
+  const stage = $("viewerStage");
+  const opts = options || {};
+  stage.classList.add("video");
+  PLAY.item = item;
+  PLAY.online = [];
+  PLAY.subKey = "";
+  PLAY.audio = 0;
+  PLAY.trackEl = null;
+  PLAY.cover = makePlayCover(item);
+  stage.append(PLAY.cover.root);
+
+  let info = null;
+  try { info = await api(playUrl(item, token)); } catch (error) {
+    if (token !== VIEWER.token) return;
+    PLAY.cover.message("This movie can’t be opened.", error.message || "");
+    PLAY.cover.buttons([
+      { label: "Open in mpv", onClick: () => openInMpv(item) },
+      { label: "Close", primary: true, onClick: closeViewer }
+    ]);
+    return;
+  }
+  if (token !== VIEWER.token) return;
+  PLAY.info = info;
+  const prefs = playPrefs(item.id);
+  PLAY.shift = Number(prefs.shift || 0);
+  PLAY.scale = Math.min(2, Math.max(0.6, Number(prefs.scale || 1)));
+  PLAY.subKey = "";
+  PLAY.audio = Number(prefs.audio || 0);
+  mergePreparedTracks(info.prepare);
+
+  const fromUrl = opts.source || null;
+  if (fromUrl) {
+    PLAY.cover.remove();
+    restoreSubtitleChoice(prefs);
+    startVideoPlayer(item, token, fromUrl, { type: "video/mp4", startAt: opts.startAt || info.play_pos });
+    return;
+  }
+  if (!opts.forceTranscode && info.direct) {
+    PLAY.cover.remove();
+    restoreSubtitleChoice(prefs);
+    startVideoPlayer(item, token, info.stream_url, {
+      type: item.mime || "video/mp4",
+      startAt: Number(info.play_pos || 0)
+    });
+    return;
+  }
+
+  // MKV and friends: convert once to MP4 on this PC, then stream the copy.
+  const ready = !opts.forceTranscode && info.prepare && info.prepare.state === "ready"
+    && info.prepare.source_url;
+  if (ready) {
+    PLAY.audio = Number(info.prepare.audio || 0);
+    PLAY.cover.remove();
+    restoreSubtitleChoice(prefs);
+    startVideoPlayer(item, token, info.prepare.source_url, {
+      type: "video/mp4",
+      startAt: Number(info.play_pos || 0)
+    });
+    return;
+  }
+  if (!info.ffmpeg) {
+    PLAY.cover.message(
+      "A converter is needed",
+      "ffmpeg joins the video and subtitle tracks into a format this player can show. It is downloaded once and checked before use."
+    );
+    PLAY.cover.buttons([
+      { label: "Install ffmpeg", primary: true, onClick: () => promptInstallTool("ffmpeg", () => playMovie(item, token, opts)) },
+      { label: "Open in mpv", onClick: () => openInMpv(item) },
+      { label: "Close", onClick: closeViewer }
+    ]);
+    return;
+  }
+
+  const videoMode = opts.forceTranscode ? "h264" : "copy";
+  PLAY.cover.progress(0, "Preparing this movie…", "The first play downloads the file once, then keeps a converted copy for instant replays.");
+  const result = await prepareMovie(item, token, videoMode, PLAY.audio, (state) => {
+    PLAY.cover.progress(state.progress || 0, state.stage || "Preparing…",
+      state.state === "downloading" ? "Downloaded once from Telegram, then cached on this PC." : "");
+  });
+  if (token !== VIEWER.token) return;
+  if (result.error === "cancelled") return;
+  if (result.error) {
+    PLAY.cover.message("This movie could not be prepared.", result.error);
+    PLAY.cover.buttons([
+      { label: "Convert with H.264", primary: true, onClick: () => playMovie(item, token, { forceTranscode: true }) },
+      { label: "Open in mpv", onClick: () => openInMpv(item) },
+      { label: "Close", onClick: closeViewer }
+    ]);
+    return;
+  }
+  mergePreparedTracks(result.state);
+  PLAY.audio = Number(result.state && result.state.audio || 0);
+  PLAY.cover.remove();
+  restoreSubtitleChoice(prefs);
+  startVideoPlayer(item, token, result.url, {
+    type: "video/mp4",
+    startAt: Number(info.play_pos || 0)
+  });
+}
+
+function startVideoPlayer(item, token, source, options) {
+  const stage = $("viewerStage");
+  const opts = options || {};
+  const element = h("video-js", {
+    id: "tfePlayer",
+    class: "video-js vjs-tfe",
+    controls: "",
+    autoplay: "",
+    playsinline: "",
+    preload: "metadata"
+  });
+  element.append(h("source", { src: source, type: opts.type || "video/mp4" }));
+  stage.append(element);
+  const player = videojs(element, {
+    autoplay: true,
+    controls: true,
+    fill: true,
+    fluid: false,
+    preload: "metadata",
+    playbackRates: [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2],
     poster: item.thumb_url || "",
     controlBar: { pictureInPictureToggle: true }
   });
   VIEWER.player = player;
-  // The sprite thumbnails plugin only reads its state on the media's own
-  // loadstart/loadedmetadata, so it has to exist before those fire — long
-  // before the preview sheet is ready. The URL is swapped in later.
   VIEWER.sprites = null;
-  if (!isGif) {
-    try {
-      VIEWER.sprites = player.spriteThumbnails({
-        url: `/api/storyboard/${item.id}/sprite.jpg?v=${Number(item.thumb_version) || 0}`,
-        width: 160,
-        height: 90,
-        columns: 5,
-        rows: 6,
-        interval: 3,
-        downlink: 0,
-        responsive: false
-      });
-    } catch (_) {
-      /* previews are optional */
-    }
-  }
-  if (isGif) {
-    player.loop(true);
-    player.muted(true);
-  }
+  try {
+    VIEWER.sprites = player.spriteThumbnails({
+      url: `/api/storyboard/${item.id}/sprite.jpg?v=${Number(item.thumb_version) || 0}`,
+      width: 160, height: 90, columns: 5, rows: 6, interval: 3, downlink: 0, responsive: false
+    });
+  } catch (_) { /* previews are optional */ }
+
+  let startAt = Number(opts.startAt || 0);
   player.one("loadedmetadata", () => {
     if (token !== VIEWER.token) return;
-    const start = Number(item.play_pos || 0);
     const duration = Number(player.duration() || 0);
-    if (!isGif && start > 3 && (!duration || start < duration - 3)) {
-      player.currentTime(start);
-      toast(`Resumed at ${fmtDuration(start)}`, "info", 2200);
+    if (startAt > 3 && (!duration || startAt < duration - 3)) {
+      player.currentTime(startAt);
+      toast(`Resumed at ${fmtDuration(startAt)}`, "info", 2200);
     }
-    if (!isGif) loadStoryboard(item, token);
+    loadStoryboard(item, token);
+    applyCueScale();
+    if (PLAY.subKey) applySubtitle(player, PLAY.subKey, true);
   });
   player.on("timeupdate", () => {
-    if (token !== VIEWER.token || isGif || player.paused()) return;
+    if (token !== VIEWER.token || player.paused()) return;
     const now = Date.now();
     if (now - VIEWER.lastSave < 5000) return;
     VIEWER.lastSave = now;
     queueViewerPosition(item, player.currentTime(), player.duration());
   });
-  player.on("pause", () => { if (token === VIEWER.token && !isGif) saveViewerPosition(true); });
+  player.on("pause", () => { if (token === VIEWER.token) saveViewerPosition(true); });
   player.on("ended", () => {
-    if (token !== VIEWER.token || isGif) return;
+    if (token !== VIEWER.token) return;
     item.play_pos = 0;
     queueViewerPosition(item, 0, player.duration());
   });
   player.on("error", () => {
-    if (token === VIEWER.token) showViewerFallback(item);
+    if (token !== VIEWER.token) return;
+    if (source === item.stream_url) {
+      showViewerFallback(item);
+    } else {
+      showPlayHint("This converted copy can’t play.", "error");
+    }
   });
   player.ready(() => {
     if (token !== VIEWER.token) return;
+    buildPlayerTools(player);
+    applyCueScale();
     try { const playing = player.play(); if (playing && playing.catch) playing.catch(() => {}); } catch (_) {}
     try { player.focus({ preventScroll: true }); } catch (_) {}
   });
+}
+
+function buildPlayerTools(player) {
+  const host = player.el();
+  const subsButton = h("button", { class: "player-tool", type: "button", title: "Subtitles (C)", text: "CC" });
+  const audioButton = h("button", { class: "player-tool", type: "button", title: "Audio track", text: "Audio" });
+  subsButton.addEventListener("click", () => togglePlayerPanel(player, "subs", subsButton));
+  audioButton.addEventListener("click", () => togglePlayerPanel(player, "audio", audioButton));
+  const tools = h("div", { class: "player-tools" }, subsButton, audioButton);
+  host.append(tools);
+  PLAY.tools = { subs: subsButton, audio: audioButton, root: tools };
+  if (PLAY.subKey) subsButton.classList.add("on");
+}
+
+function togglePlayerPanel(player, kind, button) {
+  if (PLAY.panel && PLAY.panelKind === kind) {
+    closePlayerPanel();
+    button.classList.remove("open");
+    return;
+  }
+  closePlayerPanel();
+  PLAY.panelKind = kind;
+  Object.values(PLAY.tools || {}).forEach((entry) => {
+    if (entry && entry.classList) entry.classList.remove("open");
+  });
+  button.classList.add("open");
+  const panel = h("div", { class: "play-panel" });
+  const body = h("div", { class: "play-panel-body" });
+  const close = h("button", { class: "play-panel-close", type: "button", text: "×", onclick: closePlayerPanel });
+  panel.append(
+    h("header", {}, h("span", { text: kind === "subs" ? "Subtitles" : "Audio tracks" }), close),
+    body
+  );
+  player.el().append(panel);
+  PLAY.panel = panel;
+  if (kind === "subs") renderSubtitlePanel(player, body);
+  else renderAudioPanel(player, body);
+}
+
+function closePlayerPanel() {
+  if (PLAY.panel) PLAY.panel.remove();
+  PLAY.panel = null;
+  PLAY.panelKind = "";
+  PLAY.redrawSubtitles = null;
+  PLAY.redrawAudio = null;
+  Object.values(PLAY.tools || {}).forEach((entry) => {
+    if (entry && entry.classList) entry.classList.remove("open");
+  });
+}
+
+function subtitleEntries() {
+  const info = PLAY.info;
+  if (!info) return [];
+  const out = [];
+  const tracks = (info.tracks && info.tracks.embedded) || [];
+  for (const track of tracks) {
+    out.push({
+      key: `emb:${track.index}`,
+      group: "In the file",
+      label: track.label || `Track ${Number(track.index) + 1}`,
+      lang: track.lang || "",
+      url: `/api/play/${info.id}/subs/emb/${track.index}.vtt?token=${info.token}`
+    });
+  }
+  for (const sub of info.sidecars || []) {
+    out.push({
+      key: `side:${sub.id}`,
+      group: "In the folder",
+      label: sub.label || sub.name,
+      lang: sub.lang || "",
+      url: sub.url
+    });
+  }
+  for (const sub of PLAY.online || []) {
+    out.push({
+      key: `online:${sub.hash}`,
+      group: "Downloaded",
+      label: sub.label,
+      lang: sub.lang || "",
+      url: sub.url
+    });
+  }
+  return out;
+}
+
+function renderSubtitlePanel(player, body) {
+  const list = h("div", { class: "play-list" });
+  const draw = () => {
+    list.replaceChildren();
+    const entries = subtitleEntries();
+    const off = h("button", {
+      class: `play-item${PLAY.subKey ? "" : " active"}`,
+      type: "button",
+      onclick: () => { applySubtitle(player, ""); draw(); }
+    }, h("span", { class: "play-item-label", text: "Off" }));
+    list.append(off);
+    let lastGroup = "";
+    for (const entry of entries) {
+      if (entry.group !== lastGroup) {
+        lastGroup = entry.group;
+        list.append(h("div", { class: "play-group", text: entry.group }));
+      }
+      const active = PLAY.subKey === entry.key;
+      list.append(h("button", {
+        class: `play-item${active ? " active" : ""}`,
+        type: "button",
+        onclick: () => {
+          applySubtitle(player, entry.key);
+          draw();
+        }
+      },
+        h("span", { class: "play-item-label", text: entry.label }),
+        entry.lang ? h("span", { class: "play-item-lang", text: langName(entry.lang) || entry.lang.toUpperCase() }) : null
+      ));
+    }
+    if (!entries.length) {
+      list.append(h("div", { class: "play-empty", text: "No subtitle files found next to this movie. Search online below." }));
+    }
+    if (PLAY.info.tracks && PLAY.info.tracks.graphic && PLAY.info.tracks.graphic.length) {
+      list.append(h("div", { class: "play-note", text: `Picture-based subtitle tracks (${PLAY.info.tracks.graphic.join(", ")}) can’t be shown in the browser. Use a text subtitle instead.` }));
+    }
+  };
+
+  const shiftLabel = h("span", { class: "play-value", text: `${PLAY.shift.toFixed(1)}s` });
+  PLAY.shiftLabel = shiftLabel;
+  const scaleLabel = h("span", { class: "play-value", text: `${Math.round(PLAY.scale * 100)}%` });
+  const bumpShift = (delta) => nudgeSubtitleDelay(delta);
+  const bumpScale = (delta) => {
+    PLAY.scale = Math.max(0.6, Math.min(2, Math.round((PLAY.scale + delta) * 10) / 10));
+    scaleLabel.textContent = `${Math.round(PLAY.scale * 100)}%`;
+    applyCueScale();
+    savePlayPrefs();
+  };
+
+  const query = h("input", { class: "play-search-input", type: "search", placeholder: "Search subtitles (movie name)" });
+  const lang = h("select", { class: "play-search-lang" },
+    ...PLAY_LANGS.map(([code, label]) => h("option", { value: code, text: label }))
+  );
+  lang.value = "eng";
+  const results = h("div", { class: "play-results" });
+  const searchButton = h("button", { class: "play-search-go", type: "button", text: "Search" });
+  const runSearch = async () => {
+    searchButton.disabled = true;
+    results.replaceChildren(h("div", { class: "play-empty", text: "Searching OpenSubtitles…" }));
+    try {
+      const data = await api(`/api/play/subs/search?item_id=${PLAY.info.id}&q=${encodeURIComponent(query.value.trim())}&lang=${encodeURIComponent(lang.value)}`);
+      const rows = (data && data.results) || [];
+      results.replaceChildren();
+      if (!rows.length) {
+        results.append(h("div", { class: "play-empty", text: "No subtitles found. Check the spelling or try another language." }));
+      }
+      for (const row of rows.slice(0, 14)) {
+        const button = h("button", {
+          class: "play-result",
+          type: "button",
+          onclick: async () => {
+            button.disabled = true;
+            try {
+              const got = await api("/api/play/subs/download", { method: "POST", body: { item_id: PLAY.info.id, url: row.url, label: row.name } });
+              PLAY.online.unshift({ hash: String(got.url).split("/").pop().replace(/\.vtt.*$/, ""), label: got.label || row.name, lang: row.lang, url: got.url });
+              applySubtitle(player, `online:${PLAY.online[0].hash}`);
+              draw();
+              results.replaceChildren(h("div", { class: "play-empty", text: `Added ${got.label || row.name}.` }));
+            } catch (error) {
+              results.replaceChildren(h("div", { class: "play-empty", text: error.message }));
+            }
+          }
+        },
+          h("span", { class: "play-result-name", text: row.name }),
+          h("span", { class: "play-result-meta", text: `${row.language || langName(row.lang)} · ${Number(row.downloads || 0).toLocaleString()} downloads` })
+        );
+        results.append(button);
+      }
+    } catch (error) {
+      results.replaceChildren(h("div", { class: "play-empty", text: error.message }));
+    }
+    searchButton.disabled = false;
+  };
+  searchButton.addEventListener("click", runSearch);
+  query.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") { event.preventDefault(); runSearch(); }
+    event.stopPropagation();
+  });
+
+  draw();
+  body.append(
+    list,
+    h("div", { class: "play-row" },
+      h("span", { class: "play-row-label", text: "Delay" }),
+      h("button", { class: "play-step", type: "button", text: "−0.5", onclick: () => bumpShift(-0.5) }),
+      shiftLabel,
+      h("button", { class: "play-step", type: "button", text: "+0.5", onclick: () => bumpShift(0.5) })
+    ),
+    h("div", { class: "play-row" },
+      h("span", { class: "play-row-label", text: "Text size" }),
+      h("button", { class: "play-step", type: "button", text: "A−", onclick: () => bumpScale(-0.1) }),
+      scaleLabel,
+      h("button", { class: "play-step", type: "button", text: "A+", onclick: () => bumpScale(0.1) })
+    ),
+    h("div", { class: "play-search" }, query, h("div", { class: "play-search-row" }, lang, searchButton)),
+    results
+  );
+  PLAY.redrawSubtitles = draw;
+}
+
+function renderAudioPanel(player, body) {
+  const list = h("div", { class: "play-list" });
+  const note = h("div", { class: "play-note" });
+  const draw = () => {
+    list.replaceChildren();
+    const tracks = (PLAY.info && PLAY.info.tracks && PLAY.info.tracks.audio) || [];
+    if (!tracks.length) {
+      list.append(h("button", {
+        class: "play-item active",
+        type: "button",
+        onclick: () => closePlayerPanel()
+      }, h("span", { class: "play-item-label", text: "Original audio track" })));
+    }
+    for (const track of tracks) {
+      const label = track.title || track.language || `Track ${Number(track.index) + 1}`;
+      const meta = [track.language || langName(track.lang), track.channels, track.codec].filter(Boolean).join(" · ");
+      list.append(h("button", {
+        class: `play-item${Number(track.index) === Number(PLAY.audio) ? " active" : ""}`,
+        type: "button",
+        onclick: () => switchAudio(player, Number(track.index), list)
+      },
+        h("span", { class: "play-item-label", text: label }),
+        meta ? h("span", { class: "play-item-lang", text: meta }) : null
+      ));
+    }
+    note.textContent = tracks.length
+      ? "Audio tracks are rebuilt on this PC without downloading the movie again. Playback keeps its place."
+      : "This file plays its own audio track. Movies in MKV list every language here.";
+  };
+  draw();
+  body.append(list, note);
+  PLAY.redrawAudio = draw;
+}
+
+function applySubtitle(player, key, quiet) {
+  if (PLAY.trackEl) {
+    try { player.removeRemoteTextTrack(PLAY.trackEl); } catch (_) {}
+    PLAY.trackEl = null;
+  }
+  PLAY.subKey = key || "";
+  if (PLAY.tools && PLAY.tools.subs) PLAY.tools.subs.classList.toggle("on", Boolean(PLAY.subKey));
+  if (!PLAY.subKey) {
+    savePlayPrefs();
+    return;
+  }
+  const entry = subtitleEntries().find((candidate) => candidate.key === PLAY.subKey);
+  if (!entry) {
+    PLAY.subKey = "";
+    savePlayPrefs();
+    return;
+  }
+  const url = `${entry.url}${entry.url.includes("?") ? "&" : "?"}shift=${PLAY.shift.toFixed(1)}`;
+  try {
+    PLAY.trackEl = player.addRemoteTextTrack({
+      kind: "subtitles",
+      src: url,
+      srclang: cueLang(entry.lang),
+      label: entry.label || "Subtitles",
+      default: true
+    }, true);
+    const textTrack = PLAY.trackEl && PLAY.trackEl.track;
+    if (textTrack) textTrack.mode = "showing";
+  } catch (error) {
+    showPlayHint("This subtitle could not be loaded.", "error");
+    PLAY.subKey = "";
+  }
+  if (!quiet && PLAY.subKey) showPlayHint(`Subtitles: ${entry.label}`);
+  savePlayPrefs();
+}
+
+function nudgeSubtitleDelay(delta) {
+  PLAY.shift = Math.max(-30, Math.min(30, Math.round((PLAY.shift + delta) * 10) / 10));
+  if (PLAY.shiftLabel) PLAY.shiftLabel.textContent = `${PLAY.shift.toFixed(1)}s`;
+  if (PLAY.subKey) {
+    applySubtitle(VIEWER.player, PLAY.subKey, true);
+    showPlayHint(`Subtitle delay ${PLAY.shift > 0 ? "+" : ""}${PLAY.shift.toFixed(1)}s`);
+  } else {
+    showPlayHint("Turn on subtitles first.", "error");
+  }
+  savePlayPrefs();
+}
+
+function applyCueScale() {  const player = VIEWER.player;
+  if (!player) return;
+  player.el().style.setProperty("--tfe-cue-size", `${(22 * PLAY.scale).toFixed(1)}px`);
+}
+
+async function switchAudio(player, index, list) {
+  if (PLAY.audioBusy || index === Number(PLAY.audio)) return;
+  const item = PLAY.item;
+  const token = VIEWER.token;
+  if (!item || !PLAY.info) return;
+  if (!PLAY.info.ffmpeg) {
+    promptInstallTool("ffmpeg", () => switchAudio(player, index, list));
+    return;
+  }
+  PLAY.audioBusy = true;
+  Array.from(list.children).forEach((node) => { node.disabled = true; });
+  showPlayHint(`Preparing audio track ${index + 1}…`);
+  const result = await prepareMovie(item, token, "copy", index, null);
+  PLAY.audioBusy = false;
+  if (token !== VIEWER.token) return;
+  Array.from(list.children).forEach((node) => { node.disabled = false; });
+  if (result.error) {
+    showPlayHint(result.error, "error");
+    return;
+  }
+  mergePreparedTracks(result.state);
+  const time = Number(player.currentTime() || 0);
+  const paused = player.paused();
+  PLAY.audio = index;
+  savePlayPrefs();
+  if (PLAY.redrawAudio) PLAY.redrawAudio();
+  player.src({ src: result.url, type: "video/mp4" });
+  player.one("loadedmetadata", () => {
+    if (token !== VIEWER.token) return;
+    player.currentTime(time);
+    if (PLAY.subKey) applySubtitle(player, PLAY.subKey, true);
+    if (!paused) { const playing = player.play(); if (playing && playing.catch) playing.catch(() => {}); }
+  });
+  showPlayHint(`Audio: ${((PLAY.info.tracks && PLAY.info.tracks.audio) || [])[index]?.language || `track ${index + 1}`}`);
+}
+
+function stopPlaybackState() {
+  closePlayerPanel();
+  if (PLAY.hintTimer) { clearTimeout(PLAY.hintTimer); PLAY.hintTimer = null; }
+  PLAY.info = null;
+  PLAY.item = null;
+  PLAY.online = [];
+  PLAY.trackEl = null;
+  PLAY.subKey = "";
+  PLAY.tools = null;
+  PLAY.cover = null;
+  PLAY.audioBusy = false;
 }
 function initImageViewer(item, token) {
   const stage = $("viewerStage");
@@ -4020,9 +4674,12 @@ function showViewerFallback(item) {
   stage.className = "viewer-stage";
   stage.replaceChildren(h("div", { class: "viewer-fallback" },
     fileIcon(item.kind),
-    h("h3", { text: "This format can’t play here" }),
-    h("p", { text: "MKV, HEVC and some other formats need a different decoder. mpv plays this same Telegram stream in its own window." }),
-    h("button", { class: "btn primary", type: "button", text: "Open in mpv", onclick: () => openInMpv(item) })
+    h("h3", { text: "This video won’t play in its current format" }),
+    h("p", { text: "The app can convert it to H.264 MP4 on this PC. Large movies take a few minutes the first time, then play instantly." }),
+    h("div", { class: "viewer-fallback-actions" },
+      h("button", { class: "btn primary", type: "button", text: "Convert for playback", onclick: () => playMovie(item, VIEWER.token, { forceTranscode: true }) }),
+      h("button", { class: "btn", type: "button", text: "Open in mpv", onclick: () => openInMpv(item) })
+    )
   ));
 }
 function queueViewerPosition(item, position, duration) {
@@ -4070,6 +4727,7 @@ function toggleViewerSlideshow(button) {
 function destroyViewerMedia() {
   if (window.TFEReader && window.TFEReader.isOpen()) window.TFEReader.close();
   stopViewerSlideshow();
+  stopPlaybackState();
   if (VIEWER.spriteTimer) { clearTimeout(VIEWER.spriteTimer); VIEWER.spriteTimer = null; }
   VIEWER.sprites = null;
   if (VIEWER.gallery) { try { VIEWER.gallery.destroy(); } catch (_) {} VIEWER.gallery = null; }
@@ -4143,7 +4801,7 @@ async function openInMpv(item) {
   }
 }
 function promptInstallTool(tool, after) {
-  const label = tool === "mpv" ? "mpv player" : tool === "ffmpeg" ? "ffmpeg previews" : tool;
+  const label = tool === "mpv" ? "mpv player" : tool === "ffmpeg" ? "ffmpeg (previews and playback)" : tool;
   const size = tool === "mpv" ? 32 * 1024 * 1024 : 26 * 1024 * 1024;
   const note = h("p", { class: "modal-note", text: `It downloads once (about ${fmtSize(size)}) from the official GitHub release and is verified before use.` });
   let timer = null;
@@ -4191,12 +4849,20 @@ function promptInstallTool(tool, after) {
     ]
   });
 }
-function downloadItem(item) {
-  if (!item) return;
-  const link = h("a", { href: item.download_url, download: "" });
-  document.body.append(link);
-  link.click();
-  link.remove();
+async function downloadItem(item) {
+  if (!item || item.id === undefined) return;
+  try {
+    const data = await api("/api/downloads", { method: "POST", body: { item_id: item.id } });
+    if (data.transfer) {
+      S.transfers = [...S.transfers.filter((entry) => entry.id !== data.transfer.id), data.transfer];
+      renderTransfers();
+      showTransferBar();
+      startTransferPolling();
+      setStatus(`Downloading ${item.name || "file"}…`);
+    }
+  } catch (error) {
+    toast(error.message || "The download could not start.", "error", 6000);
+  }
 }
 function promptReupload(item) {
   openModal({
@@ -4214,7 +4880,7 @@ function promptReupload(item) {
             await api(`/api/items/${item.id}/reupload`, { method: "POST" });
             closeModal();
             toast("Re-uploading so the video can stream — see Transfers.", "success", 6000);
-            showUploadPanel();
+            showTransferBar();
             startTransferPolling();
           } catch (error) { toast(error.message, "error"); }
         }
@@ -4227,7 +4893,7 @@ async function startMergeDownload(item) {
   try {
     await api("/api/merge", { method: "POST", body: { item_id: item.id } });
     toast(`Downloading ${plural(item.part_of.count, "part")} of ${item.part_of.base} — see Transfers.`, "success", 5000);
-    showUploadPanel();
+    showTransferBar();
     startTransferPolling();
     await fetchTransfers(false);
   } catch (error) {
@@ -5051,14 +5717,22 @@ function promptMovie(item) {
 function bulkIds() {
   return Array.from(S.selection);
 }
-function bulkDownload() {
+async function bulkDownload() {
   const ids = bulkIds();
   if (!ids.length) return;
-  const link = h("a", { href: `/api/batch/download?ids=${ids.join(",")}`, download: "" });
-  document.body.append(link);
-  link.click();
-  link.remove();
-  toast(`Preparing ZIP of ${plural(ids.length, "file")}…`, "info", 5000);
+  try {
+    const data = await api("/api/downloads", { method: "POST", body: { ids } });
+    if (data.transfer) {
+      S.transfers = [...S.transfers.filter((entry) => entry.id !== data.transfer.id), data.transfer];
+      renderTransfers();
+      showTransferBar();
+      startTransferPolling();
+    }
+    toast(`Preparing ZIP of ${plural(ids.length, "file")}…`, "info", 5000);
+    setStatus("Building ZIP download…");
+  } catch (error) {
+    toast(error.message || "The ZIP download could not start.", "error", 6000);
+  }
 }
 async function bulkFavorite() {
   const ids = bulkIds();
@@ -6662,16 +7336,21 @@ function promptRenameFolder(folder) {
   input.focus();
   input.select();
 }
-function downloadFolder(folder) {
+async function downloadFolder(folder) {
   if (!folder) return;
-  const link = h("a", {
-    href: `/api/folders/download?name=${encodeURIComponent(folder.folder)}`,
-    download: ""
-  });
-  document.body.append(link);
-  link.click();
-  link.remove();
-  toast("Preparing ZIP download…", "info", 5000);
+  try {
+    const data = await api("/api/downloads", { method: "POST", body: { folder: folder.folder } });
+    if (data.transfer) {
+      S.transfers = [...S.transfers.filter((entry) => entry.id !== data.transfer.id), data.transfer];
+      renderTransfers();
+      showTransferBar();
+      startTransferPolling();
+    }
+    toast("Preparing ZIP download…", "info", 5000);
+    setStatus("Building folder ZIP…");
+  } catch (error) {
+    toast(error.message || "The folder download could not start.", "error", 6000);
+  }
 }
 function promptDeleteFolder(folder) {
   openModal({
@@ -6789,7 +7468,7 @@ function promptSettings() {
   const sectionConnection = h("div", { class: "settings-section" },
     h("h3", { text: "Connection" }),
     h("div", { class: "settings-row" }, h("span", { text: "Telegram" }), h("span", { class: "value", text: st.authorized ? "Signed in" : "Not signed in" })),
-    h("div", { class: "settings-row" }, h("span", { text: "Explorer version" }), h("span", { class: "value", text: st.version || "2.2" })),
+    h("div", { class: "settings-row" }, h("span", { text: "Explorer version" }), h("span", { class: "value", text: st.version || "2.3" })),
     h("div", { class: "settings-row" },
       h("span", { text: "Server bot" }),
       h("span", { class: "value", text: S.server ? (SERVER_LABELS[S.server.state] || "Unknown") : "Checking…" })
@@ -7153,33 +7832,33 @@ function startUpload(input) {
     xhr
   };
   $("uploadBtn").disabled = true;
-  renderUploads();
-  showUploadPanel();
+  renderTransfers();
+  showTransferBar();
   xhr.open("POST", "/api/upload");
   xhr.setRequestHeader("X-TFE", "1");
   xhr.withCredentials = true;
   xhr.upload.onprogress = (event) => {
     if (!event.lengthComputable || !S.localUpload) return;
     S.localUpload.sent = event.loaded;
-    renderUploads();
+    renderTransfers();
   };
   xhr.onload = async () => {
     const local = S.localUpload;
     S.localUpload = null;
     $("uploadBtn").disabled = !ready();
-    if (local && local.canceled) { renderUploads(); return; }
+    if (local && local.canceled) { renderTransfers(); return; }
     let data = null;
     try { data = JSON.parse(xhr.responseText || "{}"); } catch (_) { data = {}; }
     if (xhr.status >= 200 && xhr.status < 300) {
       S.transfers = data.transfers || [];
-      renderUploads();
-      showUploadPanel();
+      renderTransfers();
+      showTransferBar();
       startTransferPolling();
       setStatus("Uploading to Telegram…");
     } else {
       const message = (data && data.detail) || `Upload failed (${xhr.status})`;
       toast(typeof message === "string" ? message : "Upload failed.", "error", 6000);
-      renderUploads();
+      renderTransfers();
     }
   };
   xhr.onerror = () => {
@@ -7189,7 +7868,7 @@ function startUpload(input) {
     if (!local || !local.canceled) {
       toast("The upload could not reach the local app.", "error");
     }
-    renderUploads();
+    renderTransfers();
   };
   xhr.send(form);
 }
@@ -7200,7 +7879,7 @@ function cancelLocalUpload() {
   S.localUpload = null;
   try { local.xhr.abort(); } catch (_) { /* request already finished */ }
   $("uploadBtn").disabled = !ready();
-  renderUploads();
+  renderTransfers();
   setStatus("Upload cancelled");
   toast("Upload cancelled.", "success", 3000);
   // The app may have accepted the body just before the abort landed; make
@@ -7224,71 +7903,182 @@ async function cancelTransfer(id) {
     toast(error.message || "The transfer could not be cancelled.", "error");
   }
 }
-function showUploadPanel() {
-  $("uploadPanel").hidden = false;
+function showTransferBar() {
+  const bar = $("transferBar");
+  if (!bar) return;
+  bar.hidden = false;
+  syncTransferHeight();
+}
+function syncTransferHeight() {
+  const bar = $("transferBar");
+  const height = bar && !bar.hidden ? bar.offsetHeight : 0;
+  document.documentElement.style.setProperty("--transfer-h", `${height}px`);
+}
+function toggleTransfers() {
+  const bar = $("transferBar");
+  bar.classList.toggle("collapsed");
+  const collapsed = bar.classList.contains("collapsed");
+  $("transferToggle").setAttribute("aria-expanded", collapsed ? "false" : "true");
+  $("transferToggle").title = collapsed ? "Expand transfers" : "Collapse transfers";
+  syncTransferHeight();
 }
 function transferActive(state) {
   return state === "queued" || state === "uploading" || state === "splitting"
     || state === "downloading" || state === "merging";
 }
-function renderUploads() {
-  const panel = $("uploadPanel");
-  const list = $("uploadList");
+async function pauseTransfer(id) {
+  try {
+    await api(`/api/transfers/${encodeURIComponent(id)}/pause`, { method: "POST" });
+    await fetchTransfers(false);
+  } catch (error) {
+    toast(error.message || "The download could not be paused.", "error");
+  }
+}
+async function resumeTransfer(id) {
+  try {
+    await api(`/api/transfers/${encodeURIComponent(id)}/resume`, { method: "POST" });
+    await fetchTransfers(false);
+    startTransferPolling();
+  } catch (error) {
+    toast(error.message || "The download could not be resumed.", "error");
+  }
+}
+async function revealTransfer(id) {
+  try {
+    await api(`/api/downloads/${encodeURIComponent(id)}/reveal`, { method: "POST" });
+  } catch (error) {
+    toast(error.message || "That file is no longer on this PC.", "error");
+  }
+}
+function saveMergedFile(url) {
+  const link = h("a", { href: url, download: "" });
+  document.body.append(link);
+  link.click();
+  link.remove();
+}
+function transferPercent(transfer) {
+  const state = transfer.state;
+  if (state === "done" || state === "ready" || state === "merging") return 100;
+  if (state === "cancelled") return 0;
+  if (!transfer.size) return transferActive(state) ? 0 : 100;
+  return Math.min(100, Math.round(((transfer.sent || 0) / transfer.size) * 100));
+}
+function transferSub(transfer) {
+  const state = transfer.state;
+  const written = `${fmtSize(transfer.sent || 0)} of ${fmtSize(transfer.size || 0)}`;
+  const rate = transferSpeed(transfer);
+  if (state === "error") return transfer.error || "The transfer failed.";
+  if (state === "cancelled") return "Cancelled";
+  if (state === "paused") return `Paused at ${written}`;
+  if (state === "queued") return transfer.kind === "download" ? "Waiting to start" : "Queued";
+  if (state === "done") {
+    if (transfer.kind !== "download") return transfer.parts ? `Done · ${transfer.parts} parts uploaded` : "Done";
+    return `Saved to ${transfer.dir || "Downloads"}`;
+  }
+  if (state === "splitting") return "Splitting into archive parts…";
+  if (state === "merging") return "Joining parts into one file…";
+  if (state === "ready") return "Complete file ready to save";
+  if (state === "downloading") {
+    if (!transfer.kind) return `Downloading parts · ${written}`;
+    const head = transfer.zipped ? `Downloading ZIP · ${written}` : `Downloading · ${written}`;
+    return rate ? `${head} · ${rate}` : head;
+  }
+  const head = `Uploading · ${written}${transfer.parts ? ` · ${transfer.parts} parts` : ""}`;
+  return rate ? `${head} · ${rate}` : head;
+}
+function transferSpeed(transfer) {
+  const sample = S.transferRates[transfer.id];
+  return sample && sample.rate > 0 ? `${fmtSize(sample.rate)}/s` : "";
+}
+function renderTransfers() {
+  const bar = $("transferBar");
+  const list = $("transferList");
   const rows = [];
   if (S.localUpload) {
     const local = S.localUpload;
     const pct = local.size ? Math.min(100, Math.round((local.sent / local.size) * 100)) : 0;
-    const sub = h("div", { class: "upload-sub" }, "Sending to the app… ");
+    const sub = h("div", { class: "transfer-sub" }, "Sending to the app… ");
     const cancel = h("button", { class: "link-btn", type: "button", text: "Cancel" });
     cancel.addEventListener("click", cancelLocalUpload);
     sub.append(cancel);
-    rows.push(h("div", { class: "upload-row" },
-      h("div", { class: "upload-line" }, h("span", { class: "upload-name", text: local.name, title: local.name }), h("span", { class: "upload-pct", text: `${pct}%` })),
-      h("div", { class: "upload-track" }, h("i", { style: `width:${pct}%` })),
-      sub
+    rows.push(h("div", { class: "transfer-row" },
+      iconNode("upload", "transfer-kind"),
+      h("div", { class: "transfer-body" },
+        h("div", { class: "transfer-line" }, h("span", { class: "transfer-name", text: local.name, title: local.name }), h("span", { class: "transfer-pct", text: `${pct}%` })),
+        h("div", { class: "transfer-track" }, h("i", { style: `width:${pct}%` })),
+        sub
+      )
     ));
   }
   for (const transfer of S.transfers) {
     const state = transfer.state;
-    const active = transferActive(state);
-    const pct = state === "merging" || state === "ready"
-      ? 100
-      : transfer.size ? Math.min(100, Math.round(((transfer.sent || 0) / transfer.size) * 100)) : active ? 0 : 100;
-    let sub;
-    if (state === "error") sub = transfer.error;
-    else if (state === "cancelled") sub = "Cancelled";
-    else if (state === "done") sub = transfer.parts ? `Done · ${transfer.parts} parts uploaded` : "Done";
-    else if (state === "queued") sub = "Queued";
-    else if (state === "splitting") sub = "Splitting into archive parts…";
-    else if (state === "downloading") sub = `Downloading parts · ${fmtSize(transfer.sent || 0)} of ${fmtSize(transfer.size)}`;
-    else if (state === "merging") sub = "Joining parts into one file…";
-    else if (state === "ready") sub = "Complete file ready to save";
-    else sub = `${fmtSize(transfer.sent || 0)} of ${fmtSize(transfer.size)}${transfer.parts ? ` · ${transfer.parts} parts` : ""}`;
-    const subLine = h("div", { class: "upload-sub" });
-    subLine.append(sub);
+    const pct = transferPercent(transfer);
+    const download = transfer.kind === "download";
+    const uploading = transfer.kind === "upload" || state === "uploading" || state === "splitting";
+    const subLine = h("div", { class: "transfer-sub" }, transferSub(transfer));
+    const actions = h("span", { class: "transfer-actions" });
+    if (download && (state === "downloading" || state === "queued")) {
+      const button = h("button", { class: "link-btn", type: "button", text: "Pause" });
+      button.addEventListener("click", () => pauseTransfer(transfer.id));
+      actions.append(button);
+    } else if (download && (state === "paused" || state === "error")) {
+      const button = h("button", { class: "link-btn", type: "button", text: state === "error" ? "Retry" : "Resume" });
+      button.addEventListener("click", () => resumeTransfer(transfer.id));
+      actions.append(button);
+    }
+    if (transferActive(state) || state === "paused") {
+      const button = h("button", { class: "link-btn", type: "button", text: "Cancel" });
+      button.addEventListener("click", () => cancelTransfer(transfer.id));
+      actions.append(button);
+    }
+    if (state === "done" && download) {
+      const button = h("button", { class: "link-btn", type: "button", text: "Show in folder" });
+      button.addEventListener("click", () => revealTransfer(transfer.id));
+      actions.append(button);
+    }
     if (state === "ready" && transfer.result_url) {
-      const save = h("button", { class: "link-btn", type: "button", text: "Save file" });
-      save.addEventListener("click", () => downloadItem({ download_url: transfer.result_url }));
-      subLine.append(" ", save);
+      const button = h("button", { class: "link-btn", type: "button", text: "Save file" });
+      button.addEventListener("click", () => saveMergedFile(transfer.result_url));
+      actions.append(button);
     }
-    if (active) {
-      const cancel = h("button", { class: "link-btn", type: "button", text: "Cancel" });
-      cancel.addEventListener("click", () => cancelTransfer(transfer.id));
-      subLine.append(" ", cancel);
-    }
+    if (actions.childElementCount) subLine.append(" ", actions);
     const pctText = state === "error" ? "!" : state === "cancelled" ? "—" : `${pct}%`;
-    rows.push(h("div", { class: `upload-row ${state}` },
-      h("div", { class: "upload-line" }, h("span", { class: "upload-name", text: transfer.name, title: transfer.name }), h("span", { class: "upload-pct", text: pctText })),
-      h("div", { class: "upload-track" }, h("i", { style: `width:${pct}%` })),
-      subLine
+    rows.push(h("div", { class: `transfer-row ${state}` },
+      iconNode(uploading ? "upload" : "download", "transfer-kind"),
+      h("div", { class: "transfer-body" },
+        h("div", { class: "transfer-line" }, h("span", { class: "transfer-name", text: transfer.name, title: transfer.name }), h("span", { class: "transfer-pct", text: pctText })),
+        h("div", { class: "transfer-track" }, h("i", { style: `width:${pct}%` })),
+        subLine
+      )
     ));
   }
   if (!rows.length) {
-    list.replaceChildren(h("div", { class: "upload-empty", text: "No uploads in this session." }));
+    list.replaceChildren(h("div", { class: "transfer-empty", text: "No transfers in this session." }));
   } else {
     list.replaceChildren(...rows);
   }
-  panel.hidden = !S.localUpload && !S.transfers.length;
+  const active = S.transfers.filter((transfer) => transferActive(transfer.state)).length;
+  const paused = S.transfers.filter((transfer) => transfer.state === "paused").length;
+  $("transferSummary").textContent = active
+    ? `${active} active${paused ? ` · ${paused} paused` : ""}`
+    : (paused ? `${paused} paused` : "");
+  if (!S.localUpload && !S.transfers.length) bar.hidden = true;
+  syncTransferHeight();
+}
+function sampleTransferRates(transfers) {
+  const now = performance.now();
+  for (const transfer of transfers) {
+    const moving = transfer.state === "downloading" || transfer.state === "uploading"
+      || transfer.state === "splitting";
+    if (!moving) {
+      delete S.transferRates[transfer.id];
+      continue;
+    }
+    const previous = S.transferRates[transfer.id];
+    const sent = transfer.sent || 0;
+    const rate = previous && now > previous.t ? (sent - previous.sent) / ((now - previous.t) / 1000) : 0;
+    S.transferRates[transfer.id] = { sent, t: now, rate: Math.max(0, rate) };
+  }
 }
 function startTransferPolling() {
   if (S.transferTimer) return;
@@ -7300,18 +8090,19 @@ async function pollTransfers() {
     const transfers = data.transfers || [];
     const active = transfers.filter((transfer) => transferActive(transfer.state));
     let newlyDone = 0;
-    let newlyFailed = 0;
+    let newlySaved = 0;
     let newlyReady = 0;
     let newlyCancelled = 0;
+    sampleTransferRates(transfers);
     for (const transfer of transfers) {
       if (transfer.state === "done" && !S.seenTransfers.has(transfer.id)) {
         S.seenTransfers.add(transfer.id);
-        newlyDone += 1;
+        if (transfer.kind === "download") newlySaved += 1;
+        else newlyDone += 1;
       }
       if (transfer.state === "error" && !S.seenTransfers.has(`e:${transfer.id}`)) {
         S.seenTransfers.add(`e:${transfer.id}`);
-        newlyFailed += 1;
-        toast(`${transfer.name}: ${transfer.error || "upload failed"}`, "error", 7000);
+        toast(`${transfer.name}: ${transfer.error || "transfer failed"}`, "error", 7000);
       }
       if (transfer.state === "ready" && !S.seenTransfers.has(`r:${transfer.id}`)) {
         S.seenTransfers.add(`r:${transfer.id}`);
@@ -7323,21 +8114,27 @@ async function pollTransfers() {
       }
     }
     S.transfers = transfers;
-    renderUploads();
+    renderTransfers();
     if (newlyDone) {
       await Promise.all([loadNav(), loadItems({ reset: true })]);
       toast(`${plural(newlyDone, "upload")} complete.`, "success");
       setStatus("Upload complete");
     }
+    if (newlySaved) {
+      toast(newlySaved === 1
+        ? "Download complete — saved to Downloads."
+        : `${newlySaved} downloads complete — saved to Downloads.`, "success", 5000);
+      setStatus("Download complete");
+    }
     if (newlyReady) {
-      toast(`Complete file ready — click Save file in the transfers list.`, "success", 7000);
+      toast(`Complete file ready — click Save file in the transfers bar.`, "success", 7000);
       setStatus("Merged file ready");
     }
     if (newlyCancelled) {
       // A split upload may have already sent parts; the app removes them
       // when it processes the cancel, so refresh the library.
       await Promise.all([loadNav(), loadItems({ reset: true })]);
-      setStatus("Upload cancelled");
+      setStatus("Transfer cancelled");
     }
     if (!active.length && !S.localUpload) {
       clearInterval(S.transferTimer);
@@ -7348,20 +8145,19 @@ async function pollTransfers() {
     /* transient poll failure */
   }
 }
-async function fetchTransfers(showPanel) {
+async function fetchTransfers(showBar) {
   try {
     const data = await api("/api/transfers");
     S.transfers = data.transfers || [];
+    sampleTransferRates(S.transfers);
     for (const transfer of S.transfers) {
       if (transfer.state === "done") S.seenTransfers.add(transfer.id);
       if (transfer.state === "error") S.seenTransfers.add(`e:${transfer.id}`);
       if (transfer.state === "ready") S.seenTransfers.add(`r:${transfer.id}`);
     }
-    renderUploads();
-    if (showPanel && S.transfers.some((transfer) => transferActive(transfer.state))) {
-      showUploadPanel();
-      startTransferPolling();
-    }
+    renderTransfers();
+    if (showBar && (S.transfers.length || S.localUpload)) showTransferBar();
+    if (S.transfers.some((transfer) => transferActive(transfer.state))) startTransferPolling();
   } catch (_) { /* ignore */ }
 }
 
@@ -7673,7 +8469,8 @@ function bindEvents() {
   $("emptyUploadBtn").addEventListener("click", () => $("fileInput").click());
   $("emptyFolderBtn").addEventListener("click", () => $("folderInput").click());
   $("loadMoreBtn").addEventListener("click", loadMore);
-  $("uploadsClose").addEventListener("click", () => { $("uploadPanel").hidden = true; });
+  $("transferClose").addEventListener("click", () => { $("transferBar").hidden = true; syncTransferHeight(); });
+  $("transferToggle").addEventListener("click", toggleTransfers);
   $("moreBtn").addEventListener("click", promptSettings);
   $("quitBtn").addEventListener("click", confirmQuit);
   $("serverChip").addEventListener("click", showServerDetails);
@@ -7718,6 +8515,11 @@ function bindEvents() {
   });
   $("openBtn").addEventListener("click", () => openViewerFor(selectedItem()));
   $("downloadBtn").addEventListener("click", () => downloadItem(selectedItem()));
+  $("viewerDownload").addEventListener("click", (event) => {
+    if (!VIEWER.item) return;
+    event.preventDefault();
+    downloadItem(VIEWER.item);
+  });
   $("thumbBtn").addEventListener("click", () => promptThumbPicker(selectedItem()));
   $("movieBtn").addEventListener("click", () => promptMovie(selectedItem()));
   $("completeBtn").addEventListener("click", () => startMergeDownload(selectedItem()));
@@ -7857,7 +8659,17 @@ function handleViewerKey(event) {
     }
     return;
   }
-  if (player.el().contains(event.target)) return;
+  if (player.el().contains(event.target)) {
+    if (event.target && event.target.closest && event.target.closest("input, textarea, select")) return;
+    if (key === "c" && PLAY.tools) {
+      event.preventDefault();
+      togglePlayerPanel(player, "subs", PLAY.tools.subs);
+    } else if (event.key === "[" || event.key === "]") {
+      event.preventDefault();
+      nudgeSubtitleDelay(event.key === "]" ? 0.5 : -0.5);
+    }
+    return;
+  }
   const seekBy = (delta) => {
     event.preventDefault();
     const duration = Number(player.duration() || 0);
@@ -7878,6 +8690,14 @@ function handleViewerKey(event) {
   else if (key === "l") seekBy(10);
   else if (key === "j") seekBy(-10);
   else if (key === "m") { event.preventDefault(); player.muted(!player.muted()); }
+  else if (key === "c" && PLAY.tools) {
+    event.preventDefault();
+    togglePlayerPanel(player, "subs", PLAY.tools.subs);
+  }
+  else if (event.key === "[" || event.key === "]") {
+    event.preventDefault();
+    nudgeSubtitleDelay(event.key === "]" ? 0.5 : -0.5);
+  }
   else if (key === "f") {
     event.preventDefault();
     if (player.isFullscreen()) player.exitFullscreen();

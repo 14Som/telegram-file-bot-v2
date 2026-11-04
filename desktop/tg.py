@@ -413,7 +413,7 @@ class TelegramService:
                 api_id_int,
                 api_hash,
                 device_model="Telegram File Explorer",
-                system_version="Windows",
+                system_version=os.environ.get("TFE_DEVICE", "Windows"),
                 app_version=APP_VERSION,
                 connection_retries=3,
                 request_retries=3,
@@ -1509,7 +1509,15 @@ class TelegramService:
         if remaining == 0:
             return
         client = self._require_ready()
+        wanted = remaining
         offset = max(0, int(start))
+        # Telegram only accepts a multi-chunk GetFile read that begins on a
+        # 512 KiB boundary; a resumed transfer starts at an arbitrary byte, so
+        # pull from the boundary and drop the lead-in before handing it on.
+        lead = offset % DOWNLOAD_CHUNK
+        if lead:
+            offset -= lead
+            remaining += lead
         end = offset + remaining
         segment = DOWNLOAD_SEGMENT
         streams = max(1, min(DOWNLOAD_STREAMS, (remaining + segment - 1) // segment))
@@ -1570,8 +1578,19 @@ class TelegramService:
                 if len(data) < size:
                     # Never hand a hole to the player or the saved file.
                     raise TGError("The download ended before the file was complete.")
-                yield data
                 schedule()
+                if lead:
+                    if len(data) <= lead:
+                        lead -= len(data)
+                        continue
+                    data = data[lead:]
+                    lead = 0
+                if len(data) > wanted:
+                    data = data[:wanted]
+                wanted -= len(data)
+                yield data
+                if wanted <= 0:
+                    break
         except asyncio.CancelledError:
             raise
         except TGError:
@@ -1930,6 +1949,7 @@ def _sniff_image(data: bytes) -> str:
 def _qr_svg(url: str) -> str:
     buffer = io.BytesIO()
     segno.make(url, error="m").save(
-        buffer, kind="svg", scale=8, border=2, dark="#14213d", light="#ffffff"
+        buffer, kind="svg", scale=8, border=2, dark="#14213d", light="#ffffff",
+        omitsize=True,
     )
     return buffer.getvalue().decode("utf-8")

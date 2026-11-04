@@ -54,6 +54,7 @@ MUTEX_NAME = "Local\\TelegramFileExplorer"
 WINDOW_SIZE = (1380, 880)
 WINDOW_MIN_SIZE = (980, 640)
 WINDOW_BG = "#1f2024"
+ICON_PATH = Path("desktop") / "ui" / "app.ico"
 
 log = logging.getLogger("tfe.native")
 
@@ -262,6 +263,20 @@ def start_server() -> tuple[Optional[uvicorn.Server], Optional[threading.Thread]
     return uv, thread, url
 
 
+def bundled_icon() -> Optional[Path]:
+    """The app icon, from the one-file bundle or the source tree."""
+    roots = []
+    bundle = getattr(sys, "_MEIPASS", None)
+    if bundle:
+        roots.append(Path(bundle))
+    roots.append(PROJECT_DIR)
+    for root in roots:
+        path = root / ICON_PATH
+        if path.is_file():
+            return path
+    return None
+
+
 def open_window(url: str):
     # Explicit coordinates avoid a WebView2 host being left at the WinForms
     # default position (~32767), which renders the whole window blank.
@@ -286,6 +301,43 @@ def open_window(url: str):
         background_color=WINDOW_BG,
         text_select=True,
     )
+
+
+def apply_window_icon(hwnd: int) -> None:
+    """Give the app window the bundled icon for its title bar and taskbar."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32")
+        user32.SendMessageW.restype = ctypes.c_void_p
+        user32.SendMessageW.argtypes = [
+            wintypes.HWND,
+            wintypes.UINT,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+        ]
+        user32.LoadImageW.restype = ctypes.c_void_p
+        user32.LoadImageW.argtypes = [
+            wintypes.HINSTANCE,
+            wintypes.LPCWSTR,
+            wintypes.UINT,
+            ctypes.c_int,
+            ctypes.c_int,
+            wintypes.UINT,
+        ]
+        if user32.SendMessageW(hwnd, 0x007F, 1, 0):  # WM_GETICON, ICON_BIG
+            return
+        icon = bundled_icon()
+        if not icon:
+            return
+        for metric, slot in ((11, 1), (49, 0)):  # SM_CXICON, SM_CXSMICON
+            size = int(user32.GetSystemMetrics(metric))
+            handle = user32.LoadImageW(None, str(icon), 1, size, size, 0x10)
+            if handle:
+                user32.SendMessageW(hwnd, 0x0080, slot, handle)  # WM_SETICON
+    except Exception:
+        log.exception("Could not apply the app window icon")
 
 
 def fit_webview_bounds() -> None:
@@ -338,6 +390,7 @@ def fit_webview_bounds() -> None:
         if not top:
             time.sleep(0.5)
             continue
+        apply_window_icon(top)
         client = RECT()
         user32.GetClientRect(top, ctypes.byref(client))
         width = client.right - client.left
@@ -396,11 +449,13 @@ def run_window(url: str, uv: Optional[uvicorn.Server], thread: Optional[threadin
     webview.settings["ALLOW_DOWNLOADS"] = True
     webview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"] = True
     storage = WEBVIEW_DIR if uv is not None else appconfig.HOME / "webview-recovery"
+    icon = bundled_icon()
     try:
         webview.start(
             gui="edgechromium",
             private_mode=False,
             storage_path=str(storage),
+            icon=str(icon) if icon else None,
         )
     except Exception as exc:
         log.exception("The app window could not open")

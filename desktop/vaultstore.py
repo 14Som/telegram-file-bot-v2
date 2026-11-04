@@ -4,8 +4,11 @@ The index (folders, names, tags, notes, favorites), the settings and the
 user-picked artwork are packed into a ``tfe-data-*.zip`` document and posted
 into the vault channel — on every app close and after every completed sync,
 keeping the ten most recent copies. On launch the newest archive is downloaded
-and restored whenever it is newer than the local data, so the whole library
-comes back even if the PC's data folder (or the EXE) is gone.
+and restored whenever it is newer than the last copy this device applied, so
+the whole library comes back even if the PC's data folder (or the EXE) is gone.
+The phone mirrors the desktop library: it restores snapshots but never uploads
+one, because its own index uses default folder names and would overwrite the
+folder layout arranged on the desktop.
 
 Generated imagery is not uploaded: auto thumbnails, IMDb posters and video
 storyboards rebuild themselves from Telegram or the network, and bundling
@@ -41,6 +44,7 @@ SUFFIX = ".zip"
 STAMP_FORMAT = "%Y%m%d-%H%M%S"
 KEEP = 10
 SCAN_LIMIT = 120
+IS_MOBILE = bool(os.environ.get("TFE_MOBILE"))
 
 
 def _marker_path() -> Path:
@@ -152,6 +156,8 @@ def _snapshot_thumbs() -> list:
 
 
 async def save(service: Any) -> Dict[str, Any]:
+    if IS_MOBILE:
+        return {"saved": False, "reason": "read-only device"}
     client = service._require_ready()
     entity = service._entity
     if entity is None:
@@ -265,6 +271,40 @@ def _merge_settings(backup_path: Path) -> None:
         log.exception("Could not merge settings from the vault snapshot")
 
 
+def _local_favorites() -> list:
+    """Favorites picked on this device, keyed the same way as snapshots."""
+    if not appconfig.LIBRARY_PATH.exists():
+        return []
+    try:
+        conn = sqlite3.connect(str(appconfig.LIBRARY_PATH))
+        try:
+            return conn.execute(
+                "SELECT chat_id, message_id FROM items WHERE favorite = 1"
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        log.exception("Could not read this device's favorites")
+        return []
+
+
+def _keep_favorites(favorites: list) -> None:
+    if not favorites:
+        return
+    try:
+        conn = sqlite3.connect(str(appconfig.LIBRARY_PATH))
+        try:
+            conn.executemany(
+                "UPDATE items SET favorite = 1 WHERE chat_id = ? AND message_id = ?",
+                favorites,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        log.exception("Could not keep this device's favorites")
+
+
 async def restore(service: Any) -> Dict[str, Any]:
     client = service._require_ready()
     if service._entity is None:
@@ -273,12 +313,20 @@ async def restore(service: Any) -> Dict[str, Any]:
     if best is None:
         return {"restored": False, "reason": "no snapshot in the vault yet"}
     stamp, message = best
-    try:
-        local_dt = datetime.fromtimestamp(appconfig.LIBRARY_PATH.stat().st_mtime)
-    except OSError:
-        local_dt = None
-    if local_dt is not None and local_dt > stamp:
-        return {"restored": False, "reason": "local data is newer"}
+    # The marker records the last snapshot this device applied or saved. A
+    # library sync also touches the database, so comparing file times would
+    # stop a phone from ever picking up folder changes made on the desktop.
+    applied = _read_marker()
+    if applied is not None:
+        if stamp <= applied:
+            return {"restored": False, "reason": "local data is up to date"}
+    else:
+        try:
+            local_dt = datetime.fromtimestamp(appconfig.LIBRARY_PATH.stat().st_mtime)
+        except OSError:
+            local_dt = None
+        if local_dt is not None and local_dt > stamp:
+            return {"restored": False, "reason": "local data is newer"}
     appconfig.ensure_dirs()
     with tempfile.TemporaryDirectory(prefix="tfe-restore-") as tmp:
         work = Path(tmp)
@@ -292,12 +340,14 @@ async def restore(service: Any) -> Dict[str, Any]:
             unpacked.mkdir()
             for member in members:
                 archive.extract(member, unpacked)
+        favorites = _local_favorites()
         os.replace(unpacked / "library.db", appconfig.LIBRARY_PATH)
         for suffix in ("-wal", "-shm", "-journal"):
             try:
                 Path(str(appconfig.LIBRARY_PATH) + suffix).unlink(missing_ok=True)
             except OSError:
                 pass
+        _keep_favorites(favorites)
         thumbs_root = unpacked / "thumbs"
         if thumbs_root.is_dir():
             for thumb in thumbs_root.rglob("*"):

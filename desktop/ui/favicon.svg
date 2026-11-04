@@ -1,5 +1,41 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <rect width="64" height="64" rx="14" fill="#229ED9"/>
-  <path d="M14 22a4 4 0 0 1 4-4h10l4 4h14a4 4 0 0 1 4 4v18a4 4 0 0 1-4 4H18a4 4 0 0 1-4-4z" fill="#fff"/>
-  <path d="M23 31h18M23 38h12" stroke="#229ED9" stroke-width="3" stroke-linecap="round"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 204 204">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#23a6ff"/>
+      <stop offset=".45" stop-color="#0b84ff"/>
+      <stop offset="1" stop-color="#0247f3"/>
+    </linearGradient>
+    <linearGradient id="back" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffbc0c"/>
+      <stop offset="1" stop-color="#ee8e05"/>
+    </linearGradient>
+    <linearGradient id="front" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffe356"/>
+      <stop offset=".55" stop-color="#ffdb3e"/>
+      <stop offset="1" stop-color="#ffcb25"/>
+    </linearGradient>
+    <linearGradient id="bevel" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#faf0b4" stop-opacity=".86"/>
+      <stop offset="1" stop-color="#faf0b4" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="sq" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1e5385"/>
+      <stop offset="1" stop-color="#123d6a"/>
+    </linearGradient>
+    <clipPath id="frontClip">
+      <rect x="35" y="72" width="141" height="91" rx="12"/>
+    </clipPath>
+  </defs>
+  <rect width="204" height="204" rx="44" fill="url(#bg)"/>
+  <path d="M35 50a9 9 0 0 1 9-9h62c8 0 14 11 20 16 2 1 5 2 10 2h22a10 10 0 0 1 10 10v79a10 10 0 0 1-10 10H45a10 10 0 0 1-10-10z" fill="url(#back)"/>
+  <rect x="35" y="72" width="141" height="91" rx="12" fill="url(#front)"/>
+  <g clip-path="url(#frontClip)">
+    <rect x="35" y="72" width="141" height="9" fill="url(#bevel)"/>
+  </g>
+  <g fill="url(#sq)">
+    <rect x="86" y="101" width="19" height="18" rx="4"/>
+    <rect x="110" y="101" width="19" height="18" rx="4"/>
+    <rect x="86" y="124" width="19" height="18" rx="4"/>
+    <rect x="110" y="124" width="19" height="18" rx="4"/>
+  </g>
 </svg>

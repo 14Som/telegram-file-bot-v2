@@ -13,10 +13,13 @@ from typing import Any, Dict, Iterable, List, Optional
 
 APP_NAME = "TelegramFileExplorer"
 APP_TITLE = "Telegram File Explorer"
-PROJECT_DIR = (
-    Path(sys.executable).resolve().parent
-    if getattr(sys, "frozen", False)
-    else Path(__file__).resolve().parent.parent
+PROJECT_DIR = Path(
+    os.environ.get("TFE_PROJECT_DIR")
+    or (
+        Path(sys.executable).resolve().parent
+        if getattr(sys, "frozen", False)
+        else Path(__file__).resolve().parent.parent
+    )
 )
 
 HOME = Path(os.environ.get("TFE_HOME") or (Path(os.environ.get("APPDATA") or Path.home()) / APP_NAME))
@@ -60,6 +63,21 @@ _sizes = ("B", "KB", "MB", "GB", "TB")
 def ensure_dirs() -> None:
     for path in (HOME, SESSION_DIR, THUMB_DIR, CACHE_DIR):
         path.mkdir(parents=True, exist_ok=True)
+
+
+def downloads_dir() -> Path:
+    """Where transfers save finished files: the Windows Downloads folder."""
+    override = os.environ.get("TFE_DOWNLOADS")
+    candidates = [Path(override)] if override else []
+    candidates.append(Path.home() / "Downloads")
+    candidates.append(HOME / "downloads")
+    for path in candidates:
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+        except OSError:
+            continue
+    return HOME
 
 
 def _read_env_vault() -> str:

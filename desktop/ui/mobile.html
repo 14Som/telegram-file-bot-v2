@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#0b84ff">
+  <title>Telegram File Explorer</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/mobile.css?v=8">
+</head>
+<body>
+  <div class="screen boot" id="bootScreen">
+    <img class="logo" src="/favicon.svg" alt="">
+    <div class="spinner" aria-hidden="true"></div>
+    <p class="muted" id="bootText">Starting…</p>
+    <button class="btn ghost" id="bootRetry" type="button" hidden>Try again</button>
+  </div>
+
+  <div class="screen lock" id="pinScreen" hidden>
+    <img class="logo" src="/favicon.svg" alt="">
+    <h1>App locked</h1>
+    <p class="muted">Enter your PIN to open the library.</p>
+    <div class="pin-dots" id="pinDots" aria-live="polite"></div>
+    <p class="form-error" id="pinError"></p>
+    <div class="pin-pad" id="pinPad">
+      <button type="button" data-key="1">1</button>
+      <button type="button" data-key="2">2</button>
+      <button type="button" data-key="3">3</button>
+      <button type="button" data-key="4">4</button>
+      <button type="button" data-key="5">5</button>
+      <button type="button" data-key="6">6</button>
+      <button type="button" data-key="7">7</button>
+      <button type="button" data-key="8">8</button>
+      <button type="button" data-key="9">9</button>
+      <button type="button" class="blank" tabindex="-1"></button>
+      <button type="button" data-key="0">0</button>
+      <button type="button" class="back" data-key="back" aria-label="Delete digit"></button>
+    </div>
+  </div>
+
+  <div class="screen auth" id="authScreen" hidden>
+    <img class="logo" src="/favicon.svg" alt="">
+    <h1>Telegram File Explorer</h1>
+    <p class="muted" id="authIntro">Sign in with the same Telegram account you use on the desktop app.</p>
+
+    <div class="seg" id="authTabs">
+      <button type="button" class="active" data-auth-tab="phone">Phone</button>
+      <button type="button" data-auth-tab="qr">QR code</button>
+    </div>
+
+    <form class="auth-form" id="phoneForm" autocomplete="off">
+      <label class="field">
+        <span>Phone number</span>
+        <input id="phoneInput" type="tel" inputmode="tel" placeholder="+91 98765 43210" autocomplete="tel">
+      </label>
+      <button class="btn primary" type="submit" id="sendCodeBtn">Send code</button>
+    </form>
+
+    <form class="auth-form" id="codeForm" autocomplete="off" hidden>
+      <label class="field">
+        <span>Login code</span>
+        <input id="codeInput" type="text" inputmode="numeric" placeholder="12345" autocomplete="one-time-code">
+      </label>
+      <button class="btn primary" type="submit" id="verifyCodeBtn">Verify</button>
+      <button class="btn ghost" type="button" id="codeBackBtn">Use another number</button>
+    </form>
+
+    <form class="auth-form" id="passwordForm" autocomplete="off" hidden>
+      <label class="field">
+        <span>Two-step password</span>
+        <input id="passwordInput" type="password" autocomplete="current-password">
+      </label>
+      <button class="btn primary" type="submit" id="verifyPasswordBtn">Sign in</button>
+    </form>
+
+    <div class="auth-form" id="qrBox" hidden>
+      <div class="qr-frame" id="qrImage"></div>
+      <p class="muted small" id="qrHint">Loading QR code…</p>
+      <button class="btn ghost" type="button" id="qrRetry">Refresh QR</button>
+    </div>
+
+    <p class="form-error" id="authError"></p>
+    <p class="fineprint">Uploads are disabled in this app. Your files stay in your Telegram channel.</p>
+  </div>
+
+  <div class="screen vault" id="vaultScreen" hidden>
+    <h1>Choose a storage vault</h1>
+    <p class="muted">Pick the Telegram channel that holds your files.</p>
+    <div class="vault-search">
+      <input id="vaultFilter" type="search" placeholder="Filter channels" autocomplete="off">
+      <button class="btn ghost" type="button" id="vaultRefresh">Refresh</button>
+    </div>
+    <div class="vault-list" id="vaultList"></div>
+    <p class="form-error" id="vaultError"></p>
+    <button class="btn ghost" type="button" id="vaultSignOut">Sign out</button>
+  </div>
+
+  <div id="main" hidden>
+    <header class="topbar" id="mainTopbar">
+      <img class="topbar-logo" src="/favicon.svg" alt="">
+      <div class="topbar-title">
+        <strong id="topTitle">All files</strong>
+        <small id="topSub"></small>
+      </div>
+      <button class="icon-btn" id="searchBtn" type="button" aria-label="Search"></button>
+      <button class="icon-btn" id="syncBtn" type="button" aria-label="Sync with Telegram"></button>
+      <button class="icon-btn" id="selectBtn" type="button" aria-label="Select files"></button>
+      <button class="icon-btn" id="lockBtn" type="button" aria-label="Lock app" title="Lock app" hidden></button>
+    </header>
+    <header class="topbar select-topbar" id="selectTopbar" hidden>
+      <button class="icon-btn" id="selectCancel" type="button" aria-label="Cancel selection"></button>
+      <div class="topbar-title">
+        <strong id="selectTitle">0 selected</strong>
+        <small>Tap files to add or remove</small>
+      </div>
+      <button class="text-btn" id="selectAll" type="button">Select all</button>
+    </header>
+    <div class="searchbar" id="searchBar" hidden>
+      <input id="searchInput" type="search" placeholder="Search names, folders, tags" autocomplete="off">
+      <button class="icon-btn" id="searchClose" type="button" aria-label="Close search"></button>
+    </div>
+    <div class="sync-banner" id="syncBanner" hidden>
+      <div class="sync-track"><div class="sync-fill" id="syncFill"></div></div>
+      <span id="syncText">Syncing…</span>
+    </div>
+
+    <div class="crumb" id="crumb" hidden></div>
+    <div class="chips" id="chips" hidden></div>
+    <main class="content" id="content"></main>
+    <div class="load-more" id="loadMore" hidden><div class="spinner small"></div></div>
+    <div class="select-actions" id="selectActions" hidden>
+      <button class="btn primary" id="selectDownload" type="button">Download</button>
+    </div>
+
+    <section class="dlbar" id="dlBar" hidden aria-label="Downloads">
+      <button class="dlbar-head" id="dlToggle" type="button" aria-expanded="true">
+        <span class="dlbar-title">Downloads</span>
+        <span class="dlbar-sum" id="dlSummary"></span>
+        <span class="dlbar-chev" id="dlChev" data-icon="chev"></span>
+      </button>
+      <div class="dlbar-list" id="dlList"></div>
+    </section>
+
+    <nav class="tabs" id="tabs">
+      <button type="button" class="active" data-tab="files"><span data-icon="files"></span><em>Files</em></button>
+      <button type="button" data-tab="folders"><span data-icon="folder"></span><em>Folders</em></button>
+      <button type="button" data-tab="favorites"><span data-icon="star"></span><em>Favorites</em></button>
+      <button type="button" data-tab="recent"><span data-icon="clock"></span><em>Recent</em></button>
+      <button type="button" data-tab="more"><span data-icon="menu"></span><em>More</em></button>
+    </nav>
+  </div>
+
+  <div class="viewer" id="viewer" hidden>
+    <div class="viewer-bar">
+      <button class="icon-btn light" id="viewerClose" type="button" aria-label="Close"></button>
+      <div class="viewer-title">
+        <strong id="viewerName"></strong>
+        <small id="viewerMeta"></small>
+      </div>
+      <button class="icon-btn light" id="viewerPrev" type="button" aria-label="Previous"></button>
+      <button class="icon-btn light" id="viewerNext" type="button" aria-label="Next"></button>
+      <button class="icon-btn light" id="viewerFavorite" type="button" aria-label="Favorite"></button>
+      <button class="icon-btn light" id="viewerDownload" type="button" aria-label="Download"></button>
+      <button class="icon-btn light" id="viewerInfo" type="button" aria-label="File details"></button>
+    </div>
+    <div class="viewer-stage" id="viewerStage"></div>
+  </div>
+
+  <div class="sheet-backdrop" id="sheetBackdrop" hidden></div>
+  <div class="sheet" id="sheet" hidden>
+    <div class="sheet-head">
+      <strong id="sheetTitle"></strong>
+      <button class="icon-btn" id="sheetClose" type="button" aria-label="Close"></button>
+    </div>
+    <div class="sheet-body" id="sheetBody"></div>
+  </div>
+
+  <div class="toast" id="toast" hidden></div>
+
+  <script src="/static/vendor/three/three.min.js"></script>
+  <script src="/static/vendor/three/libs/fflate.min.js"></script>
+  <script src="/static/vendor/three/loaders/STLLoader.js"></script>
+  <script src="/static/vendor/three/loaders/OBJLoader.js"></script>
+  <script src="/static/vendor/three/loaders/PLYLoader.js"></script>
+  <script src="/static/vendor/three/loaders/3MFLoader.js?v=2"></script>
+  <script src="/static/vendor/three/controls/OrbitControls.js"></script>
+  <script src="/static/vendor/marked/marked.umd.js"></script>
+  <script src="/static/vendor/dompurify/purify.min.js"></script>
+  <script src="/static/vendor/mammoth/mammoth.browser.min.js"></script>
+  <script src="/static/viewer3d.js?v=4"></script>
+  <script src="/static/reader.js?v=23"></script>
+  <script src="/static/mobile.js?v=10"></script>
+</body>
+</html>

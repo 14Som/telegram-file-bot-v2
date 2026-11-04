@@ -1,0 +1,129 @@
+plugins {
+    id 'com.android.application'
+    id 'com.chaquo.python'
+}
+
+def repoRoot = rootProject.projectDir.parentFile
+def backendDir = new File(repoRoot, "desktop")
+def uiDir = new File(backendDir, "ui")
+def generatedPython = layout.buildDirectory.dir("generated/python")
+def generatedAssets = layout.buildDirectory.dir("generated/assets")
+def buildPythonPath = project.findProperty("buildPython")
+        ?: System.getenv("TFE_BUILD_PYTHON")
+
+def keystoreFile = new File(project.projectDir, "keystore.properties")
+def keystoreProps = new Properties()
+def hasReleaseKey = keystoreFile.exists()
+if (hasReleaseKey) {
+    keystoreFile.withInputStream { keystoreProps.load(it) }
+}
+
+android {
+    namespace 'com.telegramfileexplorer.mobile'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "com.telegramfileexplorer.mobile"
+        minSdk 24
+        targetSdk 35
+        versionCode 26
+        versionName "3.11.3"
+        ndk { abiFilters "arm64-v8a", "x86_64" }
+    }
+
+    signingConfigs {
+        if (hasReleaseKey) {
+            release {
+                def storePath = keystoreProps["storeFile"].toString()
+                if (storePath.startsWith("~")) {
+                    storePath = System.getProperty("user.home") + storePath.substring(1)
+                }
+                storeFile new File(storePath)
+                storePassword keystoreProps["storePassword"]
+                keyAlias keystoreProps["keyAlias"]
+                keyPassword keystoreProps["keyPassword"]
+            }
+        }
+    }
+
+    buildTypes {
+        debug {
+        }
+        release {
+            minifyEnabled false
+            if (hasReleaseKey) {
+                signingConfig signingConfigs.release
+            }
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    buildFeatures {
+        buildConfig true
+    }
+
+    sourceSets {
+        main {
+            assets.srcDirs += [generatedAssets.get().asFile]
+            python.srcDirs += [generatedPython.get().asFile]
+        }
+    }
+
+    packagingOptions {
+        jniLibs { useLegacyPackaging true }
+    }
+}
+
+dependencies {
+    implementation 'org.videolan.android:libvlc-all:3.6.5'
+}
+
+chaquopy {
+    defaultConfig {
+        if (buildPythonPath) {
+            buildPython(buildPythonPath)
+        }
+        version = "3.13"
+        pip {
+            install "fastapi==0.103.2"
+            install "pydantic==1.10.24"
+            install "starlette==0.27.0"
+            install "uvicorn==0.30.6"
+            install "python-multipart==0.0.9"
+            install "telethon==1.45.0"
+            install "segno==1.6.6"
+            // Telethon needs pyaes, which has no wheel in Chaquopy's index.
+            options "--find-links", new File(rootProject.projectDir, "wheels").toURI().toString()
+        }
+    }
+}
+
+tasks.register("syncBackendSources", Sync) {
+    from(backendDir) {
+        include "*.py"
+        into "desktop"
+    }
+    into(generatedPython)
+}
+
+tasks.register("syncUiAssets", Sync) {
+    from(uiDir)
+    into(new File(generatedAssets.get().asFile, "ui"))
+}
+
+tasks.named("preBuild").configure {
+    dependsOn "syncBackendSources", "syncUiAssets"
+}
+
+// The merge tasks read the generated folders directly, so they need the
+// sync tasks to have run first regardless of task ordering.
+tasks.matching {
+    it.name in ["mergeDebugPythonSources", "mergeReleasePythonSources",
+                "mergeDebugAssets", "mergeReleaseAssets"]
+}.configureEach {
+    dependsOn "syncBackendSources", "syncUiAssets"
+}

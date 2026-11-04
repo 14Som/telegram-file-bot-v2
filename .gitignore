@@ -9,3 +9,10 @@ build/
 TelegramFileBot.exe
 installer/__pycache__/
 dist/
+android/.gradle/
+android/local.properties
+android/.cxx/
+android/app/keystore.properties
+android/app/src/main/python/__pycache__/
+*.keystore
+*.jks

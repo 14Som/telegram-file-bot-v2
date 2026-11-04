@@ -12,6 +12,7 @@ import secrets
 import shutil
 import sqlite3
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -35,10 +36,12 @@ from . import (
     appconfig,
     applock,
     docconvert,
+    downloadjobs,
     filetypes,
     iteminfo,
     mediatools,
     movielookup,
+    playback,
     serverstatus,
     starlookup,
     storyboard,
@@ -46,8 +49,12 @@ from . import (
     thumbpick,
     updater,
     vaultstore,
-    winshell,
 )
+
+if os.name == "nt":
+    from . import winshell
+else:
+    winshell = None
 from .catalog import (
     Catalog,
     clean_folder_path,
@@ -71,8 +78,19 @@ log = logging.getLogger("tfe.server")
 
 QUIT = threading.Event()
 COOKIE = "tfe_session"
-APP_VERSION = "2.2"
-UI_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent)) / "desktop" / "ui"
+APP_VERSION = "2.5.2"
+# The Android build extracts the interface next to its writable data and runs
+# the same server there; the desktop EXE keeps using the bundled copy.
+UI_DIR = Path(
+    os.environ.get("TFE_UI_DIR")
+    or Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
+    / "desktop"
+    / "ui"
+)
+# The mobile app is a viewer: it may stream and download, never upload. The
+# flag is also exposed to the interface so its upload controls stay hidden.
+MOBILE = os.environ.get("TFE_MOBILE") == "1"
+NO_UPLOAD = MOBILE or os.environ.get("TFE_NO_UPLOAD") == "1"
 UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 # API paths that stay reachable while the app is PIN-locked (status, lock
 # control and quit — none of them expose file data).
@@ -207,6 +225,12 @@ class TransferCancelBody(BaseModel):
     client: str = ""
 
 
+class DownloadBody(BaseModel):
+    item_id: Optional[int] = None
+    ids: Optional[List[int]] = None
+    folder: Optional[str] = None
+
+
 class BatchIdsBody(BaseModel):
     item_ids: List[int]
 
@@ -306,6 +330,14 @@ class FolderPatch(BaseModel):
     new_name: Optional[str] = None
     icon: Optional[str] = None
     note: Optional[str] = None
+
+
+def _body_values(body: BaseModel) -> Dict[str, Any]:
+    """Works with pydantic v2 on desktop and v1 on the Android build."""
+    dump = getattr(body, "model_dump", None)
+    if callable(dump):
+        return dump(exclude_unset=True)
+    return body.dict(exclude_unset=True)
 
 
 def _state(request: Request) -> Any:
@@ -686,6 +718,10 @@ async def lifespan(app: FastAPI):
     # app on this boot too.
     state.locked = applock.has_pin()
     state.catalog = Catalog(appconfig.LIBRARY_PATH, _status_chat_id(state.service.status()))
+    state.downloads = downloadjobs.DownloadJobs(state)
+    resumed = state.downloads.restore()
+    if resumed:
+        log.info("Restored %d unfinished download(s)", resumed)
     marked = await run_in_threadpool(
         state.catalog.ensure_has_thumb, _custom_thumb_ids()
     )
@@ -729,7 +765,12 @@ async def guard(request: Request, call_next):
     if is_api:
         state.last_activity = time.time()
     if is_api and request.url.path != "/api/ping":
-        if request.cookies.get(COOKIE) != state.key:
+        if (
+            request.cookies.get(COOKIE) != state.key
+            and not playback.token_allows(
+                request.query_params.get("token"), request.url.path
+            )
+        ):
             blocked = JSONResponse(
                 {"detail": "This window is not authenticated. Reload the app."},
                 status_code=403,
@@ -809,6 +850,11 @@ async def index():
     return FileResponse(UI_DIR / "index.html", media_type="text/html", headers=FRESH)
 
 
+@app.get("/m", include_in_schema=False)
+async def mobile_index():
+    return FileResponse(UI_DIR / "mobile.html", media_type="text/html", headers=FRESH)
+
+
 @app.get("/favicon.svg", include_in_schema=False)
 async def favicon():
     return FileResponse(UI_DIR / "favicon.svg", media_type="image/svg+xml", headers=FRESH)
@@ -837,6 +883,8 @@ async def status(request: Request):
     payload["pin_set"] = applock.has_pin()
     payload["pin_skipped"] = applock.pin_skipped()
     payload["pin_recovery"] = bool(payload.get("authorized")) and applock.has_pin()
+    payload["mobile"] = MOBILE
+    payload["can_upload"] = not NO_UPLOAD
     return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
 
@@ -1415,16 +1463,13 @@ async def _zip_stream(
     yield _zip_end(central, offset)
 
 
-@app.get("/api/folders/download")
-async def download_folder(request: Request, name: str = Query(..., max_length=180)):
-    state = _state(request)
-    folder = clean_folder_path(name, "")
-    if not folder:
-        raise HTTPException(status_code=404, detail="Folder not found.")
+async def _folder_archive(
+    state: Any, folder: str
+) -> Optional[Tuple[str, List[str], List[Dict[str, Any]]]]:
     chat_id = _chat_id(state)
     info = await run_in_threadpool(state.catalog.folder_info, folder, chat_id)
     if info is None:
-        raise HTTPException(status_code=404, detail="Folder not found.")
+        return None
     items = await run_in_threadpool(state.catalog.folder_items, folder, chat_id)
     all_folders = await run_in_threadpool(state.catalog.folders, chat_id)
     lower = folder.lower()
@@ -1433,9 +1478,20 @@ async def download_folder(request: Request, name: str = Query(..., max_length=18
         for entry in all_folders
         if entry["folder"].lower().startswith(lower + "/")
     ]
-    zip_name = f"{folder_leaf(folder)}.zip"
+    return folder_leaf(folder), dir_names, items
+
+
+@app.get("/api/folders/download")
+async def download_folder(request: Request, name: str = Query(..., max_length=180)):
+    state = _state(request)
+    folder = clean_folder_path(name, "")
+    archive = await _folder_archive(state, folder) if folder else None
+    if archive is None:
+        raise HTTPException(status_code=404, detail="Folder not found.")
+    label, dir_names, items = archive
+    zip_name = f"{label}.zip"
     return StreamingResponse(
-        _zip_stream(state, folder_leaf(folder), dir_names, items),
+        _zip_stream(state, label, dir_names, items),
         media_type="application/zip",
         headers={
             "Content-Disposition": _content_disposition(zip_name, True),
@@ -2015,7 +2071,7 @@ async def stars(
 @app.post("/api/stars")
 async def create_star(body: StarBody, request: Request):
     state = _state(request)
-    values = body.model_dump(exclude_unset=True)
+    values = _body_values(body)
     if not str(values.get("name") or "").strip():
         raise TGError("A star needs a name.")
     try:
@@ -2031,7 +2087,7 @@ async def create_star(body: StarBody, request: Request):
 async def update_star(star_id: int, body: StarBody, request: Request):
     state = _state(request)
     await _scoped_star(state, star_id)
-    values = body.model_dump(exclude_unset=True)
+    values = _body_values(body)
     if "name" in values and not str(values["name"] or "").strip():
         raise TGError("A star needs a name.")
     try:
@@ -2739,6 +2795,8 @@ async def delete_item(item_id: int, request: Request, remote: bool = False):
 @app.post("/api/items/{item_id}/reupload")
 async def reupload_item(item_id: int, request: Request):
     """Download a stored document and send it again as media (video/audio)."""
+    if NO_UPLOAD:
+        raise TGError("Uploading is disabled in the mobile app.")
     state = _state(request)
     item = await _scoped_item(state, item_id)
     if item.get("kind") != "document" or parse_part_name(item.get("name") or ""):
@@ -2968,6 +3026,8 @@ async def upload(
     paths: str = Form("[]"),
     client: str = Form(""),
 ):
+    if NO_UPLOAD:
+        raise TGError("Uploading is disabled in the mobile app.")
     state = _state(request)
     info = state.service.status()
     if not info["authorized"] or not info["vault"]:
@@ -3187,9 +3247,88 @@ async def cancel_client_transfers(body: TransferCancelBody, request: Request):
 @app.post("/api/transfers/{transfer_id}/cancel")
 async def cancel_transfer(transfer_id: str, request: Request):
     state = _state(request)
-    if not state.service.cancel_transfer(transfer_id):
+    if not state.downloads.cancel(transfer_id):
         raise HTTPException(status_code=404, detail="This transfer already finished.")
     return {"ok": True}
+
+
+@app.post("/api/transfers/{transfer_id}/pause")
+async def pause_transfer(transfer_id: str, request: Request):
+    state = _state(request)
+    if not state.downloads.pause(transfer_id):
+        raise HTTPException(
+            status_code=409, detail="Only a running download can be paused."
+        )
+    return {"ok": True}
+
+
+@app.post("/api/transfers/{transfer_id}/resume")
+async def resume_transfer(transfer_id: str, request: Request):
+    state = _state(request)
+    if not state.downloads.resume(transfer_id):
+        raise HTTPException(
+            status_code=409, detail="That download cannot be resumed."
+        )
+    return {"ok": True}
+
+
+# ------------------------------------------------------------------ downloads
+def _archive_size(items: List[Dict[str, Any]], dirs: int = 0) -> int:
+    return (
+        sum(int(item.get("size") or 0) for item in items)
+        + 220 * (len(items) + dirs)
+        + 512
+    )
+
+
+@app.post("/api/downloads")
+async def start_download(body: DownloadBody, request: Request):
+    """Queue a download that saves into Downloads and can be paused."""
+    state = _state(request)
+    if body.folder:
+        folder = clean_folder_path(body.folder, "")
+        archive = await _folder_archive(state, folder) if folder else None
+        if archive is None:
+            raise HTTPException(status_code=404, detail="Folder not found.")
+        label, dir_names, items = archive
+        if not items and not dir_names:
+            raise TGError("This folder is empty.")
+        transfer = state.downloads.start_zip(
+            f"{label}.zip",
+            _archive_size(items, len(dir_names)),
+            lambda: _zip_stream(state, label, dir_names, items),
+            parts=len(items),
+        )
+        return {"transfer": transfer}
+    if body.ids:
+        items = await _batch_items(state, body.ids)
+        transfer = state.downloads.start_zip(
+            "Selected files.zip",
+            _archive_size(items),
+            lambda: _zip_stream(state, "Selected files", [], items),
+            parts=len(items),
+        )
+        return {"transfer": transfer}
+    if body.item_id is None:
+        raise TGError("Choose a file to download.")
+    item = await _scoped_item(state, int(body.item_id))
+    return {"transfer": state.downloads.start_file(item)}
+
+
+@app.post("/api/downloads/{transfer_id}/reveal")
+async def reveal_download(transfer_id: str, request: Request):
+    state = _state(request)
+    path = state.downloads.reveal(transfer_id)
+    if path is None:
+        raise HTTPException(status_code=404, detail="That file is no longer on this PC.")
+    if os.name == "nt":
+        try:
+            await run_in_threadpool(
+                subprocess.Popen, ["explorer", f"/select,{path}"]
+            )
+        except OSError:
+            await run_in_threadpool(webbrowser.open, str(path.parent))
+    return {"ok": True, "path": str(path)}
 
 
 # ------------------------------------------------------------------ merge
@@ -3485,6 +3624,274 @@ async def _serve_media(
 
     return StreamingResponse(
         body(), status_code=status_code, headers=headers, media_type=mime
+    )
+
+
+# ----------------------------------------------------------------- playback
+class PlayPrepareBody(BaseModel):
+    video: str = "copy"
+    audio: int = 0
+
+
+class SubtitlePickBody(BaseModel):
+    item_id: int
+    url: str
+    label: str = ""
+
+
+def _token_path(path: str, token: str) -> str:
+    return f"{path}{'&' if '?' in path else '?'}token={token}"
+
+
+def _clean_mode(video: str) -> str:
+    return video if video in ("copy", "h264") else "copy"
+
+
+@app.get("/api/play/{item_id}/info")
+async def play_info(item_id: int, request: Request):
+    state = _state(request)
+    item = await _scoped_item(state, item_id)
+    token = playback.mint_token(int(item["id"]))
+    sidecars = await run_in_threadpool(playback.sidecar_subtitles, state.catalog, item)
+    for entry in sidecars:
+        entry["url"] = _token_path(entry["url"], token)
+    tracks = playback.cached_probe(item)
+    job = playback.latest_job(item)
+    prepared = None
+    if job:
+        prepared = {
+            "state": job.get("state"),
+            "stage": job.get("stage"),
+            "progress": job.get("progress") or 0.0,
+            "error": job.get("error") or "",
+            "video": job.get("video"),
+            "audio": job.get("audio"),
+        }
+        if job.get("state") == "ready":
+            source = playback.prepared_source(
+                item, str(job.get("video") or "copy"), int(job.get("audio") or 0)
+            )
+            if source is not None:
+                prepared["source_url"] = _token_path(
+                    f"/api/play/{item['id']}/video?video={job.get('video') or 'copy'}"
+                    f"&audio={int(job.get('audio') or 0)}",
+                    token,
+                )
+    return {
+        "id": item["id"],
+        "name": item.get("name"),
+        "ext": playback.item_ext(item),
+        "mime": item.get("mime") or "",
+        "size": int(item.get("size") or 0),
+        "direct": playback.is_direct(item),
+        "ffmpeg": playback.ffmpeg_path() is not None,
+        "token": token,
+        "duration": float(item.get("duration") or (tracks or {}).get("duration") or 0),
+        "play_pos": float(item.get("play_pos") or 0),
+        "stream_url": _token_path(f"/api/stream/{item['id']}", token),
+        "tracks": playback.public_tracks(tracks),
+        "tracks_scanned": tracks is not None,
+        "sidecars": sidecars,
+        "prepare": prepared,
+    }
+
+
+@app.get("/api/play/{item_id}/tracks")
+async def play_tracks(item_id: int, request: Request):
+    state = _state(request)
+    item = await _scoped_item(state, item_id)
+    cached = playback.cached_probe(item)
+    if cached is None:
+        if playback.ffmpeg_path() is None:
+            raise HTTPException(status_code=409, detail="ffmpeg is not installed.")
+        token = playback.mint_token(int(item["id"]))
+        source = _token_path(f"/api/file/{item['id']}", token)
+        try:
+            cached = await run_in_threadpool(playback.probe_source, item, source)
+        except Exception as exc:
+            raise HTTPException(status_code=409, detail=str(exc)[:200]) from exc
+    return playback.public_tracks(cached)
+
+
+@app.post("/api/play/{item_id}/prepare")
+async def play_prepare(item_id: int, body: PlayPrepareBody, request: Request):
+    state = _state(request)
+    item = await _scoped_item(state, item_id)
+    if playback.ffmpeg_path() is None:
+        raise HTTPException(status_code=409, detail="ffmpeg is not installed.")
+    video = _clean_mode(body.video)
+    audio = max(0, min(int(body.audio or 0), 31))
+    _spawn(state, playback.prepare(state, item, video, audio))
+    job = playback.job_status(item, video, audio) or {}
+    return {"started": True, "state": job.get("state") or "queued"}
+
+
+@app.get("/api/play/{item_id}/prepare")
+async def play_prepare_state(
+    item_id: int,
+    request: Request,
+    video: str = Query("copy"),
+    audio: int = Query(0),
+):
+    state = _state(request)
+    item = await _scoped_item(state, item_id)
+    video = _clean_mode(video)
+    job = playback.job_status(item, video, int(audio))
+    if not job:
+        return {"state": "idle"}
+    path = playback.prepared_source(item, video, int(audio))
+    if path is not None:
+        job["source_url"] = _token_path(
+            f"/api/play/{item['id']}/video?video={video}&audio={int(audio)}",
+            playback.mint_token(int(item["id"])),
+        )
+    job.pop("key", None)
+    return job
+
+
+@app.get("/api/play/{item_id}/video")
+async def play_video(
+    item_id: int,
+    request: Request,
+    video: str = Query("copy"),
+    audio: int = Query(0),
+):
+    state = _state(request)
+    item = await _scoped_item(state, item_id)
+    path = playback.prepared_source(item, _clean_mode(video), int(audio))
+    if path is None:
+        path = playback.prepared_source(item, "copy", 0)
+    if path is None:
+        raise HTTPException(status_code=409, detail="This movie has not been prepared yet.")
+    return FileResponse(
+        path,
+        media_type="video/mp4",
+        filename=item.get("name") or "movie.mp4",
+        content_disposition_type="inline",
+        headers={"Cache-Control": "private, max-age=3600"},
+    )
+
+
+@app.get("/api/play/{item_id}/subs/side/{sub_id}.vtt")
+async def play_side_subtitle(
+    item_id: int, sub_id: int, request: Request, shift: float = Query(0)
+):
+    state = _state(request)
+    item = await _scoped_item(state, item_id)
+    sub_item = await run_in_threadpool(state.catalog.get, sub_id)
+    chat_id = _chat_id(state)
+    if (
+        sub_item is None
+        or chat_id is None
+        or int(sub_item.get("chat_id")) != int(chat_id)
+        or int(sub_item.get("id")) == int(item["id"])
+        or filetypes.extension(str(sub_item.get("name") or "")) not in playback.SUBTITLE_EXT
+    ):
+        raise HTTPException(status_code=404, detail="Subtitle file not found.")
+    try:
+        path = await playback.ensure_sidecar_vtt(state, item, sub_item)
+    except playback.PlaybackError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=friendly_error(exc)) from exc
+    if abs(shift) > 0.001:
+        text = await run_in_threadpool(path.read_text, "utf-8")
+        return Response(
+            content=playback.shift_vtt(text, max(-60.0, min(60.0, shift))),
+            media_type="text/vtt; charset=utf-8",
+            headers={"Cache-Control": "no-store"},
+        )
+    return FileResponse(
+        path,
+        media_type="text/vtt; charset=utf-8",
+        headers={"Cache-Control": "private, max-age=86400"},
+    )
+
+
+@app.get("/api/play/{item_id}/subs/emb/{index}.vtt")
+async def play_embedded_subtitle(
+    item_id: int, index: int, request: Request, shift: float = Query(0)
+):
+    state = _state(request)
+    item = await _scoped_item(state, item_id)
+    path = playback.embedded_path(item, index)
+    if path is None:
+        if playback.ffmpeg_path() is None:
+            raise HTTPException(status_code=409, detail="ffmpeg is not installed.")
+        token = playback.mint_token(int(item["id"]))
+        source = _token_path(f"/api/file/{item['id']}", token)
+        directory = playback.PLAY_DIR / playback.item_key(item)
+        await run_in_threadpool(directory.mkdir, parents=True, exist_ok=True)
+        try:
+            data = await run_in_threadpool(
+                playback.extract_embedded, source, directory, index
+            )
+        except playback.PlaybackError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if data is None:
+            raise HTTPException(status_code=404, detail="Subtitle track not found.")
+        path = data
+    if abs(shift) > 0.001:
+        text = await run_in_threadpool(path.read_text, "utf-8")
+        return Response(
+            content=playback.shift_vtt(text, max(-60.0, min(60.0, shift))),
+            media_type="text/vtt; charset=utf-8",
+            headers={"Cache-Control": "no-store"},
+        )
+    return FileResponse(
+        path,
+        media_type="text/vtt; charset=utf-8",
+        headers={"Cache-Control": "private, max-age=86400"},
+    )
+
+
+@app.get("/api/play/subs/search")
+async def play_search_subtitles(
+    request: Request,
+    item_id: int = Query(...),
+    q: str = Query(""),
+    lang: str = Query("eng"),
+):
+    state = _state(request)
+    item = await _scoped_item(state, item_id)
+    try:
+        results = await run_in_threadpool(playback.online_search, item, q, lang)
+    except playback.PlaybackError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"results": results}
+
+
+@app.post("/api/play/subs/download")
+async def play_download_subtitle(body: SubtitlePickBody, request: Request):
+    state = _state(request)
+    item = await _scoped_item(state, body.item_id)
+    try:
+        result = await run_in_threadpool(playback.online_download, body.url, body.label)
+    except playback.PlaybackError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    token = playback.mint_token(int(item["id"]))
+    result["url"] = _token_path(result["url"], token)
+    return result
+
+
+@app.get("/api/play/subs/online/{name}.vtt")
+async def play_online_subtitle(name: str, shift: float = Query(0)):
+    if not re.fullmatch(r"[0-9a-f]{8,40}", name or ""):
+        raise HTTPException(status_code=404, detail="Subtitle not found.")
+    path = playback.ONLINE_DIR / f"{name}.vtt"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Subtitle not found.")
+    if abs(shift) > 0.001:
+        text = await run_in_threadpool(path.read_text, "utf-8")
+        return Response(
+            content=playback.shift_vtt(text, max(-60.0, min(60.0, shift))),
+            media_type="text/vtt; charset=utf-8",
+            headers={"Cache-Control": "no-store"},
+        )
+    return FileResponse(
+        path,
+        media_type="text/vtt; charset=utf-8",
+        headers={"Cache-Control": "private, max-age=86400"},
     )
 
 

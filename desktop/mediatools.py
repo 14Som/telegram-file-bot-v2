@@ -41,7 +41,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
         "label": "ffmpeg previews",
         "exe": "ffmpeg.exe",
         "size": 27422861,
-        "note": "Builds seek preview thumbnails for videos",
+        "note": "Seek previews and in-app playback for MKV, HEVC and other formats",
         "url": (
             "https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/"
             "20261021/ffmpeg-x86_64-git-9a861e968.7z"
