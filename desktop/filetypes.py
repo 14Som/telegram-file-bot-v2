@@ -32,6 +32,23 @@ VIDEO_EXT = {
 AUDIO_EXT = {".mp3", ".m4a", ".flac", ".wav", ".ogg", ".opus", ".aac", ".wma", ".m4b"}
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".heic", ".tiff", ".tif", ".avif"}
 
+# Telegram keeps the original upload name, and some movies end in the release
+# year ("Movie (2026)") instead of a real extension. The MIME type says which
+# container it really is, so the player can stream it instead of downloading it
+# whole and remuxing something that was already MP4.
+VIDEO_MIME_EXT = {
+    "video/mp4": ".mp4",
+    "video/x-m4v": ".m4v",
+    "video/webm": ".webm",
+    "video/3gpp": ".3gp",
+    "video/quicktime": ".mov",
+    "video/x-matroska": ".mkv",
+    "video/x-msvideo": ".avi",
+    "video/x-ms-wmv": ".wmv",
+    "video/mpeg": ".mpg",
+    "video/mp2t": ".ts",
+}
+
 # Extensions the in-browser viewer can load directly.
 VIEWER_EXT = {".stl", ".3mf", ".obj", ".ply"}
 
@@ -71,6 +88,18 @@ READER_MIME = {
 
 def extension(name: str) -> str:
     return os.path.splitext(name or "")[1].lower()
+
+
+def media_extension(name: str, mime: str = "") -> str:
+    """Container extension of a stored video, audio or image file.
+
+    The MIME type is used when the name does not end in a known media
+    extension, which happens with releases named after their year.
+    """
+    ext = extension(name)
+    if ext in VIDEO_EXT or ext in AUDIO_EXT or ext in IMAGE_EXT:
+        return ext
+    return VIDEO_MIME_EXT.get((mime or "").lower(), ext)
 
 
 def reader_format(name: str, mime: str = "") -> Optional[str]:

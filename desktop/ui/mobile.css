@@ -410,6 +410,21 @@ button { touch-action: manipulation; }
 }
 .dl-actions button:active { opacity: .6; }
 
+/* --------------------------------------------------------------- upload */
+.upload-fab {
+  position: fixed; right: 18px; bottom: 78px; z-index: 25;
+  width: 54px; height: 54px; border: 0; border-radius: 50%;
+  display: grid; place-items: center;
+  background: var(--accent); color: var(--accent-text);
+  box-shadow: 0 8px 22px rgba(11, 132, 255, .34);
+  transition: transform .16s, bottom .18s;
+}
+.upload-fab:active { transform: scale(.94); }
+.upload-fab svg {
+  width: 26px; height: 26px; fill: none; stroke: currentColor;
+  stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
+}
+
 /* ---------------------------------------------------------------- tabs */
 .tabs {
   display: flex; flex: none;

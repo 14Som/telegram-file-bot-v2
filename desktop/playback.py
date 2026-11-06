@@ -118,7 +118,9 @@ def ffmpeg_path() -> Optional[Path]:
 
 
 def item_ext(item: Dict[str, Any]) -> str:
-    return filetypes.extension(str(item.get("name") or ""))
+    return filetypes.media_extension(
+        str(item.get("name") or ""), str(item.get("mime") or "")
+    )
 
 
 def item_key(item: Dict[str, Any]) -> str:

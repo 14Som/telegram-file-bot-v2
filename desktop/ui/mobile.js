@@ -1,5 +1,5 @@
-/* Phone interface for the Telegram File Explorer backend. Read-only: streams
-   and downloads files, never uploads. */
+/* Phone interface for the Telegram File Explorer backend: browses, streams,
+   downloads and uploads files. */
 
 "use strict";
 
@@ -17,6 +17,7 @@ const ICONS = {
   play: '<path d="M8 5v14l11-7z"/>',
   pause: '<path d="M8 5h3v14H8zM13 5h3v14h-3z"/>',
   download: '<path d="M12 4v11"/><path d="m7 11 5 5 5-5"/><path d="M5 20h14"/>',
+  upload: '<path d="M12 20V9"/><path d="m7 13 5-5 5 5"/><path d="M5 4h14"/>',
   info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v5"/><path d="M12 8h.01"/>',
   image: '<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="8.5" cy="9.5" r="1.5"/><path d="m21 16-5-5L5 20"/>',
   video: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="m10 9 5 3-5 3z"/>',
@@ -83,9 +84,17 @@ const S = {
   authTab: "phone",
   toastTimer: null,
   dlItems: [],
+  dlNative: [],
+  dlUploads: [],
   dlTimer: null,
   dlRates: {},
-  dlCollapsed: false
+  dlCollapsed: false,
+  localUpload: null,
+  uploadClients: new Set(),
+  uploadDismissed: new Set(),
+  uploadSeen: new Set(),
+  uploadTimer: null,
+  closing: false
 };
 
 /* ------------------------------------------------------------------ utils */
@@ -533,6 +542,9 @@ function updateChrome() {
     : name || "Telegram File Explorer";
   $("selectBtn").hidden = S.tab === "folders" || S.tab === "more";
   $("lockBtn").hidden = !status.pin_set;
+  const canUpload = !!status.can_upload && (S.tab === "files" || S.tab === "folders");
+  $("uploadFab").hidden = !canUpload;
+  if (canUpload) positionUploadFab();
 }
 
 $("tabs").addEventListener("click", (event) => {
@@ -945,6 +957,10 @@ function syncSelectionChrome() {
   $("selectTopbar").hidden = !active;
   $("selectActions").hidden = !active;
   $("tabs").hidden = active;
+  const status = S.status || {};
+  $("uploadFab").hidden = active || !status.can_upload
+    || (S.tab !== "files" && S.tab !== "folders");
+  if (!active) positionUploadFab();
   if (!active) return;
   $("selectTitle").textContent = count
     ? `${count} selected`
@@ -1495,8 +1511,8 @@ function pollDownloads() {
       delete S.dlRates[key];
     }
   }
-  S.dlItems = list;
-  renderDownloads();
+  S.dlNative = list;
+  mergeTransferItems();
 }
 
 function downloadPercent(download) {
@@ -1510,6 +1526,20 @@ function downloadPercent(download) {
 function downloadInfo(download) {
   const total = Number(download.total) || 0;
   const bytes = Number(download.bytes) || 0;
+  if (download.kind === "upload") {
+    if (download.sending) {
+      return `Sending to the app · ${humanSize(bytes)} of ${humanSize(total)}`;
+    }
+    if (download.done) return "Uploaded to Telegram";
+    if (download.failed) return download.error || "Upload failed";
+    if (download.cancelled) return "Upload cancelled";
+    if (download.state === "queued") return "Queued";
+    if (download.state === "splitting") return "Preparing parts…";
+    const rate = (S.dlRates[download.id] || {}).rate;
+    return total
+      ? `${humanSize(bytes)} of ${humanSize(total)}${rate ? ` · ${humanSize(rate)}/s` : ""}`
+      : humanSize(bytes);
+  }
   if (download.done) return "Saved to Downloads/Telegram Files";
   if (download.failed) return "Download failed";
   if (download.paused) {
@@ -1532,7 +1562,8 @@ function downloadRow(download) {
   const icon = document.createElement("span");
   icon.className = "dl-icon";
   icon.innerHTML = svg(download.paused ? "pause"
-    : download.done ? "check" : download.failed ? "close" : "download");
+    : download.done ? "check" : download.failed ? "close"
+      : download.kind === "upload" ? "upload" : "download");
   const name = document.createElement("span");
   name.className = "dl-name";
   name.textContent = download.name || "Download";
@@ -1555,21 +1586,31 @@ function downloadRow(download) {
   info.textContent = downloadInfo(download);
   const actions = document.createElement("span");
   actions.className = "dl-actions";
-  if (download.running) {
-    actions.append(dlAction("Pause", () => window.AndroidBridge.pauseDownload(download.id)));
-  }
-  if (download.paused) {
-    actions.append(dlAction("Resume", () => window.AndroidBridge.resumeDownload(download.id)));
-  }
-  if (!download.done && !download.failed) {
-    actions.append(dlAction("Cancel", () => window.AndroidBridge.cancelDownload(download.id)));
-  }
-  if (download.done) {
-    actions.append(dlAction("Open", () => window.AndroidBridge.openDownload(download.id)));
-    actions.append(dlAction("Clear", () => window.AndroidBridge.clearDownload(download.id)));
-  }
-  if (download.failed) {
-    actions.append(dlAction("Clear", () => window.AndroidBridge.clearDownload(download.id)));
+  if (download.kind === "upload") {
+    if (download.sending) {
+      actions.append(dlAction("Cancel", () => cancelLocalUpload()));
+    } else if (download.running) {
+      actions.append(dlAction("Cancel", () => cancelUpload(download.client)));
+    } else {
+      actions.append(dlAction("Clear", () => dismissUpload(download)));
+    }
+  } else {
+    if (download.running) {
+      actions.append(dlAction("Pause", () => window.AndroidBridge.pauseDownload(download.id)));
+    }
+    if (download.paused) {
+      actions.append(dlAction("Resume", () => window.AndroidBridge.resumeDownload(download.id)));
+    }
+    if (!download.done && !download.failed) {
+      actions.append(dlAction("Cancel", () => window.AndroidBridge.cancelDownload(download.id)));
+    }
+    if (download.done) {
+      actions.append(dlAction("Open", () => window.AndroidBridge.openDownload(download.id)));
+      actions.append(dlAction("Clear", () => window.AndroidBridge.clearDownload(download.id)));
+    }
+    if (download.failed) {
+      actions.append(dlAction("Clear", () => window.AndroidBridge.clearDownload(download.id)));
+    }
   }
   sub.append(info, actions);
   row.append(top, track, sub);
@@ -1604,7 +1645,8 @@ function renderDownloads() {
     const key = String(download.id);
     alive.add(key);
     const state = download.paused ? "paused"
-      : download.done ? "done" : download.failed ? "failed" : "running";
+      : download.done ? "done" : download.failed ? "failed"
+        : download.cancelled ? "cancelled" : "running";
     const name = download.name || "Download";
     let node = nodes.get(key);
     if (!node || node.state !== state || node.name !== name) {
@@ -1635,11 +1677,13 @@ function renderDownloads() {
   const active = S.dlItems.filter((entry) => entry.running).length;
   const paused = S.dlItems.filter((entry) => entry.paused).length;
   const failed = S.dlItems.filter((entry) => entry.failed).length;
-  const saved = S.dlItems.filter((entry) => entry.done).length;
+  const uploaded = S.dlItems.filter((entry) => entry.kind === "upload" && entry.done).length;
+  const saved = S.dlItems.filter((entry) => entry.kind !== "upload" && entry.done).length;
   const parts = [];
   if (active) parts.push(`${active} active`);
   if (paused) parts.push(`${paused} paused`);
   if (failed) parts.push(`${failed} failed`);
+  if (uploaded) parts.push(`${uploaded} uploaded`);
   if (saved) parts.push(`${saved} saved`);
   $("dlSummary").textContent = parts.join(" · ");
   bar.hidden = !S.dlItems.length;
@@ -1647,6 +1691,60 @@ function renderDownloads() {
     clearInterval(S.dlTimer);
     S.dlTimer = null;
   }
+}
+
+function uploadIsActive(state) {
+  return state === "queued" || state === "uploading" || state === "splitting";
+}
+
+function uploadItems() {
+  const items = [];
+  const local = S.localUpload;
+  if (local) {
+    items.push({
+      id: `local-${local.client}`,
+      kind: "upload",
+      client: local.client,
+      name: local.name,
+      bytes: local.sent,
+      total: local.size,
+      sending: true,
+      running: true
+    });
+  }
+  for (const transfer of S.dlUploads) {
+    const state = String(transfer.state || "");
+    items.push({
+      id: `upload-${transfer.id}`,
+      kind: "upload",
+      client: transfer.client,
+      name: transfer.name || "Upload",
+      bytes: Number(transfer.sent) || 0,
+      total: Number(transfer.size) || 0,
+      state,
+      error: transfer.error,
+      running: uploadIsActive(state),
+      done: state === "done",
+      failed: state === "error",
+      cancelled: state === "cancelled",
+      paused: false
+    });
+  }
+  return items;
+}
+
+function mergeTransferItems() {
+  S.dlItems = [...uploadItems(), ...S.dlNative];
+  renderDownloads();
+  positionUploadFab();
+}
+
+function positionUploadFab() {
+  const fab = $("uploadFab");
+  if (!fab || fab.hidden) return;
+  const tabs = $("tabs").offsetHeight || 0;
+  const bar = $("dlBar").hidden ? 0 : $("dlBar").offsetHeight || 0;
+  fab.style.bottom = `${tabs + bar + 16}px`;
 }
 
 async function downloadItem(item) {
@@ -1693,6 +1791,214 @@ function waitForTransfer(id) {
       }
     }, 900);
   });
+}
+
+/* ---------------------------------------------------------------- upload */
+function openUploadPicker() {
+  const status = S.status || {};
+  if (!status.can_upload) return;
+  if (!status.authorized || !status.vault) {
+    toast("Log in and choose a channel first.", "error");
+    return;
+  }
+  $("uploadInput").click();
+}
+
+function rememberUploads(list) {
+  const byId = new Map(S.dlUploads.map((entry) => [entry.id, entry]));
+  for (const transfer of list) byId.set(transfer.id, transfer);
+  S.dlUploads = [...byId.values()]
+    .filter((entry) => !S.uploadDismissed.has(`upload-${entry.id}`));
+}
+
+function startUploadPolling() {
+  if (S.uploadTimer) return;
+  refreshUploads();
+  S.uploadTimer = setInterval(refreshUploads, 1200);
+}
+
+function stopUploadPolling() {
+  if (!S.uploadTimer) return;
+  clearInterval(S.uploadTimer);
+  S.uploadTimer = null;
+}
+
+async function refreshUploads() {
+  if (!S.uploadClients.size) return;
+  let list;
+  try {
+    const data = await api("/api/transfers");
+    list = data.transfers || [];
+  } catch (_) {
+    return;
+  }
+  const next = list
+    .filter((transfer) => transfer.client && S.uploadClients.has(transfer.client))
+    .filter((transfer) => !S.uploadDismissed.has(`upload-${transfer.id}`));
+  const now = Date.now();
+  for (const transfer of next) {
+    const key = `upload-${transfer.id}`;
+    if (uploadIsActive(transfer.state)) {
+      const sample = S.dlRates[key];
+      if (sample) {
+        const seconds = (now - sample.at) / 1000;
+        if (seconds > 0.4) {
+          const sent = Number(transfer.sent) || 0;
+          const rate = Math.max(0, (sent - sample.bytes) / seconds);
+          sample.rate = sample.rate ? sample.rate * 0.6 + rate * 0.4 : rate;
+          sample.bytes = sent;
+          sample.at = now;
+        }
+      } else {
+        S.dlRates[key] = { bytes: Number(transfer.sent) || 0, at: now, rate: 0 };
+      }
+    } else {
+      delete S.dlRates[key];
+    }
+  }
+  S.dlUploads = next;
+  mergeTransferItems();
+  const active = next.some((transfer) => uploadIsActive(transfer.state));
+  if (active || S.localUpload) return;
+  stopUploadPolling();
+  const finished = next.filter((transfer) => !S.uploadSeen.has(transfer.id));
+  if (!finished.length) return;
+  for (const transfer of finished) S.uploadSeen.add(transfer.id);
+  const done = finished.filter((transfer) => transfer.state === "done").length;
+  const failed = finished.filter((transfer) => transfer.state === "error").length;
+  if (done) toast(done === 1 ? "File uploaded." : `${done} files uploaded.`, "success", 5000);
+  if (failed) {
+    const first = finished.find((transfer) => transfer.state === "error");
+    toast(
+      failed === 1
+        ? (first && first.error) || "The upload failed."
+        : `${failed} uploads failed.`,
+      "error",
+      8000
+    );
+  }
+  if (done) {
+    setTimeout(() => {
+      if (S.tab === "files") loadItems({ reset: true }).catch(() => {});
+      loadNav().catch(() => {});
+    }, 800);
+  }
+}
+
+function sendUpload(files) {
+  if (!files.length || S.localUpload) {
+    if (S.localUpload) toast("Wait for the current upload to finish.", "error");
+    return;
+  }
+  const limit = Number((S.status || {}).upload_limit) || 0;
+  const tooBig = files.find((file) => limit && file.size > limit);
+  if (tooBig) {
+    toast(
+      `${tooBig.name} is larger than ${humanSize(limit)}. `
+      + "Use the desktop app to split it into parts.",
+      "error",
+      8000
+    );
+    return;
+  }
+  const empty = files.find((file) => !file.size);
+  if (empty) {
+    toast(`${empty.name} is empty.`, "error");
+    return;
+  }
+  const client = `m${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+  const folder = S.folder || "";
+  const total = files.reduce((sum, file) => sum + file.size, 0);
+  const form = new FormData();
+  form.append("client", client);
+  form.append("paths", JSON.stringify(files.map((file) => file.name)));
+  if (folder) form.append("folder", folder);
+  for (const file of files) form.append("files", file, file.name);
+  const xhr = new XMLHttpRequest();
+  S.uploadClients.add(client);
+  S.localUpload = {
+    client,
+    name: files.length === 1 ? files[0].name : `${files.length} files`,
+    size: total,
+    sent: 0,
+    cancelled: false,
+    xhr
+  };
+  startUploadPolling();
+  mergeTransferItems();
+  xhr.open("POST", "/api/upload");
+  xhr.setRequestHeader("X-TFE", "1");
+  xhr.withCredentials = true;
+  xhr.upload.onprogress = (event) => {
+    if (!event.lengthComputable || !S.localUpload) return;
+    S.localUpload.sent = event.loaded;
+    mergeTransferItems();
+  };
+  xhr.onload = () => {
+    const local = S.localUpload;
+    S.localUpload = null;
+    if (local && local.cancelled) {
+      mergeTransferItems();
+      return;
+    }
+    let data = {};
+    try { data = JSON.parse(xhr.responseText || "{}"); } catch (_) { data = {}; }
+    if (xhr.status >= 200 && xhr.status < 300) {
+      rememberUploads(data.transfers || []);
+      toast(files.length === 1
+        ? `Uploading ${files[0].name} to Telegram…`
+        : `Uploading ${files.length} files to Telegram…`, "success", 5000);
+      startUploadPolling();
+    } else {
+      const message = typeof data.detail === "string"
+        ? data.detail
+        : `Upload failed (${xhr.status})`;
+      toast(message, "error", 8000);
+      stopUploadPolling();
+    }
+    mergeTransferItems();
+  };
+  xhr.onerror = () => {
+    const local = S.localUpload;
+    S.localUpload = null;
+    if (!local || !local.cancelled) {
+      toast("The upload could not reach the app.", "error");
+    }
+    mergeTransferItems();
+  };
+  xhr.send(form);
+}
+
+function cancelLocalUpload() {
+  const local = S.localUpload;
+  if (!local) return;
+  local.cancelled = true;
+  S.localUpload = null;
+  try { local.xhr.abort(); } catch (_) { /* request already finished */ }
+  mergeTransferItems();
+  stopUploadPolling();
+  api("/api/transfers/cancel", { method: "POST", body: { client: local.client } })
+    .then(refreshUploads)
+    .catch(() => {});
+  toast("Upload cancelled.", "success", 3000);
+}
+
+async function cancelUpload(client) {
+  if (!client) return;
+  try {
+    await api("/api/transfers/cancel", { method: "POST", body: { client } });
+    toast("Cancelling upload…", "success", 2500);
+    refreshUploads();
+  } catch (error) {
+    toast(error.message || "The upload could not be cancelled.", "error");
+  }
+}
+
+function dismissUpload(download) {
+  S.uploadDismissed.add(download.id);
+  S.dlUploads = S.dlUploads
+    .filter((transfer) => `upload-${transfer.id}` !== download.id);
+  mergeTransferItems();
 }
 
 /* ---------------------------------------------------------------- sheets */
@@ -2049,6 +2355,9 @@ function renderMore() {
 
   list.append(moreRow("vault", "Storage vault", vault.title || "Choose a vault", openVaultSheet));
   list.append(moreRow("sort", "Sort files", `${sortLabel(S.sort)} · ${S.dir === "desc" ? "Descending" : "Ascending"}`, openSortSheet));
+  if (status.can_upload) {
+    list.append(moreRow("upload", "Upload files", "Add files to this channel from your phone", openUploadPicker));
+  }
 
   const nav = S.nav || {};
   list.append(moreRow("tag", "Tags", `${(nav.tags || []).length} tag(s)`, openTagsSheet));
@@ -2073,8 +2382,13 @@ function renderMore() {
   }
 
   const appVersion = window.AndroidBridge ? window.AndroidBridge.versionName() : status.version || "2.3";
-  list.append(moreRow("info", "About", `Version ${appVersion} · read-only mobile viewer`, () => {
-    openSheet("About", "<p>Telegram File Explorer for Android streams and downloads the files in your Telegram storage channel. Uploading is disabled on this device — use the desktop app to add files.</p><p>The 4-digit PIN is stored with your library, so it can also apply in the desktop app.</p>");
+  const uploadLimit = Number(status.upload_limit) || 0;
+  list.append(moreRow("info", "About", `Version ${appVersion} · mobile app`, () => {
+    openSheet("About", "<p>Telegram File Explorer for Android browses, streams, downloads and uploads the files in your Telegram storage channel.</p>"
+      + (uploadLimit
+        ? `<p>Uploads up to ${humanSize(uploadLimit)} go straight into the channel. Larger files need the desktop app, which splits them into parts.</p>`
+        : "")
+      + "<p>The 4-digit PIN is stored with your library, so it can also apply in the desktop app.</p>");
   }));
   list.append(moreRow("logout", "Sign out", "Remove the Telegram session from this phone", () => confirmAction(
     "Sign out?",
@@ -2422,6 +2736,7 @@ setIcon($("searchBtn"), "search");
 setIcon($("syncBtn"), "sync");
 setIcon($("selectBtn"), "select");
 setIcon($("lockBtn"), "lock");
+setIcon($("uploadFab"), "upload");
 setIcon($("selectCancel"), "close");
 setIcon($("searchClose"), "close");
 setIcon($("viewerClose"), "close");
@@ -2438,6 +2753,14 @@ for (const button of $("tabs").querySelectorAll("button[data-tab]")) {
 }
 
 $("lockBtn").addEventListener("click", lockNow);
+$("uploadFab").addEventListener("click", openUploadPicker);
+$("uploadInput").addEventListener("change", () => {
+  const input = $("uploadInput");
+  const files = Array.from(input.files || []);
+  input.value = "";
+  if (files.length) sendUpload(files);
+});
+window.addEventListener("resize", positionUploadFab);
 $("selectBtn").addEventListener("click", () => {
   if (S.tab === "folders" || S.tab === "more") return;
   S.selecting = true;
@@ -2466,8 +2789,29 @@ window.mobileBack = function mobileBack() {
   if (!$("searchBar").hidden) { $("searchClose").click(); return true; }
   if (S.tab !== "files") { switchTab("files"); return true; }
   if (S.folder) { openFolder(""); return true; }
+  if (nativeFinish()) { closeApp(); return true; }
   return false;
 };
+
+function nativeFinish() {
+  return Boolean(window.AndroidBridge && typeof AndroidBridge.finishApp === "function");
+}
+
+async function closeApp() {
+  if (S.closing) return;
+  S.closing = true;
+  if (!S.status || !S.status.locked) {
+    toast("Saving the library to Telegram…");
+    clearTimeout(S.toastTimer);
+    try {
+      await api("/api/vault/save", { method: "POST" });
+    } catch (error) {
+      toast(error.message || "The library could not be saved.", "error");
+      await new Promise((resolve) => setTimeout(resolve, 1600));
+    }
+  }
+  AndroidBridge.finishApp();
+}
 
 initDownloadBar();
 boot();

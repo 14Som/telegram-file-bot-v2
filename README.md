@@ -269,20 +269,25 @@ official GitHub releases and verified by checksum before use:
 Nothing is uploaded; the tools run on your PC against the same local stream the app
 uses. You can skip both — the app plays video and images without them.
 
-## Android app (viewer)
+## Android app
 
 Download the APK from
 [telegram-file-explorer-android → Releases](https://github.com/14Som/telegram-file-explorer-android/releases/latest)
 and open it on your phone (Android 7.0+, arm64). The app runs the same backend and the
 same Telegram connection inside the
-APK, so there is no extra server to host. It can view, stream and download, and
-it never offers uploads — the server also rejects them.
+APK, so there is no extra server to host. It can view, stream, download and upload.
 
 First launch: sign in with your own Telegram account (phone code or QR), pick
 the vault channel, then tap sync. Downloads go to **Downloads/Telegram Files**.
-Files split into parts are joined automatically before download. A downloads
-bar above the tabs shows progress, speed and size; pause or resume a transfer,
-cancel it, or open a finished file from there.
+The library index is also taken from the vault when the app opens and saved back
+on close (press Back on the file list; the app shows "Saving the library to
+Telegram…" first). That index archive is kept in the app's private storage and
+wiped right after it is unpacked or uploaded, so Downloads never collects it.
+Files split into parts are joined automatically before download. The upload button
+saves picked files into the folder you are browsing; a phone upload can be up to
+2 GB, and larger files need the desktop app, which splits them into parts. A
+transfers bar above the tabs shows download and upload progress, speed and size;
+pause or resume a download, cancel a transfer, or open a finished file from there.
 
 Build it with JDK 17, Android SDK 35 and Python 3.13:
 

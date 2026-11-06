@@ -7843,6 +7843,13 @@ async function quitApp(note) {
   const message = typeof note === "string" && note
     ? note
     : "Saving the library snapshot to your vault. The window closes by itself; the bot stays online.";
+  showQuitScreen(message);
+  try {
+    await api("/api/quit", { method: "POST" });
+  } catch (_) { /* the server may stop before answering */ }
+  try { window.close(); } catch (_) { /* WebView window is closed by the app */ }
+}
+function showQuitScreen(message) {
   closeModal();
   document.body.replaceChildren(
     h("div", { class: "quit-screen" },
@@ -7853,11 +7860,14 @@ async function quitApp(note) {
       )
     )
   );
-  try {
-    await api("/api/quit", { method: "POST" });
-  } catch (_) { /* the server may stop before answering */ }
-  try { window.close(); } catch (_) { /* WebView window is closed by the app */ }
 }
+// Called by the app window before it closes on the X button, so the snapshot
+// upload finishes while the process is still running.
+window.tfeClosing = function tfeClosing() {
+  if (S.quitting) return;
+  S.quitting = true;
+  showQuitScreen("Saving the library snapshot to your vault. The window closes by itself.");
+};
 function resetAfterLogout() {
   pinBuffer = "";
   pendingVault = null;

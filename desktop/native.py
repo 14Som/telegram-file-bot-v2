@@ -17,7 +17,7 @@ import threading
 import time
 import urllib.request
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 PROJECT_DIR = (
     Path(sys.executable).resolve().parent
@@ -55,6 +55,31 @@ WINDOW_SIZE = (1380, 880)
 WINDOW_MIN_SIZE = (980, 640)
 WINDOW_BG = "#1f2024"
 ICON_PATH = Path("desktop") / "ui" / "app.ico"
+STARTUP_LIMIT = 600.0
+SPLASH_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><title>Telegram File Explorer</title>
+<style>
+  html, body { height: 100%; margin: 0; }
+  body {
+    display: grid; place-items: center; background: #1f2024;
+    color: #e8e9ec; font: 15px/1.5 "Segoe UI", system-ui, sans-serif;
+    -webkit-user-select: none; user-select: none;
+  }
+  .card { text-align: center; max-width: 430px; padding: 24px; }
+  .spinner {
+    width: 34px; height: 34px; margin: 0 auto 18px; border-radius: 50%;
+    border: 3px solid #3a3c43; border-top-color: #4f8cff;
+    animation: spin 0.9s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  strong { display: block; font-size: 17px; margin-bottom: 6px; }
+  p { margin: 0; color: #a9acb4; }
+</style></head>
+<body><div class="card">
+  <div class="spinner"></div>
+  <strong id="title">Opening Telegram File Explorer&hellip;</strong>
+  <p id="note">Checking the library in your Telegram vault. This can take a minute after a change.</p>
+</div></body></html>"""
 
 log = logging.getLogger("tfe.native")
 
@@ -218,14 +243,14 @@ def focus_existing_window() -> bool:
         return False
 
 
-def wait_for_server(url: str, thread: threading.Thread, seconds: float = 30.0) -> bool:
+def server_ready(url: str, thread: threading.Thread, seconds: float = STARTUP_LIMIT) -> bool:
     deadline = time.time() + seconds
     while time.time() < deadline:
         if ping(url):
             return True
         if not thread.is_alive():
             return False
-        time.sleep(0.25)
+        time.sleep(0.4)
     return False
 
 
@@ -254,12 +279,10 @@ def start_server() -> tuple[Optional[uvicorn.Server], Optional[threading.Thread]
 
     thread = threading.Thread(target=serve, name="tfe-server", daemon=True)
     thread.start()
-    if not wait_for_server(url, thread):
-        uv.should_exit = True
-        thread.join(timeout=5)
-        return None, None, None
+    # Startup restores the vault snapshot before the server answers, so the
+    # window shows a loading screen meanwhile and waits here.
     write_server_file(url, port)
-    log.info("Serving %s", url)
+    log.info("Local server starting at %s", url)
     return uv, thread, url
 
 
@@ -277,7 +300,7 @@ def bundled_icon() -> Optional[Path]:
     return None
 
 
-def open_window(url: str):
+def open_window(url: Optional[str] = None, html: Optional[str] = None):
     # Explicit coordinates avoid a WebView2 host being left at the WinForms
     # default position (~32767), which renders the whole window blank.
     try:
@@ -293,6 +316,7 @@ def open_window(url: str):
     return webview.create_window(
         appconfig.APP_TITLE,
         url,
+        html=html,
         width=WINDOW_SIZE[0],
         height=WINDOW_SIZE[1],
         x=x,
@@ -301,6 +325,19 @@ def open_window(url: str):
         background_color=WINDOW_BG,
         text_select=True,
     )
+
+
+def splash_note(window: Any, title: str, note: str) -> None:
+    script = (
+        "(function (t, n) { var a = document.getElementById('title');"
+        " var b = document.getElementById('note');"
+        " if (a) { a.textContent = t; } if (b) { b.textContent = n; } })"
+        f"({json.dumps(title)}, {json.dumps(note)})"
+    )
+    try:
+        window.evaluate_js(script)
+    except Exception:
+        pass
 
 
 def apply_window_icon(hwnd: int) -> None:
@@ -440,7 +477,93 @@ def watch_window(window, thread: threading.Thread) -> None:
 
 
 def run_window(url: str, uv: Optional[uvicorn.Server], thread: Optional[threading.Thread]) -> None:
-    window = open_window(url)
+    starting = uv is not None and thread is not None
+    window = open_window(html=SPLASH_HTML) if starting else open_window(url)
+    closing = {"active": False, "done": False}
+
+    def vault_close_needed() -> bool:
+        try:
+            state = server.app.state
+            if getattr(state, "vault_saved_at", 0):
+                return False
+            if getattr(state, "catalog", None) is None:
+                # Still restoring the library; nothing local has changed yet.
+                return False
+            info = state.service.status()
+        except Exception:
+            return False
+        return bool(info.get("authorized") and info.get("vault"))
+
+    def finish_close() -> None:
+        try:
+            window.evaluate_js("window.tfeClosing && window.tfeClosing()")
+        except Exception:
+            pass
+        try:
+            result = server.vault_save_sync(120.0)
+            log.info("Vault data snapshot on close: %s", result)
+        except Exception:
+            log.exception("Vault data save on close failed")
+        closing["done"] = True
+        try:
+            window.destroy()
+        except Exception:
+            log.exception("Could not close the app window")
+
+    def on_closing():
+        if closing["done"]:
+            return True
+        if closing["active"]:
+            return False
+        if uv is None or not vault_close_needed():
+            closing["done"] = True
+            return True
+        # Keep the window alive until the snapshot reaches the vault; the
+        # process exits as soon as the window is gone.
+        closing["active"] = True
+        threading.Thread(
+            target=finish_close, name="tfe-vault-close", daemon=True
+        ).start()
+        return False
+
+    def load_app() -> None:
+        started = time.time()
+        notified = False
+        while time.time() - started < STARTUP_LIMIT:
+            if closing["done"]:
+                return
+            if ping(url):
+                log.info("Local server is ready after %.1fs", time.time() - started)
+                try:
+                    window.load_url(url)
+                except Exception:
+                    log.exception("Could not load the app window")
+                return
+            if thread is None or not thread.is_alive():
+                break
+            if not notified and time.time() - started > 15:
+                notified = True
+                splash_note(
+                    window,
+                    "Restoring your library\u2026",
+                    "Fetching the latest snapshot from your Telegram vault. "
+                    "This can take a minute or two.",
+                )
+            time.sleep(0.4)
+        log.error("The local server did not start")
+        splash_note(
+            window,
+            "The local server did not start",
+            f"See explorer.log in {appconfig.HOME}",
+        )
+
+    def boot() -> None:
+        try:
+            load_app()
+        except Exception:
+            log.exception("Waiting for the local server failed")
+
+    window.events.closing += on_closing
     threading.Thread(target=fit_webview_bounds, name="tfe-webview-fit", daemon=True).start()
     if uv is not None and thread is not None:
         threading.Thread(
@@ -456,6 +579,7 @@ def run_window(url: str, uv: Optional[uvicorn.Server], thread: Optional[threadin
             private_mode=False,
             storage_path=str(storage),
             icon=str(icon) if icon else None,
+            func=boot if starting else None,
         )
     except Exception as exc:
         log.exception("The app window could not open")
@@ -520,12 +644,18 @@ def run() -> int:
 
     mutex = hold_mutex()
     if mutex is None:
+        if focus_existing_window():
+            log.info("Focused the starting window")
+            return 0
         deadline = time.time() + 20
         while time.time() < deadline:
             existing = find_running_server()
             if existing:
                 if not focus_existing_window():
                     run_window(existing, None, None)
+                return 0
+            if focus_existing_window():
+                log.info("Focused the starting window")
                 return 0
             time.sleep(0.4)
         message("The app is already starting. Give it a few seconds, then try again.")

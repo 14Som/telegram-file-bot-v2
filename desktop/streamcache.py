@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import time
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict
@@ -16,12 +17,18 @@ from typing import Any, AsyncIterator, Dict
 from . import appconfig
 
 BLOCK = 2 * 1024 * 1024
-PREFETCH = 2
 MAX_BYTES = 2 * 1024 ** 3
+
+# A player only drains its socket while it has picture to show, so the serve
+# loop spends most of a slow link idle. The builder keeps pulling blocks past
+# the current window on its own task, which is what gives playback its runway.
+PREFETCH_AHEAD = 192 * 1024 * 1024
+PREFETCH_RUN = 16  # blocks per pass, so seeks are picked up within ~32 MiB
 
 DIR = appconfig.HOME / "cache" / "stream"
 
 _locks: Dict[str, asyncio.Lock] = {}
+_builders: Dict[str, Dict[str, Any]] = {}
 _fills = 0
 _prune_task: "asyncio.Task[None] | None" = None
 
@@ -42,33 +49,72 @@ def _block_len(index: int, size: int | None) -> int:
     return max(0, min(BLOCK, size - index * BLOCK))
 
 
-async def _fill_run(
-    service: Any, message: Any, key: str, first: int, last: int, size: int | None = None
-) -> None:
-    """Download whole blocks first..last (inclusive) into the cache."""
-    start = first * BLOCK
-    length = (last - first + 1) * BLOCK
-    if size is not None:
-        length = max(0, min(length, size - start))
+async def _stream_run(
+    service: Any,
+    message: Any,
+    key: str,
+    first: int,
+    last: int,
+    size: int | None,
+    start: int,
+    end: int,
+) -> AsyncIterator[bytes]:
+    """Stream blocks first..last (inclusive), handing bytes on as they arrive.
+
+    Players starve when a read only ends after a whole 2 MiB block has been
+    downloaded: on a slow phone link that is several seconds of silence between
+    bursts. Every chunk is passed through immediately instead, while complete
+    blocks are still written to disk for later seeks and replays.
+    """
+    base = first * BLOCK
+    directory = _dir_for(key)
+    directory.mkdir(parents=True, exist_ok=True)
+    if size is None:
+        run_end = (last + 1) * BLOCK
+    else:
+        run_end = min((last + 1) * BLOCK, size)
+    # Pull from the requested byte, not the block boundary. Waiting for a whole
+    # block's worth of lead-in is what starved players on slow links.
+    initial = max(start, base)
+    length = run_end - initial
     if length <= 0:
         return
     buffer = bytearray()
-    directory = _dir_for(key)
-    directory.mkdir(parents=True, exist_ok=True)
-    index = first
-    async for chunk in service.stream_chunks(message, start, length):
-        buffer.extend(chunk)
-        while index <= last:
-            need = _block_len(index, size)
-            if len(buffer) < need:
-                break
-            _write(directory, index, bytes(buffer[:need]))
-            del buffer[:need]
-            index += 1
-    # Only a complete block (or the exact tail of the file) may be cached,
-    # otherwise a short read would poison every later request for this block.
-    if buffer and index <= last and len(buffer) == _block_len(index, size):
-        _write(directory, index, bytes(buffer))
+    buffer_start = initial
+    index = first + 1 if initial > base else first
+    position = initial
+    try:
+        async for chunk in service.stream_chunks(message, initial, length):
+            chunk_start = position
+            position += len(chunk)
+            buffer.extend(chunk)
+            while index <= last:
+                need = _block_len(index, size)
+                offset = index * BLOCK - buffer_start
+                if offset + need > len(buffer):
+                    break
+                _write(directory, index, bytes(buffer[offset : offset + need]))
+                index += 1
+            trim = min(index * BLOCK - buffer_start, len(buffer)) if index <= last else len(buffer)
+            if trim > 0:
+                del buffer[:trim]
+                buffer_start += trim
+            low = max(start, chunk_start)
+            high = min(end, position)
+            if low < high:
+                yield chunk[low - chunk_start : high - chunk_start]
+            if position >= end:
+                return
+        # Only a complete block (or the exact tail of the file) may be cached,
+        # otherwise a short read would poison every later request for this block.
+        if buffer and index <= last and len(buffer) == _block_len(index, size):
+            _write(directory, index, bytes(buffer))
+    except asyncio.CancelledError:
+        raise
+    except OSError:
+        raise
+    except Exception as exc:
+        raise OSError("stream cache could not fetch blocks") from exc
 
 
 def _write(directory: Path, index: int, data: bytes) -> None:
@@ -89,33 +135,6 @@ def _touch(path: Path) -> None:
         os.utime(path, None)
     except OSError:
         pass
-
-
-async def _ensure(
-    service: Any, message: Any, key: str, first: int, last: int, size: int | None
-) -> None:
-    """Make blocks first..last exist on disk, downloading the missing run."""
-    index = first
-    while index <= last:
-        if _path(key, index).exists():
-            index += 1
-            continue
-        run_last = index
-        while run_last < last and not _path(key, run_last + 1).exists():
-            run_last += 1
-        lock = _locks.setdefault(key, asyncio.Lock())
-        async with lock:
-            # Another reader may have filled part of the run meanwhile.
-            while run_last >= index and _path(key, run_last).exists():
-                run_last -= 1
-            if run_last >= index:
-                try:
-                    await _fill_run(service, message, key, index, run_last, size)
-                except Exception as exc:
-                    raise OSError("stream cache could not fetch blocks") from exc
-            if not _path(key, index).exists():
-                raise OSError("stream cache could not fetch a block")
-        index = run_last + 1
 
 
 def _prune_sync() -> None:
@@ -158,6 +177,124 @@ async def _maybe_prune() -> None:
     _prune_task = asyncio.create_task(asyncio.to_thread(_prune_sync))
 
 
+def warm(
+    service: Any,
+    message: Any,
+    key: str,
+    start: int,
+    length: int,
+    size: int | None = None,
+) -> None:
+    """Keep filling blocks onto disk past the window just served.
+
+    Called for every inline range request: the block builder runs on its own
+    task, so the download continues while the player is still chewing through
+    the bytes it has. A seek moves the anchor and the builder re-targets.
+    """
+    if not size or size <= 0:
+        return
+    end = min(start + length, size)
+    state = _builders.get(key)
+    if state is None:
+        state = {"end": end, "size": size, "task": None}
+        _builders[key] = state
+    else:
+        state["end"] = end
+        state["size"] = size
+    task = state.get("task")
+    if task is None or task.done():
+        state["task"] = asyncio.create_task(_build(service, message, key))
+
+
+async def _build(service: Any, message: Any, key: str) -> None:
+    state = _builders.get(key)
+    try:
+        while state is not None and _builders.get(key) is state:
+            anchor = state["end"]
+            size = state["size"]
+            if anchor >= size:
+                return
+            index = anchor // BLOCK
+            last = (min(size, anchor + PREFETCH_AHEAD) - 1) // BLOCK
+            while index <= last and _path(key, index).exists():
+                index += 1
+            if index > last:
+                return
+            pass_last = min(last, index + PREFETCH_RUN - 1)
+            run_end = min(size, (pass_last + 1) * BLOCK)
+            async for _chunk in _stream_run(
+                service, message, key, index, pass_last, size,
+                index * BLOCK, run_end,
+            ):
+                if _builders.get(key) is not state:
+                    return
+                # The player jumped somewhere else; drop this pass quickly.
+                if abs(state["end"] - anchor) > 2 * BLOCK:
+                    break
+            await asyncio.sleep(0)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        # The next range request starts a fresh builder.
+        return
+    finally:
+        if state is not None and state.get("task") is asyncio.current_task():
+            state["task"] = None
+
+
+def _clear_sync() -> None:
+    try:
+        shutil.rmtree(DIR)
+        return
+    except FileNotFoundError:
+        return
+    except OSError:
+        pass
+    # Windows refuses to unlink a block a closing player still holds open, and
+    # one open file aborts the whole rmtree. Drop the rest anyway; the purge on
+    # the next boot removes whatever is left.
+    for path in list(DIR.rglob("*")):
+        try:
+            if path.is_file():
+                path.unlink()
+            else:
+                path.rmdir()
+        except OSError:
+            continue
+    try:
+        DIR.rmdir()
+    except OSError:
+        pass
+
+
+async def shutdown() -> None:
+    """Stop every builder and drop the streamed bytes.
+
+    The cache only exists to smooth playback, so it is thrown away when the
+    app closes; prepared/converted movies in the play cache are kept.
+    """
+    tasks = []
+    for state in _builders.values():
+        task = state.get("task")
+        if task is not None and not task.done():
+            task.cancel()
+            tasks.append(task)
+    _builders.clear()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    await asyncio.to_thread(_clear_sync)
+
+
+async def purge() -> None:
+    """Drop streamed bytes left behind by a previous run.
+
+    Android can kill the app from the recents screen before the lifespan
+    shutdown runs, so the cache is also emptied when the app starts.
+    """
+    _builders.clear()
+    await asyncio.to_thread(_clear_sync)
+
+
 async def read(
     service: Any,
     message: Any,
@@ -166,35 +303,71 @@ async def read(
     length: int,
     size: int | None = None,
 ) -> AsyncIterator[bytes]:
-    """Yield length bytes from start, filling missing blocks from Telegram."""
+    """Yield length bytes from start, caching blocks as the data streams past.
+
+    The per-file lock is only taken when it is free. A player that walked away
+    from a range read can sit on its connection for minutes, and waiting on its
+    lock would freeze every later seek; contended reads stream straight through
+    without caching instead.
+    """
     global _fills
     if length <= 0:
         return
-    end = start + length - 1
-    first = start // BLOCK
-    last = end // BLOCK
-    for index in range(first, last + 1):
-        # The first block is fetched alone so playback starts quickly, then
-        # pairs are fetched ahead so a sequential read costs half the calls.
-        lookahead = 1 if index == first else PREFETCH
-        await _ensure(service, message, key, index, min(last, index + lookahead - 1), size)
+    end = start + length
+    index = start // BLOCK
+    last = (end - 1) // BLOCK
+    sent = 0
+    while index <= last:
         path = _path(key, index)
-        _touch(path)
-        offset = max(0, start - index * BLOCK)
-        remaining = min(BLOCK - offset, start + length - (index * BLOCK + offset))
-        if remaining <= 0:
+        if path.exists():
+            _touch(path)
+            offset = max(0, start - index * BLOCK)
+            remaining = min(BLOCK - offset, end - index * BLOCK - offset)
+            if remaining > 0:
+                try:
+                    with open(path, "rb") as handle:
+                        handle.seek(offset)
+                        while remaining > 0:
+                            data = handle.read(min(262144, remaining))
+                            if not data:
+                                break
+                            remaining -= len(data)
+                            sent += len(data)
+                            yield data
+                except OSError:
+                    raise OSError("stream cache block unreadable")
+            index += 1
             continue
+
+        lock = _locks.setdefault(key, asyncio.Lock())
+        if lock.locked():
+            remaining = length - sent
+            if remaining > 0:
+                async for chunk in service.stream_chunks(
+                    message, start + sent, remaining
+                ):
+                    sent += len(chunk)
+                    yield chunk
+            break
+
+        await lock.acquire()
         try:
-            with open(path, "rb") as handle:
-                handle.seek(offset)
-                while remaining > 0:
-                    data = handle.read(min(262144, remaining))
-                    if not data:
-                        break
-                    remaining -= len(data)
-                    yield data
-        except OSError:
-            raise OSError("stream cache block unreadable")
+            # A concurrent request may have filled the leading blocks meanwhile.
+            if _path(key, index).exists():
+                continue
+            run_last = index
+            while run_last < last and not _path(key, run_last + 1).exists():
+                run_last += 1
+            async for chunk in _stream_run(
+                service, message, key, index, run_last, size, start, end
+            ):
+                sent += len(chunk)
+                yield chunk
+            index = run_last + 1
+        finally:
+            lock.release()
+    if sent < length:
+        raise OSError("stream cache ended early")
     _fills += 1
     if _fills % 256 == 0:
         await _maybe_prune()

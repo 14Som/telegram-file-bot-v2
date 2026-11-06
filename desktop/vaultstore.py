@@ -6,9 +6,15 @@ into the vault channel — on every app close and after every completed sync,
 keeping the ten most recent copies. On launch the newest archive is downloaded
 and restored whenever it is newer than the last copy this device applied, so
 the whole library comes back even if the PC's data folder (or the EXE) is gone.
-The phone mirrors the desktop library: it restores snapshots but never uploads
-one, because its own index uses default folder names and would overwrite the
-folder layout arranged on the desktop.
+The phone does the same: it restores on launch and uploads the updated index
+when the app closes, unless the vault already holds a snapshot newer than the
+one this device applied (uploading that stale copy would roll the desktop
+library back).
+
+Snapshots are staged in ``HOME/cache/vault`` and wiped after use: the archive
+is overwritten with zeros and deleted once it has been unpacked or uploaded,
+and leftovers from an interrupted run are removed on the next launch, so no
+index archive ever ends up in a Downloads folder.
 
 Generated imagery is not uploaded: auto thumbnails, IMDb posters and video
 storyboards rebuild themselves from Telegram or the network, and bundling
@@ -21,6 +27,7 @@ credential and can be recreated in seconds with the QR sign-in.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -45,6 +52,18 @@ STAMP_FORMAT = "%Y%m%d-%H%M%S"
 KEEP = 10
 SCAN_LIMIT = 120
 IS_MOBILE = bool(os.environ.get("TFE_MOBILE"))
+STAGE_DIR = appconfig.CACHE_DIR / "vault"
+WIPE_CHUNK = 1024 * 1024
+
+_SAVE_LOCK: Optional[asyncio.Lock] = None
+
+
+def _save_lock() -> asyncio.Lock:
+    """A sync save and a close save can overlap; upload one at a time."""
+    global _SAVE_LOCK
+    if _SAVE_LOCK is None:
+        _SAVE_LOCK = asyncio.Lock()
+    return _SAVE_LOCK
 
 
 def _marker_path() -> Path:
@@ -71,6 +90,60 @@ def _write_marker(when: datetime) -> None:
         os.replace(tmp, _marker_path())
     except OSError:
         log.exception("Could not write the vault data marker")
+
+
+def _stage() -> Path:
+    STAGE_DIR.mkdir(parents=True, exist_ok=True)
+    return STAGE_DIR
+
+
+def _shred(path: Path) -> None:
+    """Overwrite a staged snapshot with zeros, then delete it."""
+    try:
+        with path.open("r+b") as handle:
+            zeros = b"\0" * WIPE_CHUNK
+            remaining = path.stat().st_size
+            while remaining > 0:
+                chunk = zeros[: min(remaining, WIPE_CHUNK)]
+                handle.write(chunk)
+                remaining -= len(chunk)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError:
+        pass
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def purge_local_cache() -> int:
+    """Delete snapshot archives an interrupted run left behind."""
+    removed = 0
+    stage = _stage()
+    for root in (stage, Path(tempfile.gettempdir())):
+        try:
+            entries = list(root.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if entry.is_dir():
+                    # Old builds unpacked into the system temp folder.
+                    if entry.name.startswith(
+                        ("tfe-restore-", "tfe-vault-", "save-", "restore-")
+                    ):
+                        shutil.rmtree(entry, ignore_errors=True)
+                        removed += 1
+                elif entry.name.startswith(PREFIX) and entry.suffix.lower() == ".zip":
+                    _shred(entry)
+                    removed += 1
+                elif root == stage and entry.name in ("library.db", "snapshot.zip"):
+                    _shred(entry)
+                    removed += 1
+            except OSError:
+                continue
+    return removed
 
 
 def _doc_name(message: Any) -> Optional[str]:
@@ -156,50 +229,65 @@ def _snapshot_thumbs() -> list:
 
 
 async def save(service: Any) -> Dict[str, Any]:
-    if IS_MOBILE:
-        return {"saved": False, "reason": "read-only device"}
+    async with _save_lock():
+        return await _save(service)
+
+
+async def _save(service: Any) -> Dict[str, Any]:
     client = service._require_ready()
     entity = service._entity
     if entity is None:
         return {"saved": False, "reason": "no vault"}
+    applied = _read_marker()
+    if IS_MOBILE and applied is not None:
+        # The phone mirrors the desktop library. If the vault already holds a
+        # snapshot newer than the one this device applied, uploading the copy
+        # in memory would roll the desktop library back.
+        latest = await find_latest(service)
+        if latest is not None and latest[0] > applied:
+            log.info("Vault snapshot kept: the vault already has a newer copy")
+            return {"saved": False, "reason": "newer snapshot in the vault"}
     when = datetime.now()
     name = f"{PREFIX}{when.strftime(STAMP_FORMAT)}{SUFFIX}"
     appconfig.ensure_dirs()
     thumbs = 0
-    with tempfile.TemporaryDirectory(prefix="tfe-vault-") as tmp:
+    with tempfile.TemporaryDirectory(dir=_stage(), prefix="save-") as tmp:
         work = Path(tmp)
         db_snap = work / "library.db"
         _snapshot_db(db_snap)
         zip_path = work / name
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
-            archive.write(db_snap, "library.db")
-            if appconfig.SETTINGS_PATH.exists():
-                archive.write(appconfig.SETTINGS_PATH, "settings.json")
-            for thumb in _snapshot_thumbs():
-                archive.write(
-                    thumb,
-                    f"thumbs/{thumb.relative_to(appconfig.THUMB_DIR).as_posix()}",
+        try:
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
+                archive.write(db_snap, "library.db")
+                if appconfig.SETTINGS_PATH.exists():
+                    archive.write(appconfig.SETTINGS_PATH, "settings.json")
+                for thumb in _snapshot_thumbs():
+                    archive.write(
+                        thumb,
+                        f"thumbs/{thumb.relative_to(appconfig.THUMB_DIR).as_posix()}",
+                    )
+                    thumbs += 1
+                archive.writestr(
+                    "manifest.json",
+                    json.dumps(
+                        {
+                            "app": "telegram-file-explorer",
+                            "saved": when.isoformat(timespec="seconds"),
+                            "thumbs": thumbs,
+                            "thumb_policy": "covers+stars",
+                        },
+                        indent=2,
+                    ),
                 )
-                thumbs += 1
-            archive.writestr(
-                "manifest.json",
-                json.dumps(
-                    {
-                        "app": "telegram-file-explorer",
-                        "saved": when.isoformat(timespec="seconds"),
-                        "thumbs": thumbs,
-                        "thumb_policy": "covers+stars",
-                    },
-                    indent=2,
-                ),
+            await client.send_file(
+                entity,
+                str(zip_path),
+                caption=f"{MARKER} {name}",
+                force_document=True,
+                attributes=[DocumentAttributeFilename(name)],
             )
-        await client.send_file(
-            entity,
-            str(zip_path),
-            caption=f"{MARKER} {name}",
-            force_document=True,
-            attributes=[DocumentAttributeFilename(name)],
-        )
+        finally:
+            _shred(zip_path)
     _write_marker(when)
     log.info("Vault data snapshot saved: %s (%d thumbs)", name, thumbs)
     await _prune_old(client, entity)
@@ -328,36 +416,39 @@ async def restore(service: Any) -> Dict[str, Any]:
         if local_dt is not None and local_dt > stamp:
             return {"restored": False, "reason": "local data is newer"}
     appconfig.ensure_dirs()
-    with tempfile.TemporaryDirectory(prefix="tfe-restore-") as tmp:
+    with tempfile.TemporaryDirectory(dir=_stage(), prefix="restore-") as tmp:
         work = Path(tmp)
-        zip_path = work / "snapshot.zip"
-        await client.download_media(message, file=str(zip_path))
-        with zipfile.ZipFile(zip_path) as archive:
-            members = _safe_members(archive)
-            if not any(m.filename == "library.db" for m in members):
-                return {"restored": False, "reason": "unreadable snapshot"}
-            unpacked = work / "unpack"
-            unpacked.mkdir()
-            for member in members:
-                archive.extract(member, unpacked)
-        favorites = _local_favorites()
-        os.replace(unpacked / "library.db", appconfig.LIBRARY_PATH)
-        for suffix in ("-wal", "-shm", "-journal"):
-            try:
-                Path(str(appconfig.LIBRARY_PATH) + suffix).unlink(missing_ok=True)
-            except OSError:
-                pass
-        _keep_favorites(favorites)
-        thumbs_root = unpacked / "thumbs"
-        if thumbs_root.is_dir():
-            for thumb in thumbs_root.rglob("*"):
-                if thumb.is_file():
-                    target = appconfig.THUMB_DIR / thumb.relative_to(thumbs_root)
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(thumb, target)
-        backup_settings = unpacked / "settings.json"
-        if backup_settings.exists():
-            _merge_settings(backup_settings)
+        zip_path = work / f"{PREFIX}{stamp.strftime(STAMP_FORMAT)}{SUFFIX}"
+        try:
+            await client.download_media(message, file=str(zip_path))
+            with zipfile.ZipFile(zip_path) as archive:
+                members = _safe_members(archive)
+                if not any(m.filename == "library.db" for m in members):
+                    return {"restored": False, "reason": "unreadable snapshot"}
+                unpacked = work / "unpack"
+                unpacked.mkdir()
+                for member in members:
+                    archive.extract(member, unpacked)
+            favorites = _local_favorites()
+            os.replace(unpacked / "library.db", appconfig.LIBRARY_PATH)
+            for suffix in ("-wal", "-shm", "-journal"):
+                try:
+                    Path(str(appconfig.LIBRARY_PATH) + suffix).unlink(missing_ok=True)
+                except OSError:
+                    pass
+            _keep_favorites(favorites)
+            thumbs_root = unpacked / "thumbs"
+            if thumbs_root.is_dir():
+                for thumb in thumbs_root.rglob("*"):
+                    if thumb.is_file():
+                        target = appconfig.THUMB_DIR / thumb.relative_to(thumbs_root)
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(thumb, target)
+            backup_settings = unpacked / "settings.json"
+            if backup_settings.exists():
+                _merge_settings(backup_settings)
+        finally:
+            _shred(zip_path)
     _write_marker(stamp)
     log.info("Library data restored from the vault: %s", stamp.isoformat(timespec="seconds"))
     return {"restored": True, "stamp": stamp.isoformat(timespec="seconds")}

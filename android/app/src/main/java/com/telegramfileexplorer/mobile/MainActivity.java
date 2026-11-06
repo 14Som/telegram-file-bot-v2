@@ -6,6 +6,7 @@ import android.app.Activity;
 import android.app.DownloadManager;
 import android.content.ActivityNotFoundException;
 import android.content.BroadcastReceiver;
+import android.content.ClipData;
 import android.content.ContentUris;
 import android.content.ContentValues;
 import android.content.Context;
@@ -31,6 +32,7 @@ import android.view.WindowInsets;
 import android.webkit.CookieManager;
 import android.webkit.DownloadListener;
 import android.webkit.JavascriptInterface;
+import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
@@ -72,7 +74,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 /**
  * Runs the desktop FastAPI backend inside the APK and shows its mobile page.
  * The local server only listens on 127.0.0.1, so nothing is exposed to the
- * network; uploads are disabled by the backend itself.
+ * network.
  */
 public class MainActivity extends Activity {
 
@@ -82,6 +84,7 @@ public class MainActivity extends Activity {
     private static final int START_TIMEOUT_MS = 60_000;
     private static final int STORAGE_REQUEST = 7001;
     private static final int NOTIFICATION_REQUEST = 7002;
+    private static final int FILE_CHOOSER_REQUEST = 7003;
     private static final String DOWNLOAD_DIR = "Telegram Files";
     private static final String DOWNLOAD_PREFS = "downloads";
     private static final String DOWNLOAD_TRACKED = "tracked";
@@ -108,6 +111,7 @@ public class MainActivity extends Activity {
     private int failedStarts = 0;
 
     private BroadcastReceiver downloadReceiver;
+    private ValueCallback<Uri[]> fileChooserCallback;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -212,7 +216,8 @@ public class MainActivity extends Activity {
         settings.setDatabaseEnabled(true);
         settings.setMediaPlaybackRequiresUserGesture(false);
         settings.setAllowFileAccess(false);
-        settings.setAllowContentAccess(false);
+        // The document picker hands the WebView content:// URIs to read.
+        settings.setAllowContentAccess(true);
         settings.setJavaScriptCanOpenWindowsAutomatically(false);
         settings.setSupportMultipleWindows(false);
         settings.setSaveFormData(false);
@@ -226,7 +231,46 @@ public class MainActivity extends Activity {
         cookies.setAcceptThirdPartyCookies(webView, true);
 
         webView.addJavascriptInterface(new Bridge(), "AndroidBridge");
-        webView.setWebChromeClient(new WebChromeClient());
+        webView.setWebChromeClient(new WebChromeClient() {
+            @Override
+            public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback,
+                                             FileChooserParams params) {
+                if (fileChooserCallback != null) {
+                    fileChooserCallback.onReceiveValue(null);
+                }
+                fileChooserCallback = callback;
+                Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                intent.addCategory(Intent.CATEGORY_OPENABLE);
+                ArrayList<String> types = new ArrayList<>();
+                String[] accept = params.getAcceptTypes();
+                if (accept != null) {
+                    for (String value : accept) {
+                        String type = value == null ? "" : value.trim().toLowerCase(Locale.ROOT);
+                        if (type.contains("/")) {
+                            types.add(type);
+                        }
+                    }
+                }
+                if (types.isEmpty()) {
+                    intent.setType("*/*");
+                } else if (types.size() == 1) {
+                    intent.setType(types.get(0));
+                } else {
+                    intent.setType("*/*");
+                    intent.putExtra(Intent.EXTRA_MIME_TYPES, types.toArray(new String[0]));
+                }
+                intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE,
+                        params.getMode()
+                                == WebChromeClient.FileChooserParams.MODE_OPEN_MULTIPLE);
+                try {
+                    startActivityForResult(intent, FILE_CHOOSER_REQUEST);
+                } catch (ActivityNotFoundException error) {
+                    fileChooserCallback = null;
+                    callback.onReceiveValue(null);
+                }
+                return true;
+            }
+        });
         webView.setWebViewClient(new WebViewClient() {
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
@@ -603,6 +647,11 @@ public class MainActivity extends Activity {
         public String versionName() {
             return BuildConfig.VERSION_NAME;
         }
+
+        @JavascriptInterface
+        public void finishApp() {
+            main.post(MainActivity.this::finish);
+        }
     }
 
     private void enqueueDownload(String url, String filename, String mimeType) {
@@ -899,6 +948,46 @@ public class MainActivity extends Activity {
 
     /* ---------------------------------------------------------------- system */
     @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        if (requestCode != FILE_CHOOSER_REQUEST) {
+            super.onActivityResult(requestCode, resultCode, data);
+            return;
+        }
+        ValueCallback<Uri[]> callback = fileChooserCallback;
+        fileChooserCallback = null;
+        if (callback == null) {
+            return;
+        }
+        ArrayList<Uri> uris = new ArrayList<>();
+        if (resultCode == RESULT_OK && data != null) {
+            ClipData clip = data.getClipData();
+            if (clip != null) {
+                for (int i = 0; i < clip.getItemCount(); i++) {
+                    Uri uri = clip.getItemAt(i).getUri();
+                    if (uri != null) {
+                        uris.add(uri);
+                    }
+                }
+            } else if (data.getData() != null) {
+                uris.add(data.getData());
+            }
+        }
+        if (uris.isEmpty()) {
+            callback.onReceiveValue(null);
+            return;
+        }
+        for (Uri uri : uris) {
+            try {
+                getContentResolver().takePersistableUriPermission(
+                        uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            } catch (SecurityException ignored) {
+                // Some providers grant access only for this session.
+            }
+        }
+        callback.onReceiveValue(uris.toArray(new Uri[0]));
+    }
+
+    @Override
     public void onBackPressed() {
         if (webView == null || !pageLoaded) {
             super.onBackPressed();
@@ -923,6 +1012,10 @@ public class MainActivity extends Activity {
                 // Already unregistered.
             }
             downloadReceiver = null;
+        }
+        if (fileChooserCallback != null) {
+            fileChooserCallback.onReceiveValue(null);
+            fileChooserCallback = null;
         }
         if (webView != null) {
             webView.removeJavascriptInterface("AndroidBridge");

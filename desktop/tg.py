@@ -47,6 +47,60 @@ from .catalog import Catalog, clean_folder_path, clean_name, default_folder
 
 log = logging.getLogger("tfe.tg")
 
+
+def _use_native_aes() -> None:
+    """Phones ship no cryptg, and Telethon's fallback AES runs in Python at a
+    few thousand blocks a second, which caps transfers and startup restore.
+    PyCryptodome's C core keeps the IGE chaining but does each block natively."""
+    try:
+        from telethon.crypto import aes as telegram_aes
+    except Exception:
+        return
+    if getattr(telegram_aes, "cryptg", None) is not None:
+        return
+    try:
+        from Crypto.Cipher import AES as native_aes
+    except Exception:
+        return
+
+    def decrypt_ige(cipher_text: bytes, key: bytes, iv: bytes) -> bytes:
+        size = len(cipher_text) - len(cipher_text) % 16
+        cipher = native_aes.new(key, native_aes.MODE_ECB)
+        out = bytearray(size)
+        prev_c = int.from_bytes(iv[:16], "big")
+        prev_p = int.from_bytes(iv[16:], "big")
+        for offset in range(0, size, 16):
+            block = int.from_bytes(cipher_text[offset:offset + 16], "big")
+            plain = int.from_bytes(
+                cipher.decrypt((block ^ prev_p).to_bytes(16, "big")), "big"
+            ) ^ prev_c
+            out[offset:offset + 16] = plain.to_bytes(16, "big")
+            prev_c, prev_p = block, plain
+        return bytes(out)
+
+    def encrypt_ige(plain_text: bytes, key: bytes, iv: bytes) -> bytes:
+        if len(plain_text) % 16:
+            plain_text += os.urandom(16 - len(plain_text) % 16)
+        cipher = native_aes.new(key, native_aes.MODE_ECB)
+        out = bytearray(len(plain_text))
+        prev_c = int.from_bytes(iv[:16], "big")
+        prev_p = int.from_bytes(iv[16:], "big")
+        for offset in range(0, len(plain_text), 16):
+            plain = int.from_bytes(plain_text[offset:offset + 16], "big")
+            block = int.from_bytes(
+                cipher.encrypt((plain ^ prev_c).to_bytes(16, "big")), "big"
+            ) ^ prev_p
+            out[offset:offset + 16] = block.to_bytes(16, "big")
+            prev_c, prev_p = block, plain
+        return bytes(out)
+
+    telegram_aes.AES.decrypt_ige = staticmethod(decrypt_ige)
+    telegram_aes.AES.encrypt_ige = staticmethod(encrypt_ige)
+    log.info("Using PyCryptodome for MTProto AES")
+
+
+_use_native_aes()
+
 APP_VERSION = "1.0"
 MAX_UPLOAD = 2 * 1024 * 1024 * 1024
 PREMIUM_MAX_UPLOAD = 4 * 1024 * 1024 * 1024
@@ -85,6 +139,7 @@ UPLOAD_PART_MIN_BYTES = 10 * 1024 * 1024
 # switch to its generic iterator (extra alignment requests), so stay at the cap
 # and let each segment be a couple of back-to-back chunks instead.
 DOWNLOAD_CHUNK = 512 * 1024
+_SEGMENT_END = object()
 
 # Telegram Desktop's published app credentials. They let the first sign-in
 # start without a my.telegram.org app; custom credentials always take priority.
@@ -1522,73 +1577,93 @@ class TelegramService:
         segment = DOWNLOAD_SEGMENT
         streams = max(1, min(DOWNLOAD_STREAMS, (remaining + segment - 1) // segment))
 
-        async def fetch(position: int, size: int) -> bytes:
-            buffer = bytearray()
+        async def fetch(position: int, size: int, out: "asyncio.Queue[Any]") -> None:
             cursor = 0
             request = min(segment, DOWNLOAD_CHUNK)
-            while cursor < size:
-                need = size - cursor
-                # The limit counts chunks, not bytes; assume the smallest chunk
-                # Telegram may return so a short response can never end a
-                # segment early. The iterator is closed explicitly so a borrowed
-                # DC sender is handed back instead of waiting for the GC.
-                iterator = client.iter_download(
-                    message,
-                    offset=position + cursor,
-                    request_size=request,
-                    limit=max(1, (need + request - 1) // request),
-                )
-                got = 0
+            try:
+                while cursor < size:
+                    need = size - cursor
+                    # The limit counts chunks, not bytes; assume the smallest
+                    # chunk Telegram may return so a short response can never
+                    # end a segment early. The iterator is closed explicitly so
+                    # a borrowed DC sender is handed back instead of waiting for
+                    # the GC.
+                    iterator = client.iter_download(
+                        message,
+                        offset=position + cursor,
+                        request_size=request,
+                        limit=max(1, (need + request - 1) // request),
+                    )
+                    got = 0
+                    try:
+                        async for chunk in iterator:
+                            piece = chunk[: need - got]
+                            if not piece:
+                                break
+                            got += len(piece)
+                            # Hand each chunk on immediately: waiting for the
+                            # whole segment is what starves the player.
+                            await out.put(bytes(piece))
+                            if got >= need:
+                                break
+                    finally:
+                        await iterator.close()
+                    if got == 0:
+                        # No progress: the server has no more data from here,
+                        # so stop rather than spin on the same offset.
+                        break
+                    cursor += got
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await out.put(exc)
+            finally:
                 try:
-                    async for chunk in iterator:
-                        buffer.extend(chunk)
-                        got += len(chunk)
-                        if got >= need:
-                            break
-                finally:
-                    await iterator.close()
-                if got == 0:
-                    # No progress: the server has no more data from here, so
-                    # stop rather than spin on the same offset.
-                    break
-                cursor += got
-            return bytes(buffer[:size])
+                    out.put_nowait(_SEGMENT_END)
+                except asyncio.QueueFull:
+                    pass
 
-        pending: "deque[Tuple[int, asyncio.Task[bytes]]]" = deque()
+        pending: "deque[Tuple[int, asyncio.Task[None], asyncio.Queue]]" = deque()
         next_position = offset
 
         def schedule() -> None:
             nonlocal next_position
             while next_position < end and len(pending) < streams:
                 size = min(segment, end - next_position)
-                pending.append(
-                    (size, asyncio.create_task(fetch(next_position, size)))
-                )
+                queue: "asyncio.Queue[Any]" = asyncio.Queue(maxsize=8)
+                task = asyncio.create_task(fetch(next_position, size, queue))
+                pending.append((size, task, queue))
                 next_position += size
 
         try:
             schedule()
             while pending:
-                size, task = pending.popleft()
-                try:
-                    data = await task
-                except asyncio.CancelledError:
-                    task.cancel()
-                    raise
-                if len(data) < size:
+                size, task, queue = pending.popleft()
+                received = 0
+                while received < size:
+                    item = await queue.get()
+                    if item is _SEGMENT_END:
+                        break
+                    if isinstance(item, Exception):
+                        raise item
+                    received += len(item)
+                    data = item
+                    if lead:
+                        if len(data) <= lead:
+                            lead -= len(data)
+                            continue
+                        data = data[lead:]
+                        lead = 0
+                    if len(data) > wanted:
+                        data = data[:wanted]
+                    wanted -= len(data)
+                    yield data
+                    if wanted <= 0:
+                        break
+                if received < size:
                     # Never hand a hole to the player or the saved file.
                     raise TGError("The download ended before the file was complete.")
                 schedule()
-                if lead:
-                    if len(data) <= lead:
-                        lead -= len(data)
-                        continue
-                    data = data[lead:]
-                    lead = 0
-                if len(data) > wanted:
-                    data = data[:wanted]
-                wanted -= len(data)
-                yield data
                 if wanted <= 0:
                     break
         except asyncio.CancelledError:
@@ -1598,7 +1673,7 @@ class TelegramService:
         except Exception as exc:
             raise TGError(friendly_error(exc)) from exc
         finally:
-            for _, task in pending:
+            for _, task, _ in pending:
                 task.cancel()
 
     async def thumbnail(self, item: Dict[str, Any]) -> Optional[Tuple[bytes, str]]:

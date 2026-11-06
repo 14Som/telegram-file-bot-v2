@@ -26,8 +26,8 @@ android {
         applicationId "com.telegramfileexplorer.mobile"
         minSdk 24
         targetSdk 35
-        versionCode 29
-        versionName "3.12.2"
+        versionCode 38
+        versionName "3.13.8"
         ndk { abiFilters "arm64-v8a", "x86_64" }
     }
 
@@ -96,6 +96,8 @@ chaquopy {
             install "python-multipart==0.0.9"
             install "telethon==1.45.0"
             install "segno==1.6.6"
+            // Telethon's Python AES caps phone transfers; this gives it a C core.
+            install "pycryptodome==3.21.0"
             // Telethon needs pyaes, which has no wheel in Chaquopy's index.
             options "--find-links", new File(rootProject.projectDir, "wheels").toURI().toString()
         }

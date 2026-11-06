@@ -66,7 +66,6 @@ from .catalog import (
 )
 from .splitmerge import merge_parts, parse_part_name, split_file
 from .tg import (
-    MAX_UPLOAD,
     PART_SIZE,
     TGError,
     TelegramService,
@@ -79,7 +78,7 @@ log = logging.getLogger("tfe.server")
 
 QUIT = threading.Event()
 COOKIE = "tfe_session"
-APP_VERSION = "2.6.6"
+APP_VERSION = "2.6.10"
 # The Android build extracts the interface next to its writable data and runs
 # the same server there; the desktop EXE keeps using the bundled copy.
 UI_DIR = Path(
@@ -88,10 +87,10 @@ UI_DIR = Path(
     / "desktop"
     / "ui"
 )
-# The mobile app is a viewer: it may stream and download, never upload. The
-# flag is also exposed to the interface so its upload controls stay hidden.
+# Mobile runs the same backend; uploads are split with the bundled 7-Zip on
+# desktop, so the phone only accepts files Telegram can take in one piece.
 MOBILE = os.environ.get("TFE_MOBILE") == "1"
-NO_UPLOAD = MOBILE or os.environ.get("TFE_NO_UPLOAD") == "1"
+NO_UPLOAD = os.environ.get("TFE_NO_UPLOAD") == "1"
 UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 # API paths that stay reachable while the app is PIN-locked (status, lock
 # control and quit — none of them expose file data).
@@ -108,6 +107,8 @@ LOCK_OPEN_PATHS = {
 # Files above Telegram's per-file cap are split into volumes; this is the
 # largest source file the app will accept and split.
 SPLIT_HARD_CAP = 64 * 1024 ** 3
+# Phones have no bundled 7-Zip, so they only take what Telegram accepts whole.
+UPLOAD_LIMIT = PART_SIZE if MOBILE else SPLIT_HARD_CAP
 # Uploads are RTT-bound (Telegram takes 512 KiB parts), so a few files or
 # volumes can be in flight at once. Stay modest to avoid FloodWait.
 UPLOAD_CONCURRENCY = 4
@@ -774,14 +775,28 @@ def _content_disposition(name: str, download: bool) -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     appconfig.ensure_dirs()
+    # A swipe-away on Android kills the process before lifespan shutdown, so
+    # streamed bytes from the last run are dropped on boot as well.
+    try:
+        await streamcache.purge()
+    except Exception:
+        log.exception("Stream cache cleanup on boot failed")
+    try:
+        leftover = vaultstore.purge_local_cache()
+        if leftover:
+            log.info("Removed %d leftover vault snapshot file(s)", leftover)
+    except Exception:
+        log.exception("Vault snapshot cleanup on boot failed")
     state = app.state
     state.service = TelegramService()
     state.key = secrets.token_urlsafe(32)
+    state.loop = asyncio.get_running_loop()
     state.bot_db = appconfig.PROJECT_DIR / "data" / "files.db"
     state.last_activity = time.time()
     state.tasks: Set[asyncio.Task] = set()
     state.merge_jobs: Dict[str, Dict[str, Any]] = {}
     state.vault_restore: Dict[str, Any] = {}
+    state.vault_saved_at = 0.0
     await state.service.start()
     info = state.service.status()
     if info["authorized"] and info.get("vault"):
@@ -818,12 +833,19 @@ async def lifespan(app: FastAPI):
     finally:
         for task in list(state.tasks):
             task.cancel()
+        try:
+            await streamcache.shutdown()
+        except Exception:
+            log.exception("Stream cache cleanup failed")
         info = state.service.status()
         if info["authorized"] and info.get("vault"):
-            try:
-                await asyncio.wait_for(vaultstore.save(state.service), timeout=120.0)
-            except Exception:
-                log.exception("Vault data save on close failed")
+            # The phone saves right before it closes; the snapshot is already
+            # in the vault, so the shutdown path must not upload it twice.
+            if not state.vault_saved_at:
+                try:
+                    await asyncio.wait_for(vaultstore.save(state.service), timeout=120.0)
+                except Exception:
+                    log.exception("Vault data save on close failed")
         await state.service.close()
 
 
@@ -965,6 +987,7 @@ async def status(request: Request):
     payload["pin_recovery"] = bool(payload.get("authorized")) and applock.has_pin()
     payload["mobile"] = MOBILE
     payload["can_upload"] = not NO_UPLOAD
+    payload["upload_limit"] = UPLOAD_LIMIT
     return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
 
@@ -1616,6 +1639,19 @@ async def set_vault(body: VaultBody, request: Request):
     return state.service.status()
 
 
+@app.post("/api/vault/save")
+async def save_vault(request: Request):
+    """Upload the current library snapshot before the app window closes."""
+    state = _state(request)
+    info = state.service.status()
+    if not (info["authorized"] and info.get("vault")):
+        return {"saved": False, "reason": "no vault"}
+    result = await asyncio.wait_for(vaultstore.save(state.service), timeout=120.0)
+    if result.get("saved"):
+        state.vault_saved_at = time.time()
+    return result
+
+
 @app.get("/api/vaults")
 async def list_vaults(request: Request, refresh: bool = False):
     state = _state(request)
@@ -1749,8 +1785,34 @@ async def reconnect(request: Request):
 
 @app.post("/api/quit")
 async def quit_app(request: Request):
+    state = _state(request)
+    info = state.service.status()
+    if info["authorized"] and info.get("vault") and not state.vault_saved_at:
+        # The process exits as soon as the window closes, so the snapshot has
+        # to be uploaded while the API call is still waiting, not on shutdown.
+        try:
+            result = await asyncio.wait_for(vaultstore.save(state.service), timeout=120.0)
+            if result.get("saved"):
+                state.vault_saved_at = time.time()
+        except Exception:
+            log.exception("Vault data save before quit failed")
     QUIT.set()
     return {"quitting": True}
+
+
+def vault_save_sync(timeout: float = 120.0) -> Dict[str, Any]:
+    """Run the close-time snapshot from the window thread."""
+    state = app.state
+    loop = getattr(state, "loop", None)
+    if loop is None or loop.is_closed():
+        return {"saved": False, "reason": "server is not running"}
+    future = asyncio.run_coroutine_threadsafe(
+        vaultstore.save(state.service), loop
+    )
+    result = future.result(timeout)
+    if result.get("saved"):
+        state.vault_saved_at = time.time()
+    return result
 
 
 # -------------------------------------------------------------------- updates
@@ -3169,14 +3231,13 @@ async def upload(
     client: str = Form(""),
 ):
     if NO_UPLOAD:
-        raise TGError("Uploading is disabled in the mobile app.")
+        raise TGError("Uploading is disabled in this app.")
     state = _state(request)
     info = state.service.status()
     if not info["authorized"] or not info["vault"]:
         raise TGError("Log in and choose your channel before uploading.")
     if not files:
         raise TGError("Choose at least one file.")
-    max_upload = int(info.get("max_upload") or MAX_UPLOAD)
     try:
         requested = json.loads(paths) if paths else []
     except json.JSONDecodeError:
@@ -3212,13 +3273,19 @@ async def upload(
                         if not chunk:
                             break
                         total += len(chunk)
-                        if total > SPLIT_HARD_CAP:
+                        if total > UPLOAD_LIMIT:
+                            hint = (
+                                " Upload it from the desktop app, which can split "
+                                "large files into parts."
+                                if MOBILE
+                                else ""
+                            )
+                            size_gb = UPLOAD_LIMIT // (1024 ** 3)
                             raise HTTPException(
                                 status_code=413,
                                 detail=(
-                                    f"{name} is larger than the "
-                                    f"{SPLIT_HARD_CAP // (1024 ** 3)} GB limit this "
-                                    "app can split into parts."
+                                    f"{name} is larger than the {size_gb} GB "
+                                    f"upload limit.{hint}"
                                 ),
                             )
                         handle.write(chunk)
@@ -3754,6 +3821,10 @@ async def _serve_media(
     async def body() -> AsyncIterator[bytes]:
         sent = 0
         if can_cache:
+            if not full:
+                streamcache.warm(
+                    state.service, message, cache_key, start, length, size
+                )
             try:
                 async for chunk in streamcache.read(
                     state.service, message, cache_key, start, length, size

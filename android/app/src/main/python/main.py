@@ -51,7 +51,6 @@ def start(home: str, ui_dir: str, port: int) -> bool:
     os.environ["TFE_PROJECT_DIR"] = str(home)
     os.environ["TFE_UI_DIR"] = str(ui_dir)
     os.environ["TFE_MOBILE"] = "1"
-    os.environ["TFE_NO_UPLOAD"] = "1"
     os.environ["TFE_DEVICE"] = "Android"
     os.makedirs(str(home), exist_ok=True)
     previous, previous_thread = _server, _thread

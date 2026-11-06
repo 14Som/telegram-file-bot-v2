@@ -7,7 +7,7 @@
   <meta name="theme-color" content="#0b84ff">
   <title>Telegram File Explorer</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/static/mobile.css?v=8">
+  <link rel="stylesheet" href="/static/mobile.css?v=9">
 </head>
 <body>
   <div class="screen boot" id="bootScreen">
@@ -81,7 +81,7 @@
     </div>
 
     <p class="form-error" id="authError"></p>
-    <p class="fineprint">Uploads are disabled in this app. Your files stay in your Telegram channel.</p>
+    <p class="fineprint">Files you upload go straight into your Telegram channel.</p>
   </div>
 
   <div class="screen vault" id="vaultScreen" hidden>
@@ -128,6 +128,7 @@
     <div class="crumb" id="crumb" hidden></div>
     <div class="chips" id="chips" hidden></div>
     <main class="content" id="content"></main>
+    <input id="uploadInput" type="file" multiple hidden>
     <div class="load-more" id="loadMore" hidden><div class="spinner small"></div></div>
     <div class="select-actions" id="selectActions" hidden>
       <button class="btn primary" id="selectDownload" type="button">Download</button>
@@ -135,12 +136,14 @@
 
     <section class="dlbar" id="dlBar" hidden aria-label="Downloads">
       <button class="dlbar-head" id="dlToggle" type="button" aria-expanded="true">
-        <span class="dlbar-title">Downloads</span>
+        <span class="dlbar-title">Transfers</span>
         <span class="dlbar-sum" id="dlSummary"></span>
         <span class="dlbar-chev" id="dlChev" data-icon="chev"></span>
       </button>
       <div class="dlbar-list" id="dlList"></div>
     </section>
+
+    <button class="upload-fab" id="uploadFab" type="button" aria-label="Upload files" hidden></button>
 
     <nav class="tabs" id="tabs">
       <button type="button" class="active" data-tab="files"><span data-icon="files"></span><em>Files</em></button>
@@ -190,6 +193,6 @@
   <script src="/static/vendor/mammoth/mammoth.browser.min.js"></script>
   <script src="/static/viewer3d.js?v=4"></script>
   <script src="/static/reader.js?v=23"></script>
-  <script src="/static/mobile.js?v=12"></script>
+  <script src="/static/mobile.js?v=14"></script>
 </body>
 </html>
