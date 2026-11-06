@@ -108,7 +108,7 @@ survives on the boot volume.
   All, Videos, Images and Documents tabs with counts. Pick the portrait from any of
   her images: click the portrait, use **Change portrait…**, or right-click an image
   and choose **Use as star portrait…**. Search matches names and aliases. *Look up
-  online* fills the details and portrait from Wikipedia
+  online* fills the details and portrait from IMDb and then Wikipedia
 - **IMDb details** — select a movie file and use **IMDb** (or its **⋯** menu) to look
   it up by name. The app fills title, year, rating and votes, genres, runtime,
   director, writers, cast, plot, country, language and poster, and shows them in the

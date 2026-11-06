@@ -24,7 +24,7 @@ from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "Telegram File Explorer"
 APP_ID = "TelegramFileExplorer"
-APP_VERSION = "2.6.5"
+APP_VERSION = "2.6.6"
 PAYLOAD_FILES = ("TelegramFileExplorer.exe",)
 UNINSTALL_KEY = rf"Software\Microsoft\Windows\CurrentVersion\Uninstall\{APP_ID}"
 CREATE_NO_WINDOW = 0x08000000

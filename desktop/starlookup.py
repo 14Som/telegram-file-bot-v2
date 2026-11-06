@@ -1,22 +1,53 @@
 """Online performer details for star records.
 
-Wikipedia and Wikidata supply aliases, birthday, birthplace, nationality and
-height. Only portraits hosted by Wikipedia/Wikimedia are downloaded.
+IAFD is searched first, then IMDb, then Wikipedia/Wikidata. Only portraits
+hosted by iafd.com, IMDb's image CDN or Wikipedia/Wikimedia are downloaded.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
 import ssl
+import subprocess
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime
+from html.parser import HTMLParser
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 USER_AGENT = "TelegramFileExplorer/1.0 (personal desktop library)"
+BROWSER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 TIMEOUT = 12
 IMAGE_LIMIT = 8 * 1024 * 1024
+IAFD_BASE = "https://www.iafd.com"
+IMDB_GRAPHQL = "https://api.graphql.imdb.com/"
+IMDB_NAME_URL = "https://www.imdb.com/name/{id}/"
+IMDB_IMAGE_HOSTS = (".media-amazon.com", ".media-imdb.com", ".imdb.com")
+IMDB_SEARCH = """
+query($term: String!, $first: Int!) {
+  mainSearch(options: {searchTerm: $term, type: [NAME]}, first: $first) {
+    edges { node { entity { ... on Name {
+      id
+      nameText { text }
+      birthDate { dateComponents { year month day } }
+      birthLocation { text }
+      height { measurement { value unit } }
+      primaryImage { url }
+      akas(first: 12) { edges { node { text } } }
+      bio { text { plainText } }
+    } } } }
+  }
+}
+"""
 ADULT_WORDS = (
     "porn",
     "erotic",
@@ -26,10 +57,40 @@ ADULT_WORDS = (
     "adult entertainer",
     "xxx",
 )
+PERSON_HREF = re.compile(
+    r'href="(?:https?://www\.iafd\.com)?/person\.rme/id=([0-9a-zA-Z\-]+)"', re.I
+)
+BIO_PAIR = re.compile(
+    r'<p class="bioheading">([^<]{1,160})</p>\s*<p class="biodata">(.*?)</p>',
+    re.S | re.I,
+)
+TABLE = re.compile(
+    r'<table\b[^>]*\bid="(tbl[^"]*)"[^>]*>(.*?)</table>', re.S | re.I
+)
+ROW = re.compile(r"<tr\b[^>]*>(.*?)</tr>", re.S | re.I)
 
 
 class LookupError(Exception):
     pass
+
+
+class _Text(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: List[str] = []
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(data)
+
+
+def _text(fragment: str) -> str:
+    parser = _Text()
+    try:
+        parser.feed(fragment or "")
+        parser.close()
+    except Exception:
+        return re.sub(r"<[^>]+>", " ", fragment or "").strip()
+    return re.sub(r"\s+", " ", " ".join(parser.parts)).strip()
 
 
 def _open(url: str, accept: str, agent: str = USER_AGENT) -> bytes:
@@ -48,6 +109,498 @@ def _open(url: str, accept: str, agent: str = USER_AGENT) -> bytes:
 
 def _json(url: str) -> Any:
     return json.loads(_open(url, "application/json").decode("utf-8"))
+
+
+# --------------------------------------------------------------------- IAFD
+def _curl(url: str, accept: str) -> Optional[tuple]:
+    """IAFD sits behind a TLS filter that rejects Python's handshake, so its
+    pages go through the curl that ships with Windows 10/11."""
+    exe = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "curl.exe"
+    if not exe.exists():
+        found = shutil.which("curl")
+        if not found:
+            return None
+        exe = Path(found)
+    with tempfile.TemporaryDirectory(prefix="tfe-iafd-") as tmp:
+        out = Path(tmp) / "body"
+        cmd = [
+            str(exe),
+            "-sS",
+            "-L",
+            "--compressed",
+            "--max-time",
+            str(TIMEOUT),
+            "-A",
+            BROWSER_AGENT,
+            "-H",
+            f"Accept: {accept}",
+            "-H",
+            "Accept-Language: en-US,en;q=0.9",
+            "-o",
+            str(out),
+            "-w",
+            "%{http_code}",
+            url,
+        ]
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            done = subprocess.run(
+                cmd,
+                capture_output=True,
+                timeout=TIMEOUT + 5,
+                creationflags=flags if os.name == "nt" else 0,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        code = done.stdout.decode("ascii", errors="ignore").strip()
+        try:
+            status = int(code[-3:])
+        except ValueError:
+            return None
+        try:
+            data = out.read_bytes() if out.exists() else b""
+        except OSError:
+            data = b""
+        return status, data
+
+
+def _iafd_fetch(url: str) -> bytes:
+    got = _curl(url, "text/html,application/xhtml+xml")
+    if got is not None:
+        status, data = got
+        if status in (403, 429):
+            raise LookupError(
+                "IAFD is refusing requests right now. Try again in a minute."
+            )
+        if status != 200 or not data:
+            raise LookupError("IAFD could not be reached.")
+        return data
+    try:
+        return _open(url, "text/html,application/xhtml+xml", BROWSER_AGENT)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (403, 429):
+            raise LookupError(
+                "IAFD is refusing requests right now. Try again in a minute."
+            ) from None
+        raise LookupError("IAFD could not be reached.") from None
+    except (urllib.error.URLError, TimeoutError, OSError):
+        raise LookupError(
+            "Could not reach IAFD. Check the internet connection."
+        ) from None
+
+
+def _iafd_html(url: str) -> str:
+    return _iafd_fetch(url).decode("utf-8", errors="replace")
+
+
+def _normalise(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", name.lower()).strip()
+
+
+def _iafd_rows(html: str) -> List[Dict[str, str]]:
+    found: List[Dict[str, str]] = []
+    for table_id, body in TABLE.findall(html):
+        if table_id.lower() in {"titleresult", "tblreviews"}:
+            continue
+        for row in ROW.findall(body):
+            ids = PERSON_HREF.findall(row)
+            if not ids:
+                continue
+            name = ""
+            for link in re.finditer(
+                r'<a\b[^>]*href="[^"]*person\.rme[^"]*"[^>]*>(.*?)</a>',
+                row,
+                re.S | re.I,
+            ):
+                candidate = _text(link.group(1))
+                if candidate:
+                    name = candidate
+                    break
+            if not name:
+                continue
+            aka = ""
+            cell = re.search(r"</td>\s*<td class=\"text-left\">(.*?)</td>", row, re.S | re.I)
+            if cell:
+                aka = _text(cell.group(1))
+            head = re.search(r'<img\b[^>]*src="([^"]+)"', row, re.I)
+            found.append(
+                {
+                    "id": ids[0],
+                    "name": name,
+                    "aka": aka,
+                    "headshot": head.group(1) if head else "",
+                }
+            )
+    return found
+
+
+def _best_row(rows: List[Dict[str, str]], query: str) -> Optional[Dict[str, str]]:
+    target = _normalise(query)
+    if not target:
+        return rows[0] if rows else None
+
+    def score(row: Dict[str, str]) -> int:
+        name = _normalise(row.get("name") or "")
+        if name == target:
+            return 0
+        if name.startswith(target) or target.startswith(name):
+            return 1
+        if target in name or name in target:
+            return 2
+        return 3
+
+    best = min(rows, key=score)
+    return best if score(best) < 3 else rows[0]
+
+
+def _iafd_search(name: str, candidates: List[str]) -> Optional[Dict[str, str]]:
+    fallback: Optional[Dict[str, str]] = None
+    seen: set = set()
+    for candidate in candidates[:3]:
+        if candidate.lower() in seen:
+            continue
+        seen.add(candidate.lower())
+        url = (
+            IAFD_BASE
+            + "/results.asp?searchtype=comprehensive&searchstring="
+            + urllib.parse.quote_plus(candidate)
+        )
+        rows = _iafd_rows(_iafd_html(url))
+        if not rows:
+            continue
+        exact = [row for row in rows if _normalise(row["name"]) == _normalise(candidate)]
+        if exact:
+            return exact[0]
+        if fallback is None:
+            fallback = _best_row(rows, candidate)
+    return fallback
+
+
+def _aliases_from_block(block: str) -> str:
+    values: List[str] = []
+    for chunk in re.split(r"<br\s*/?>|\r?\n", block or "", flags=re.I):
+        alias = re.sub(r"\([^)]*\)", "", _text(chunk)).strip(" ,;.-")
+        if alias and alias.lower() not in {value.lower() for value in values}:
+            values.append(alias)
+    return ", ".join(values)[:300]
+
+
+def _iso_date(text: str) -> str:
+    cleaned = re.sub(r"\([^)]*\)", "", text or "").strip()
+    for pattern in ("%B %d, %Y", "%b %d, %Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(cleaned, pattern).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    match = re.match(r"([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})", cleaned)
+    if match:
+        month = match.group(1)[:3].title()
+        try:
+            return datetime.strptime(
+                f"{month} {match.group(2)} {match.group(3)}", "%b %d %Y"
+            ).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    return cleaned[:40]
+
+
+def _height_cm(text: str) -> str:
+    match = re.search(r"\((\d{2,3})\s*cm\)", text or "", re.I)
+    if match:
+        return f"{int(match.group(1))} cm"
+    feet = re.search(r"(\d+)\s*(?:ft|feet|foot|')", text or "", re.I)
+    inches = re.search(r"(\d+)\s*(?:in|inches|inch|\")", text or "", re.I)
+    if feet:
+        total = int(feet.group(1)) * 30.48 + (int(inches.group(1)) * 2.54 if inches else 0)
+        if total > 0:
+            return f"{round(total)} cm"
+    return (text or "").strip()[:40]
+
+
+US_STATES = {
+    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "HI", "ID",
+    "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD", "MA", "MI", "MN", "MS",
+    "MO", "MT", "NE", "NV", "NH", "NJ", "NM", "NY", "NC", "ND", "OH", "OK",
+    "OR", "PA", "RI", "SC", "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV",
+    "WI", "WY", "DC",
+}
+
+
+def _country(pairs: Dict[str, str]) -> str:
+    birthplace = re.sub(r"\([^)]*\)", "", pairs.get("birthplace") or "")
+    parts = [part.strip() for part in birthplace.split(",") if part.strip()]
+    nationality = pairs.get("nationality") or ""
+    if len(parts) > 1:
+        last = parts[-1]
+        if len(last) > 3 and last.upper() not in US_STATES:
+            return last[:80]
+        return nationality[:80]
+    return (parts[0] if parts else nationality)[:80]
+
+
+def _iafd_note(pairs: Dict[str, str], comment: str) -> str:
+    bits: List[str] = []
+    if pairs.get("birthplace"):
+        bits.append(f"Born in {pairs['birthplace']}.")
+    if pairs.get("ethnicity"):
+        bits.append(f"Ethnicity: {pairs['ethnicity']}.")
+    if pairs.get("years active"):
+        bits.append(f"Active {pairs['years active']}.")
+    if pairs.get("weight"):
+        bits.append(f"Weight: {pairs['weight']}.")
+    if comment:
+        bits.append(comment)
+    return " ".join(bits).strip()[:4000]
+
+
+def _first_comment(html: str) -> str:
+    match = re.search(
+        r'<li class="cmt">(.*?)</li>', html, re.S | re.I
+    )
+    text = _text(match.group(1)) if match else ""
+    return text.lstrip("- ").strip()[:1500]
+
+
+def _iafd_image(url: str) -> Optional[bytes]:
+    url = urllib.parse.urljoin(IAFD_BASE, url or "")
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    if host not in {"www.iafd.com", "iafd.com"}:
+        return None
+    got = _curl(url, "image/avif,image/webp,image/jpeg,image/png,image/*")
+    if got is not None:
+        status, data = got
+        if status == 200 and 0 < len(data) <= IMAGE_LIMIT:
+            return data
+        return None
+    try:
+        data = _open(
+            url,
+            "image/avif,image/webp,image/jpeg,image/png,image/*",
+            BROWSER_AGENT,
+        )
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return None
+    if not data or len(data) > IMAGE_LIMIT:
+        return None
+    return data
+
+
+def _iafd_lookup(name: str, candidates: List[str]) -> Optional[Dict[str, Any]]:
+    row = _iafd_search(name, candidates)
+    if row is None:
+        return None
+    person_url = f"{IAFD_BASE}/person.rme/id={row['id']}"
+    html = _iafd_html(person_url)
+    heading = re.search(r"<h1[^>]*>(.*?)</h1>", html, re.S | re.I)
+    title = _text(heading.group(1)) if heading else row["name"]
+    pairs: Dict[str, str] = {}
+    for label, value in BIO_PAIR.findall(html):
+        key = _text(label).lower()
+        text = _text(value)
+        if key and text and key not in pairs:
+            pairs[key] = text
+    aliases_block = re.search(
+        r'<p class="bioheading">\s*Performer\s*AKA\s*</p>\s*<div class="biodata">(.*?)</div>',
+        html,
+        re.S | re.I,
+    )
+    aliases = _aliases_from_block(aliases_block.group(1) if aliases_block else row["aka"])
+    if not aliases and row.get("aka"):
+        aliases = _aliases_from_block(row["aka"])
+    fields: Dict[str, str] = {
+        "aliases": aliases,
+        "note": _iafd_note(pairs, _first_comment(html)),
+        "country": _country(pairs),
+        "birthdate": _iso_date(pairs.get("birthday", "")),
+        "height": _height_cm(pairs.get("height", "")),
+        "hair": (pairs.get("hair color") or "")[:60],
+        "eyes": (pairs.get("eye color") or "")[:60],
+        "measurements": (pairs.get("measurements") or "")[:80],
+        "tattoos": (pairs.get("tattoos") or "")[:1000],
+        "piercings": (pairs.get("piercings") or "")[:600],
+    }
+    shot = re.search(
+        r'<div id="headshot">\s*<img\b[^>]*src="([^"]+)"', html, re.S | re.I
+    )
+    image = _iafd_image(shot.group(1)) if shot else None
+    return {
+        "found": True,
+        "source": "IAFD",
+        "source_url": person_url,
+        "title": title or row["name"],
+        "description": (pairs.get("ethnicity") or "Performer")[:200],
+        "fields": fields,
+        "image_bytes": image,
+    }
+
+
+# --------------------------------------------------------------------- IMDb
+def _imdb_graphql(term: str) -> Dict[str, Any]:
+    body = json.dumps(
+        {"query": IMDB_SEARCH, "variables": {"term": term, "first": 8}}
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        IMDB_GRAPHQL,
+        data=body,
+        method="POST",
+        headers={
+            "User-Agent": BROWSER_AGENT,
+            "Accept": "application/json",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Content-Type": "application/json",
+            "x-imdb-client-name": "imdb-web-next",
+            "Origin": "https://www.imdb.com",
+            "Referer": "https://www.imdb.com/",
+        },
+    )
+    context = ssl.create_default_context()
+    try:
+        with urllib.request.urlopen(
+            request, timeout=TIMEOUT, context=context
+        ) as response:
+            data = json.loads(response.read(IMAGE_LIMIT + 1).decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code in (403, 429):
+            raise LookupError(
+                "IMDb is refusing requests right now. Try again in a minute."
+            ) from None
+        raise LookupError("IMDb could not be reached.") from None
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        raise LookupError(
+            "Could not reach IMDb. Check the internet connection."
+        ) from None
+    if not isinstance(data, dict) or data.get("errors"):
+        return {}
+    return data
+
+
+def _imdb_people(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    edges = (
+        ((payload.get("data") or {}).get("mainSearch") or {}).get("edges")
+    ) or []
+    people: List[Dict[str, Any]] = []
+    for edge in edges:
+        entity = ((edge or {}).get("node") or {}).get("entity") or {}
+        if isinstance(entity, dict) and entity.get("id"):
+            people.append(entity)
+    return people
+
+
+def _imdb_birthdate(node: Dict[str, Any]) -> str:
+    parts = ((node.get("birthDate") or {}).get("dateComponents")) or {}
+    if not isinstance(parts, dict):
+        return ""
+    year = parts.get("year")
+    month = parts.get("month")
+    day = parts.get("day")
+    if not year:
+        return ""
+    if not month:
+        return f"{int(year):04d}"
+    if not day:
+        return f"{int(year):04d}-{int(month):02d}"
+    return f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
+
+
+def _imdb_height(node: Dict[str, Any]) -> str:
+    measurement = ((node.get("height") or {}).get("measurement")) or {}
+    if not isinstance(measurement, dict):
+        return ""
+    try:
+        value = float(measurement.get("value"))
+    except (TypeError, ValueError):
+        return ""
+    unit = str(measurement.get("unit") or "m").lower()
+    if unit in {"m", "meter", "meters"}:
+        centimetres = value * 100
+    elif unit in {"cm", "centimeter", "centimeters"}:
+        centimetres = value
+    elif unit in {"ft", "feet", "foot"}:
+        centimetres = value * 30.48
+    elif unit in {"in", "inch", "inches"}:
+        centimetres = value * 2.54
+    else:
+        return ""
+    if centimetres <= 0:
+        return ""
+    return f"{round(centimetres)} cm"
+
+
+def _imdb_country(node: Dict[str, Any]) -> str:
+    place = str((node.get("birthLocation") or {}).get("text") or "").strip()
+    parts = [part.strip() for part in place.split(",") if part.strip()]
+    if len(parts) > 1:
+        return parts[-1][:80]
+    return ""
+
+
+def _imdb_aliases(node: Dict[str, Any], name: str) -> str:
+    values: List[str] = []
+    for edge in ((node.get("akas") or {}).get("edges") or []):
+        text = str((((edge or {}).get("node") or {}).get("text")) or "").strip()
+        if text and text.lower() != name.lower():
+            if text.lower() not in {value.lower() for value in values}:
+                values.append(text)
+    return ", ".join(values)[:300]
+
+
+def _imdb_image(node: Dict[str, Any]) -> Optional[bytes]:
+    url = str((node.get("primaryImage") or {}).get("url") or "")
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    if not url or not host.endswith(IMDB_IMAGE_HOSTS):
+        return None
+    try:
+        data = _open(url, "image/avif,image/webp,image/jpeg,image/*", BROWSER_AGENT)
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return None
+    if not data or len(data) > IMAGE_LIMIT:
+        return None
+    return data
+
+
+def _imdb_lookup(name: str, candidates: List[str]) -> Optional[Dict[str, Any]]:
+    target = _normalise(name)
+    people: List[Dict[str, Any]] = []
+    seen: set = set()
+    for candidate in candidates[:2]:
+        if candidate.lower() in seen:
+            continue
+        seen.add(candidate.lower())
+        people.extend(_imdb_people(_imdb_graphql(candidate)))
+
+    def score(node: Dict[str, Any]) -> int:
+        title = _normalise(str((node.get("nameText") or {}).get("text") or ""))
+        if title == target:
+            return 0
+        if title.startswith(target) or target.startswith(title):
+            return 1
+        if target in title or title in target:
+            return 2
+        return 3
+
+    if not people:
+        return None
+    best = min(people, key=score)
+    if score(best) >= 3:
+        return None
+    title = str((best.get("nameText") or {}).get("text") or name)
+    bio = str((((best.get("bio") or {}).get("text") or {}).get("plainText")) or "").strip()
+    fields: Dict[str, str] = {
+        "aliases": _imdb_aliases(best, title),
+        "note": bio[:4000],
+        "country": _imdb_country(best),
+        "birthdate": _imdb_birthdate(best),
+        "height": _imdb_height(best),
+    }
+    return {
+        "found": True,
+        "source": "IMDb",
+        "source_url": IMDB_NAME_URL.format(id=str(best.get("id") or "")),
+        "title": title,
+        "description": "Performer",
+        "fields": fields,
+        "image_bytes": _imdb_image(best),
+    }
 
 
 # ----------------------------------------------------------------- Wikipedia
@@ -256,7 +809,7 @@ def _wiki_lookup(name: str, candidates: List[str]) -> Dict[str, Any]:
 
 
 def lookup(name: str, aliases: str = "") -> Dict[str, Any]:
-    """Find performer facts and a portrait on Wikipedia."""
+    """Find a performer on IAFD, then IMDb, then Wikipedia."""
     name = str(name or "").strip()
     if not name:
         raise LookupError("Add a name before looking it up.")
@@ -265,7 +818,30 @@ def lookup(name: str, aliases: str = "") -> Dict[str, Any]:
         alias = alias.strip()
         if alias and alias.lower() != name.lower():
             candidates.append(alias)
-    return _wiki_lookup(name, candidates[:4])
+    candidates = candidates[:4]
+    notes: List[str] = []
+    try:
+        found = _iafd_lookup(name, candidates)
+        if found is not None:
+            return found
+        notes.append("IAFD has no match")
+    except LookupError as exc:
+        notes.append(str(exc))
+    try:
+        found = _imdb_lookup(name, candidates)
+        if found is not None:
+            return found
+        notes.append("IMDb has no match")
+    except LookupError as exc:
+        notes.append(str(exc))
+    try:
+        return _wiki_lookup(name, candidates)
+    except LookupError as exc:
+        notes.append(str(exc))
+    raise LookupError(
+        "; ".join(notes).rstrip(".")
+        + ". Try the full stage name or add an alias."
+    )
 
 
 def apply_fields(

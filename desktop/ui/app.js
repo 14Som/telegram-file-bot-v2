@@ -5397,7 +5397,7 @@ function confirmDeleteStar(star) {
 function promptStarLookup(star) {
   if (!star) return;
   const overwrite = inputEl({ type: "checkbox" });
-  const status = h("p", { class: "modal-note", text: "Wikipedia is checked for details and a portrait. This needs an internet connection." });
+  const status = h("p", { class: "modal-note", text: "IAFD is checked first, then IMDb and Wikipedia, for details and a portrait. This needs an internet connection." });
   const overwriteRow = h("label", { class: "check" },
     overwrite,
     h("span", {},
@@ -5419,7 +5419,7 @@ function promptStarLookup(star) {
         class: "primary",
         onClick: async (setBusy) => {
           setBusy(true);
-          status.textContent = "Searching Wikipedia…";
+          status.textContent = "Searching IAFD, IMDb and Wikipedia…";
           try {
             const data = await api(`/api/stars/${star.id}/lookup`, {
               method: "POST",
