@@ -56,6 +56,7 @@ if os.name == "nt":
 else:
     winshell = None
 from .catalog import (
+    KIND_LABELS,
     Catalog,
     clean_folder_path,
     clean_name,
@@ -78,7 +79,7 @@ log = logging.getLogger("tfe.server")
 
 QUIT = threading.Event()
 COOKIE = "tfe_session"
-APP_VERSION = "2.5.2"
+APP_VERSION = "2.6.4"
 # The Android build extracts the interface next to its writable data and runs
 # the same server there; the desktop EXE keeps using the bundled copy.
 UI_DIR = Path(
@@ -485,6 +486,14 @@ async def _scoped_star(state: Any, star_id: int) -> Dict[str, Any]:
     return star
 
 
+async def _star_payload(state: Any, star: Dict[str, Any]) -> Dict[str, Any]:
+    payload = _public_star(star)
+    payload["related"] = await run_in_threadpool(
+        state.catalog.performer_summary, int(star["id"]), _chat_id(state)
+    )
+    return payload
+
+
 async def _attach_stars(state: Any, items: List[Dict[str, Any]]) -> None:
     if not items:
         return
@@ -613,7 +622,13 @@ def _part_groups(state: Any) -> Dict[str, Dict[str, Any]]:
         key = f"{part['base'].lower()}|{part['ext']}"
         entry = groups.setdefault(
             key,
-            {"base": part["base"], "count": 0, "size": 0, "nums": {}},
+            {
+                "base": part["base"],
+                "ext": part["ext"],
+                "count": 0,
+                "size": 0,
+                "nums": {},
+            },
         )
         entry["count"] += 1
         entry["size"] += int(row.get("size") or 0)
@@ -622,6 +637,12 @@ def _part_groups(state: Any) -> Dict[str, Dict[str, Any]]:
 
 
 def _attach_part_info(state: Any, items: List[Dict[str, Any]]) -> None:
+    """Describe split sets as one file on their first volume.
+
+    The library stores one row per archive volume, but the explorer treats
+    the set as a single file: the first volume takes the original name and
+    combined size, and the UI downloads (joins) it as one file.
+    """
     if not items:
         return
     groups = _part_groups(state)
@@ -640,6 +661,65 @@ def _attach_part_info(state: Any, items: List[Dict[str, Any]]) -> None:
             "count": entry["count"],
             "size": entry["size"],
         }
+        if int(part["num"]) != 1:
+            continue
+        base = entry["base"]
+        kind = filetypes.classify(base, "document")
+        item["name"] = base
+        item["size"] = entry["size"]
+        item["kind"] = kind
+        item["kind_label"] = KIND_LABELS.get(kind, "File")
+        item["mime"] = None
+        item["split"] = {"count": entry["count"], "size": entry["size"]}
+
+
+def _expand_parts(state: Any, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Add the hidden volumes of every split set to a batch of items."""
+    extra: List[Dict[str, Any]] = []
+    seen = {int(item["id"]) for item in items}
+    for item in items:
+        if int(item.get("part_num") or 0) != 1:
+            continue
+        for member in state.catalog.part_members(
+            item["chat_id"], item["part_base"], item["part_ext"]
+        ):
+            member_id = int(member["id"])
+            if member_id in seen:
+                continue
+            seen.add(member_id)
+            extra.append(member)
+    return items + extra if extra else items
+
+
+def _volume_name(base: str, ext: str, number: int) -> str:
+    if ext == "rar":
+        return f"{base}.part{number}.rar"
+    return f"{base}.{ext}.{number:03d}"
+
+
+def _rename_parts(
+    state: Any, item: Dict[str, Any], name: str
+) -> Optional[Dict[str, Any]]:
+    """Rename every volume of a split set, keeping its numbering intact."""
+    part = parse_part_name(item.get("name") or "")
+    if part is None:
+        return state.catalog.rename(item["id"], name)
+    wanted = parse_part_name(name)
+    base = clean_name(wanted["base"] if wanted else name, "")
+    if not base:
+        return None
+    members = state.catalog.part_members(
+        item["chat_id"], item["part_base"], item["part_ext"]
+    )
+    lead: Optional[Dict[str, Any]] = None
+    for member in members:
+        number = int(member.get("part_num") or 0)
+        updated = state.catalog.rename(
+            member["id"], _volume_name(base, part["ext"], number)
+        )
+        if number == 1:
+            lead = updated
+    return lead
 
 
 def parse_range(header: Optional[str], size: int) -> Optional[Tuple[int, int]]:
@@ -1471,6 +1551,7 @@ async def _folder_archive(
     if info is None:
         return None
     items = await run_in_threadpool(state.catalog.folder_items, folder, chat_id)
+    items = await run_in_threadpool(_expand_parts, state, items)
     all_folders = await run_in_threadpool(state.catalog.folders, chat_id)
     lower = folder.lower()
     dir_names = [
@@ -1851,20 +1932,29 @@ async def patch_item(item_id: int, body: ItemPatch, request: Request):
         name = clean_name(body.name, "")
         if not name:
             raise TGError("A file name cannot be empty.")
-        item = await run_in_threadpool(state.catalog.rename, item_id, name)
+        item = await run_in_threadpool(_rename_parts, state, item, name)
         if item is None:
             raise HTTPException(status_code=404, detail="File not found.")
-        if state.service.is_bot_vault():
-            Catalog.sync_to_bot(state.bot_db, item["message_id"], name=item["name"])
-        try:
-            await state.service.edit_caption(
-                item["message_id"], item["name"], item.get("chat_id")
-            )
-        except TGError as exc:
-            warning = (
-                "Renamed in the explorer, but the Telegram caption could not be "
-                f"updated: {exc}"
-            )
+        members = await run_in_threadpool(
+            state.catalog.part_members,
+            item["chat_id"],
+            item["part_base"],
+            item["part_ext"],
+        ) or [item]
+        for member in members:
+            if state.service.is_bot_vault():
+                Catalog.sync_to_bot(
+                    state.bot_db, member["message_id"], name=member["name"]
+                )
+            try:
+                await state.service.edit_caption(
+                    member["message_id"], member["name"], member.get("chat_id")
+                )
+            except TGError as exc:
+                warning = (
+                    "Renamed in the explorer, but the Telegram caption could not be "
+                    f"updated: {exc}"
+                )
     if body.folder is not None:
         folder = clean_folder_path(body.folder, "")
         if not folder:
@@ -1895,6 +1985,7 @@ async def patch_item(item_id: int, body: ItemPatch, request: Request):
     if item is None:
         raise HTTPException(status_code=404, detail="File not found.")
     public = public_item(item, _vault(state.service.status()))
+    _attach_part_info(state, [public])
     await _attach_stars(state, [public])
     return {"item": public, "warning": warning}
 
@@ -2101,7 +2192,7 @@ async def update_star(star_id: int, body: StarBody, request: Request):
         raise TGError(str(exc))
     if star is None:
         raise HTTPException(status_code=404, detail="Star not found in this vault.")
-    return _public_star(star)
+    return await _star_payload(state, star)
 
 
 @app.delete("/api/stars/{star_id}")
@@ -2137,7 +2228,7 @@ async def star_image(star_id: int, request: Request):
 @app.get("/api/stars/{star_id}")
 async def star_detail(star_id: int, request: Request):
     state = _state(request)
-    return _public_star(await _scoped_star(state, star_id))
+    return await _star_payload(state, await _scoped_star(state, star_id))
 
 
 @app.post("/api/stars/{star_id}/image/from-item")
@@ -2155,7 +2246,7 @@ async def star_image_from_item(
     await run_in_threadpool(
         state.catalog.set_performer_image, star_id, _chat_id(state), version
     )
-    return _public_star(await _scoped_star(state, star_id))
+    return await _star_payload(state, await _scoped_star(state, star_id))
 
 
 @app.post("/api/stars/{star_id}/image")
@@ -2177,7 +2268,7 @@ async def star_image_upload(
     await run_in_threadpool(
         state.catalog.set_performer_image, star_id, _chat_id(state), version
     )
-    return _public_star(await _scoped_star(state, star_id))
+    return await _star_payload(state, await _scoped_star(state, star_id))
 
 
 @app.post("/api/stars/{star_id}/lookup")
@@ -2266,6 +2357,7 @@ INSPECT_MAX_BYTES = 512 * 1024 ** 2
 SHELL_THUMB_MAX_BYTES = 256 * 1024 ** 2
 _external_locks: Dict[int, asyncio.Lock] = {}
 _shell_thumb_locks: Dict[int, asyncio.Lock] = {}
+_auto_thumb_locks: Dict[int, asyncio.Lock] = {}
 
 
 def _scratch_path(item: Dict[str, Any], tag: str) -> Path:
@@ -2396,6 +2488,46 @@ async def set_thumb_image(item_id: int, body: ThumbImageBody, request: Request):
     public = public_item(updated or item, _vault(state.service.status()))
     await _attach_stars(state, [public])
     return {"item": public, "ok": True}
+
+
+@app.post("/api/items/{item_id}/thumb/frame")
+async def auto_thumb_frame(item_id: int, request: Request):
+    state = _state(request)
+    item = await _scoped_item(state, item_id)
+    if str(item.get("kind") or "").lower() != "video":
+        raise TGError("Automatic thumbnails are only generated for videos.")
+    cached = thumbpick.custom_path(item_id).is_file()
+    if not cached:
+        lock = _auto_thumb_locks.setdefault(item_id, asyncio.Lock())
+        async with lock:
+            url = f"{request.base_url}api/stream/{item_id}"
+            try:
+                made = await run_in_threadpool(
+                    thumbpick.auto_thumb, item, url, state.key
+                )
+            except RuntimeError as exc:
+                raise TGError(str(exc))
+            if not made:
+                raise TGError("A frame could not be read from this video.")
+            updated = await run_in_threadpool(
+                state.catalog.update,
+                item_id,
+                has_thumb=1,
+                thumb_version=int(time.time()),
+            )
+            public = public_item(updated or item, _vault(state.service.status()))
+    if cached:
+        updated = await run_in_threadpool(state.catalog.get, item_id) or item
+        if not updated.get("has_thumb"):
+            updated = await run_in_threadpool(
+                state.catalog.update,
+                item_id,
+                has_thumb=1,
+                thumb_version=int(time.time()),
+            )
+        public = public_item(updated, _vault(state.service.status()))
+    await _attach_stars(state, [public])
+    return {"item": public, "ok": True, "cached": cached}
 
 
 @app.get("/api/reader/state")
@@ -2782,13 +2914,18 @@ async def thumb_picker_select(item_id: int, body: ThumbPickBody, request: Reques
 async def delete_item(item_id: int, request: Request, remote: bool = False):
     state = _state(request)
     item = await _scoped_item(state, item_id)
+    targets = await run_in_threadpool(_expand_parts, state, [item])
     if remote:
-        await state.service.delete_message(item["message_id"], item.get("chat_id"))
-        await run_in_threadpool(state.catalog.delete, item_id)
-        if state.service.is_bot_vault():
-            Catalog.clear_bot_vault(state.bot_db, item["message_id"])
+        for target in targets:
+            await state.service.delete_message(
+                target["message_id"], target.get("chat_id")
+            )
+            await run_in_threadpool(state.catalog.delete, target["id"])
+            if state.service.is_bot_vault():
+                Catalog.clear_bot_vault(state.bot_db, target["message_id"])
         return {"deleted": True, "remote": True, "item_id": item_id}
-    await run_in_threadpool(state.catalog.hide, item_id)
+    for target in targets:
+        await run_in_threadpool(state.catalog.hide, target["id"])
     return {"deleted": True, "remote": False, "item_id": item_id}
 
 
@@ -2913,18 +3050,17 @@ async def _batch_items(state: Any, item_ids: List[int]) -> List[Dict[str, Any]]:
 async def batch_delete(body: BatchDeleteBody, request: Request):
     state = _state(request)
     items = await _batch_items(state, body.item_ids)
-    removed = 0
+    targets = await run_in_threadpool(_expand_parts, state, items)
+    removed = len(items)
     if body.remote:
-        for item in items:
+        for item in targets:
             await state.service.delete_message(item["message_id"], item.get("chat_id"))
             await run_in_threadpool(state.catalog.delete, item["id"])
             if state.service.is_bot_vault():
                 Catalog.clear_bot_vault(state.bot_db, item["message_id"])
-            removed += 1
     else:
-        for item in items:
+        for item in targets:
             await run_in_threadpool(state.catalog.hide, item["id"])
-            removed += 1
     return {"deleted": removed, "remote": body.remote}
 
 
@@ -2980,7 +3116,10 @@ async def batch_copy(body: BatchCopyBody, request: Request):
     items = await _batch_items(state, body.item_ids)
     if len(items) > 40:
         raise TGError("Copy up to 40 files at a time.")
-    copied = await state.service.copy_messages([item["message_id"] for item in items])
+    targets = await run_in_threadpool(_expand_parts, state, items)
+    copied = await state.service.copy_messages(
+        [item["message_id"] for item in targets]
+    )
 
     def apply() -> List[int]:
         created: List[int] = []
@@ -2999,16 +3138,19 @@ async def batch_info(request: Request, ids: str = Query("", max_length=4000)):
     state = _state(request)
     items = await _batch_items(state, _parse_id_query(ids))
     vault = _vault(state.service.status())
-    return {"items": [public_item(item, vault) for item in items]}
+    payload = [public_item(item, vault) for item in items]
+    _attach_part_info(state, payload)
+    return {"items": payload}
 
 
 @app.get("/api/batch/download")
 async def batch_download(request: Request, ids: str = Query("", max_length=4000)):
     state = _state(request)
     items = await _batch_items(state, _parse_id_query(ids))
+    targets = await run_in_threadpool(_expand_parts, state, items)
     zip_name = "Selected files.zip"
     return StreamingResponse(
-        _zip_stream(state, "Selected files", [], items),
+        _zip_stream(state, "Selected files", [], targets),
         media_type="application/zip",
         headers={
             "Content-Disposition": _content_disposition(zip_name, True),
@@ -3162,15 +3304,8 @@ async def _run_upload_entry(
                     original.unlink(missing_ok=True)
                 except OSError:
                     pass
-                bases: List[int] = []
-                total = 0
-                for volume in volumes:
-                    bases.append(total)
-                    total += volume.stat().st_size
 
-                async def upload_volume(
-                    index: int, volume: Path, sent_base: int
-                ) -> None:
+                async def upload_volume(index: int, volume: Path) -> None:
                     async with gate:
                         if transfer is not None and transfer.get("cancel"):
                             raise TransferCancelled()
@@ -3179,7 +3314,6 @@ async def _run_upload_entry(
                                 **entry,
                                 "path": str(volume),
                                 "name": volume.name,
-                                "sent_base": sent_base,
                                 "part_index": index,
                                 "shared": True,
                             },
@@ -3188,7 +3322,7 @@ async def _run_upload_entry(
 
                 results = await asyncio.gather(
                     *(
-                        upload_volume(index, volume, bases[index])
+                        upload_volume(index, volume)
                         for index, volume in enumerate(volumes)
                     ),
                     return_exceptions=True,
@@ -3302,6 +3436,7 @@ async def start_download(body: DownloadBody, request: Request):
         return {"transfer": transfer}
     if body.ids:
         items = await _batch_items(state, body.ids)
+        items = await run_in_threadpool(_expand_parts, state, items)
         transfer = state.downloads.start_zip(
             "Selected files.zip",
             _archive_size(items),
@@ -3312,6 +3447,16 @@ async def start_download(body: DownloadBody, request: Request):
     if body.item_id is None:
         raise TGError("Choose a file to download.")
     item = await _scoped_item(state, int(body.item_id))
+    if parse_part_name(item.get("name") or "") is not None:
+        members = await run_in_threadpool(
+            state.catalog.part_members,
+            item["chat_id"],
+            item["part_base"],
+            item["part_ext"],
+        )
+        if len(members) > 1:
+            # A split set is one file to the user; joining it is the download.
+            return _launch_merge(state, item)
     return {"transfer": state.downloads.start_file(item)}
 
 
@@ -3332,10 +3477,8 @@ async def reveal_download(transfer_id: str, request: Request):
 
 
 # ------------------------------------------------------------------ merge
-@app.post("/api/merge")
-async def start_merge(body: MergeBody, request: Request):
-    state = _state(request)
-    item = await _scoped_item(state, body.item_id)
+def _launch_merge(state: Any, item: Dict[str, Any]) -> Dict[str, Any]:
+    """Start downloading and joining every volume of a split set."""
     part = parse_part_name(item.get("name") or "")
     if part is None:
         raise TGError("This file is not a split archive part.")
@@ -3365,8 +3508,7 @@ async def start_merge(body: MergeBody, request: Request):
     job_id = uuid.uuid4().hex[:16]
     transfer_id = state.service.new_transfer(entry["base"], total_size)
     transfer = state.service.transfers[transfer_id]
-    transfer["state"] = "downloading"
-    transfer["parts"] = len(ordered_items)
+    transfer.update(state="downloading", parts=len(ordered_items), part_num=0)
     job = {
         "id": job_id,
         "transfer_id": transfer_id,
@@ -3377,6 +3519,13 @@ async def start_merge(body: MergeBody, request: Request):
     state.merge_jobs[job_id] = job
     _spawn(state, _run_merge(state, job))
     return {"transfer": transfer, "job": job_id}
+
+
+@app.post("/api/merge")
+async def start_merge(body: MergeBody, request: Request):
+    state = _state(request)
+    item = await _scoped_item(state, body.item_id)
+    return _launch_merge(state, item)
 
 
 async def _run_merge(state: Any, job: Dict[str, Any]) -> None:
@@ -3390,6 +3539,7 @@ async def _run_merge(state: Any, job: Dict[str, Any]) -> None:
                 if transfer.get("cancel"):
                     raise TransferCancelled()
                 transfer["state"] = "downloading"
+                transfer["part_num"] = index
             message, size, _mime = await state.service.media_info(part_item)
             target = parts_dir / clean_name(
                 part_item.get("name") or f"part-{index:03d}"
@@ -3643,6 +3793,10 @@ def _token_path(path: str, token: str) -> str:
     return f"{path}{'&' if '?' in path else '?'}token={token}"
 
 
+def _absolute_url(request: Request, path: str) -> str:
+    return f"{str(request.base_url).rstrip('/')}{path}"
+
+
 def _clean_mode(video: str) -> str:
     return video if video in ("copy", "h264") else "copy"
 
@@ -3656,6 +3810,18 @@ async def play_info(item_id: int, request: Request):
     for entry in sidecars:
         entry["url"] = _token_path(entry["url"], token)
     tracks = playback.cached_probe(item)
+    # Knowing the video codec up front lets the player avoid handing HEVC
+    # files to WebView2, which plays their audio but shows no picture.
+    if (
+        tracks is None
+        and (item.get("kind") or "") == "video"
+        and playback.ffmpeg_path() is not None
+    ):
+        source = _absolute_url(request, _token_path(f"/api/file/{item['id']}", token))
+        try:
+            tracks = await run_in_threadpool(playback.probe_source, item, source, 20)
+        except Exception:
+            tracks = None
     job = playback.latest_job(item)
     prepared = None
     if job:
@@ -3705,7 +3871,7 @@ async def play_tracks(item_id: int, request: Request):
         if playback.ffmpeg_path() is None:
             raise HTTPException(status_code=409, detail="ffmpeg is not installed.")
         token = playback.mint_token(int(item["id"]))
-        source = _token_path(f"/api/file/{item['id']}", token)
+        source = _absolute_url(request, _token_path(f"/api/file/{item['id']}", token))
         try:
             cached = await run_in_threadpool(playback.probe_source, item, source)
         except Exception as exc:
@@ -3819,7 +3985,7 @@ async def play_embedded_subtitle(
         if playback.ffmpeg_path() is None:
             raise HTTPException(status_code=409, detail="ffmpeg is not installed.")
         token = playback.mint_token(int(item["id"]))
-        source = _token_path(f"/api/file/{item['id']}", token)
+        source = _absolute_url(request, _token_path(f"/api/file/{item['id']}", token))
         directory = playback.PLAY_DIR / playback.item_key(item)
         await run_in_threadpool(directory.mkdir, parents=True, exist_ok=True)
         try:

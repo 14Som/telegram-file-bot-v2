@@ -809,12 +809,12 @@ def cached_probe(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return data if isinstance(data, dict) else None
 
 
-def probe_source(item: Dict[str, Any], source: Any) -> Dict[str, Any]:
+def probe_source(item: Dict[str, Any], source: Any, timeout: int = 90) -> Dict[str, Any]:
     """Probe and remember the stream list; cached per movie."""
     cached = cached_probe(item)
     if cached:
         return cached
-    info = probe_file(source, timeout=90)
+    info = probe_file(source, timeout=timeout)
     directory = PLAY_DIR / item_key(item)
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "tracks.json").write_text(
@@ -827,6 +827,14 @@ def public_tracks(info: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     info = info or {}
     return {
         "duration": float(info.get("duration") or 0),
+        "video": [
+            {
+                "codec": stream.get("codec") or "",
+                "width": int(stream.get("width") or 0),
+                "height": int(stream.get("height") or 0),
+            }
+            for stream in (info.get("video") or [])
+        ],
         "audio": [
             {
                 "index": int(stream.get("index") or 0),

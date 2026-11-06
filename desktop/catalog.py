@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import filetypes
+from .splitmerge import parse_part_name
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS items (
@@ -53,6 +54,9 @@ CREATE TABLE IF NOT EXISTS items (
     imdb_json TEXT NOT NULL DEFAULT '',
     imdb_poster_version INTEGER NOT NULL DEFAULT 0,
     meta_json TEXT NOT NULL DEFAULT '',
+    part_base TEXT NOT NULL DEFAULT '',
+    part_ext TEXT NOT NULL DEFAULT '',
+    part_num INTEGER NOT NULL DEFAULT 0,
     UNIQUE(chat_id, message_id)
 );
 CREATE INDEX IF NOT EXISTS idx_items_name ON items(name COLLATE NOCASE);
@@ -241,8 +245,8 @@ _BAD_NAME = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 UPSERT_SQL = """
 INSERT INTO items (chat_id, message_id, doc_id, access_hash, name,
     kind, mime, size, width, height, duration, folder, caption,
-    tg_date, has_thumb)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    tg_date, has_thumb, part_base, part_ext, part_num)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(chat_id, message_id) DO UPDATE SET
     doc_id = excluded.doc_id,
     access_hash = excluded.access_hash,
@@ -255,6 +259,9 @@ ON CONFLICT(chat_id, message_id) DO UPDATE SET
     caption = COALESCE(excluded.caption, items.caption),
     tg_date = COALESCE(excluded.tg_date, items.tg_date),
     has_thumb = MAX(items.has_thumb, excluded.has_thumb),
+    part_base = excluded.part_base,
+    part_ext = excluded.part_ext,
+    part_num = excluded.part_num,
     name = CASE WHEN items.name_source = 'telegram'
                 THEN excluded.name ELSE items.name END,
     folder = CASE WHEN items.folder_source = 'default'
@@ -312,6 +319,49 @@ def default_folder(kind: str) -> str:
 
 def _like(term: str) -> str:
     return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _compact_name_sql(expr: str) -> str:
+    return (
+        f"replace(replace(replace(replace(lower({expr}), ' ', ''), '.', ''),"
+        " '_', ''), '-', '')"
+    )
+
+
+def _star_match_sql(item_alias: str, star_alias: str) -> str:
+    return (
+        f"(instr(' ' || lower({item_alias}.tags) || ' ',"
+        f" ' ' || lower({star_alias}.name) || ' ') > 0"
+        f" OR instr({_compact_name_sql(item_alias + '.name')},"
+        f" {_compact_name_sql(star_alias + '.name')}) > 0)"
+    )
+
+
+def part_visible_sql(alias: str = "items") -> str:
+    """True for files a listing should show.
+
+    Split uploads keep one row per archive volume, but the explorer treats
+    the set as one file: only the first volume is listed, and only while a
+    first volume exists (a lone second part still shows rather than vanish).
+    """
+    return (
+        f"({alias}.part_num <= 1 OR NOT EXISTS (SELECT 1 FROM items _lead"
+        f" WHERE _lead.chat_id = {alias}.chat_id"
+        f" AND _lead.part_base = {alias}.part_base"
+        f" AND _lead.part_ext = {alias}.part_ext"
+        f" AND _lead.part_num = 1))"
+    )
+
+
+def part_size_sql(alias: str = "items") -> str:
+    """Size of the whole set for a first volume; the row size otherwise."""
+    return (
+        f"CASE WHEN {alias}.part_num = 1 THEN COALESCE((SELECT SUM(_part.size)"
+        f" FROM items _part WHERE _part.chat_id = {alias}.chat_id"
+        f" AND _part.part_base = {alias}.part_base"
+        f" AND _part.part_ext = {alias}.part_ext"
+        f" AND _part.part_num > 0), {alias}.size) ELSE {alias}.size END"
+    )
 
 
 def row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
@@ -374,6 +424,9 @@ class Catalog:
                 "imdb_json": "TEXT NOT NULL DEFAULT ''",
                 "imdb_poster_version": "INTEGER NOT NULL DEFAULT 0",
                 "meta_json": "TEXT NOT NULL DEFAULT ''",
+                "part_base": "TEXT NOT NULL DEFAULT ''",
+                "part_ext": "TEXT NOT NULL DEFAULT ''",
+                "part_num": "INTEGER NOT NULL DEFAULT 0",
             }
             for name, ddl in additions.items():
                 if name not in columns:
@@ -417,6 +470,32 @@ class Catalog:
                     changes.append((new_kind, row["id"]))
             if changes:
                 conn.executemany("UPDATE items SET kind = ? WHERE id = ?", changes)
+            # Derive the split-set columns from names so libraries indexed
+            # before this feature collapse into one entry on the next start.
+            fixes = []
+            for row in conn.execute(
+                "SELECT id, name, part_base, part_ext, part_num FROM items"
+            ):
+                part = parse_part_name(row["name"] or "")
+                base = part["base"].lower() if part else ""
+                ext = part["ext"] if part else ""
+                num = int(part["num"]) if part else 0
+                if (
+                    base != (row["part_base"] or "")
+                    or ext != (row["part_ext"] or "")
+                    or num != int(row["part_num"] or 0)
+                ):
+                    fixes.append((base, ext, num, int(row["id"])))
+            if fixes:
+                conn.executemany(
+                    "UPDATE items SET part_base = ?, part_ext = ?, part_num = ?"
+                    " WHERE id = ?",
+                    fixes,
+                )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_items_part ON items"
+                "(chat_id, part_base, part_ext, part_num)"
+            )
             self.has_fts = False
             try:
                 conn.executescript(FTS_DDL)
@@ -428,19 +507,22 @@ class Catalog:
 
     @staticmethod
     def _upsert_values(item: Dict[str, Any]) -> Tuple[Any, ...]:
-        kind = filetypes.classify(
-            str(item.get("name") or ""), str(item.get("kind") or "other")
-        )
+        name = clean_name(str(item.get("name") or ""))
+        kind = filetypes.classify(name, str(item.get("kind") or "other"))
         folder = clean_folder_path(
             str(item.get("folder") or default_folder(kind)), "Other"
         )
+        part = parse_part_name(name)
         return (
             int(item["chat_id"]), int(item["message_id"]), item.get("doc_id"),
-            item.get("access_hash"), clean_name(str(item.get("name") or "")),
+            item.get("access_hash"), name,
             kind, item.get("mime"), item.get("size"), item.get("width"),
             item.get("height"), item.get("duration"), folder, item.get("caption"),
             item.get("tg_date") or datetime.now(timezone.utc).isoformat(timespec="seconds"),
             1 if item.get("has_thumb", True) else 0,
+            part["base"].lower() if part else "",
+            part["ext"] if part else "",
+            int(part["num"]) if part else 0,
         )
 
     def upsert(self, item: Dict[str, Any]) -> int:
@@ -504,6 +586,7 @@ class Catalog:
             clauses = ["1 = 1"]
         else:
             clauses = ["items.hidden = 0"]
+        clauses.append(part_visible_sql())
         params: List[Any] = []
         if chat_id is not None:
             clauses.append("items.chat_id = ?")
@@ -585,10 +668,13 @@ class Catalog:
             clauses.append("length(trim(items.note)) > 0")
         if performer is not None:
             clauses.append(
-                "EXISTS (SELECT 1 FROM item_performers ipf"
+                "(EXISTS (SELECT 1 FROM item_performers ipf"
                 " WHERE ipf.item_id = items.id AND ipf.performer_id = ?)"
+                " OR EXISTS (SELECT 1 FROM performers pf"
+                " WHERE pf.id = ? AND length(trim(pf.name)) > 0"
+                " AND " + _star_match_sql("items", "pf") + "))"
             )
-            params.append(int(performer))
+            params += [int(performer), int(performer)]
         if collection:
             clauses.append(
                 "items.id IN (SELECT item_id FROM collection_items"
@@ -727,7 +813,8 @@ class Catalog:
                 total, total_size = cached[1]
             else:
                 totals = conn.execute(
-                    f"SELECT COUNT(*) AS n, COALESCE(SUM(size), 0) AS size"
+                    f"SELECT COUNT(*) AS n,"
+                    f" COALESCE(SUM({part_size_sql()}), 0) AS size"
                     f" FROM items WHERE {where}",
                     params,
                 ).fetchone()
@@ -770,14 +857,15 @@ class Catalog:
         cached = self._cache.get(cache_key)
         if cached is not None and now - cached[0] <= COUNT_CACHE_SECONDS:
             return [dict(entry) for entry in cached[1]]
-        clause = "WHERE hidden = 0"
+        clause = f"WHERE hidden = 0 AND {part_visible_sql()}"
         params: List[Any] = []
         if chat_id is not None:
             clause += " AND chat_id = ?"
             params.append(int(chat_id))
         with self.connect() as conn:
             rows = conn.execute(
-                f"SELECT folder, COUNT(*) AS n, COALESCE(SUM(size), 0) AS size"
+                f"SELECT folder, COUNT(*) AS n,"
+                f" COALESCE(SUM({part_size_sql()}), 0) AS size"
                 f" FROM items {clause} GROUP BY folder",
                 params,
             ).fetchall()
@@ -858,7 +946,7 @@ class Catalog:
         if not wanted:
             return covers
         limit = max(per_folder * 3, per_folder)
-        clause = "WHERE hidden = 0 AND has_thumb = 1"
+        clause = f"WHERE hidden = 0 AND has_thumb = 1 AND {part_visible_sql()}"
         params: List[Any] = []
         if chat_id is not None:
             clause += " AND chat_id = ?"
@@ -1206,7 +1294,10 @@ class Catalog:
         return {"tag": name, "color": color, "group": group}
 
     def kinds(self, chat_id: Optional[int] = None) -> List[Dict[str, Any]]:
-        sql = "SELECT kind, COUNT(*) AS n FROM items WHERE hidden = 0"
+        sql = (
+            "SELECT kind, COUNT(*) AS n FROM items"
+            f" WHERE hidden = 0 AND {part_visible_sql()}"
+        )
         params: List[Any] = []
         if chat_id is not None:
             sql += " AND chat_id = ?"
@@ -1231,14 +1322,15 @@ class Catalog:
         return [dict(row) for row in rows]
 
     def stats(self, chat_id: Optional[int] = None) -> Dict[str, Any]:
-        clause = "WHERE hidden = 0"
+        clause = f"WHERE hidden = 0 AND {part_visible_sql()}"
         params: List[Any] = []
         if chat_id is not None:
             clause += " AND chat_id = ?"
             params.append(int(chat_id))
         with self.connect() as conn:
             row = conn.execute(
-                f"SELECT COUNT(*) AS n, COALESCE(SUM(size), 0) AS size,"
+                f"SELECT COUNT(*) AS n,"
+                f" COALESCE(SUM({part_size_sql()}), 0) AS size,"
                 f" COALESCE(SUM(favorite), 0) AS favorites,"
                 f" COALESCE(SUM(CASE WHEN play_pos > 0 THEN 1 ELSE 0 END), 0) AS playing"
                 f" FROM items {clause}",
@@ -1269,13 +1361,17 @@ class Catalog:
                 "SELECT c.id, c.name, c.icon, c.note, c.created_at,"
                 " (SELECT COUNT(*) FROM collection_items ci"
                 "  JOIN items i ON i.id = ci.item_id"
-                "  WHERE ci.collection_id = c.id AND i.hidden = 0) AS n,"
-                " (SELECT COALESCE(SUM(i.size), 0) FROM collection_items ci"
+                "  WHERE ci.collection_id = c.id AND i.hidden = 0"
+                f"  AND {part_visible_sql('i')}) AS n,"
+                " (SELECT COALESCE(SUM"
+                f"({part_size_sql('i')}), 0) FROM collection_items ci"
                 "  JOIN items i ON i.id = ci.item_id"
-                "  WHERE ci.collection_id = c.id AND i.hidden = 0) AS size,"
+                "  WHERE ci.collection_id = c.id AND i.hidden = 0"
+                f"  AND {part_visible_sql('i')}) AS size,"
                 " (SELECT i.id FROM collection_items ci"
                 "  JOIN items i ON i.id = ci.item_id"
-                "  WHERE ci.collection_id = c.id AND i.hidden = 0 AND i.has_thumb = 1"
+                "  WHERE ci.collection_id = c.id AND i.hidden = 0"
+                f"  AND i.has_thumb = 1 AND {part_visible_sql('i')}"
                 "  ORDER BY ci.added_at DESC LIMIT 1) AS cover"
                 " FROM collections c WHERE c.chat_id = ?"
                 " ORDER BY c.name COLLATE NOCASE",
@@ -1471,7 +1567,7 @@ class Catalog:
         return [row_to_dict(row) for row in matches[:20]]
 
     def duplicates(self, chat_id: Optional[int] = None, limit: int = 100) -> Dict[str, Any]:
-        clause = "WHERE hidden = 0 AND size > 0"
+        clause = f"WHERE hidden = 0 AND size > 0 AND {part_visible_sql()}"
         params: List[Any] = []
         if chat_id is not None:
             clause += " AND chat_id = ?"
@@ -1508,19 +1604,21 @@ class Catalog:
         return {"groups": output, "wasted": wasted, "group_count": len(output)}
 
     def library_stats(self, chat_id: Optional[int] = None) -> Dict[str, Any]:
-        clause = "WHERE hidden = 0"
+        clause = f"WHERE hidden = 0 AND {part_visible_sql()}"
         params: List[Any] = []
         if chat_id is not None:
             clause += " AND chat_id = ?"
             params.append(int(chat_id))
         with self.connect() as conn:
             breakdown = conn.execute(
-                f"SELECT kind, COUNT(*) AS n, COALESCE(SUM(size), 0) AS size"
+                f"SELECT kind, COUNT(*) AS n,"
+                f" COALESCE(SUM({part_size_sql()}), 0) AS size"
                 f" FROM items {clause} GROUP BY kind ORDER BY size DESC",
                 params,
             ).fetchall()
             largest = conn.execute(
-                f"SELECT * FROM items {clause} ORDER BY size DESC LIMIT 12",
+                f"SELECT *, {part_size_sql()} AS total_size FROM items {clause}"
+                " ORDER BY total_size DESC LIMIT 12",
                 params,
             ).fetchall()
             collections = conn.execute(
@@ -1542,22 +1640,30 @@ class Catalog:
             "views": int(views["n"]),
         }
 
-    STAR_SELECT = """
+    STAR_RELATED_SQL = (
+        "(EXISTS (SELECT 1 FROM item_performers ip"
+        " WHERE ip.item_id = i.id AND ip.performer_id = p.id)"
+        " OR (length(trim(p.name)) > 0 AND " + _star_match_sql("i", "p") + "))"
+    )
+
+    STAR_SELECT = f"""
         SELECT p.*,
-          (SELECT COUNT(*) FROM item_performers ip
-           JOIN items i ON i.id = ip.item_id
-           WHERE ip.performer_id = p.id AND i.hidden = 0) AS n,
-          (SELECT COUNT(*) FROM item_performers ip
-           JOIN items i ON i.id = ip.item_id
-           WHERE ip.performer_id = p.id AND i.hidden = 0
-             AND i.kind = 'video') AS videos,
-          (SELECT COUNT(*) FROM item_performers ip
-           JOIN items i ON i.id = ip.item_id
-           WHERE ip.performer_id = p.id AND i.hidden = 0
-             AND i.kind = 'image') AS images,
-          (SELECT COALESCE(SUM(i.size), 0) FROM item_performers ip
-           JOIN items i ON i.id = ip.item_id
-           WHERE ip.performer_id = p.id AND i.hidden = 0) AS total_size
+          (SELECT COUNT(*) FROM items i
+           WHERE i.hidden = 0 AND i.chat_id = p.chat_id
+             AND {part_visible_sql('i')}
+             AND {STAR_RELATED_SQL}) AS n,
+          (SELECT COUNT(*) FROM items i
+           WHERE i.hidden = 0 AND i.chat_id = p.chat_id AND i.kind = 'video'
+             AND {part_visible_sql('i')}
+             AND {STAR_RELATED_SQL}) AS videos,
+          (SELECT COUNT(*) FROM items i
+           WHERE i.hidden = 0 AND i.chat_id = p.chat_id AND i.kind = 'image'
+             AND {part_visible_sql('i')}
+             AND {STAR_RELATED_SQL}) AS images,
+          (SELECT COALESCE(SUM({part_size_sql('i')}), 0) FROM items i
+           WHERE i.hidden = 0 AND i.chat_id = p.chat_id
+             AND {part_visible_sql('i')}
+             AND {STAR_RELATED_SQL}) AS total_size
         FROM performers p
     """
 
@@ -1634,6 +1740,39 @@ class Catalog:
                 (int(chat_id or 0),),
             ).fetchone()
         return int(row["n"]) if row else 0
+
+    def performer_summary(
+        self, star_id: int, chat_id: Optional[int]
+    ) -> Dict[str, Any]:
+        where, params = self._where(performer=star_id, chat_id=chat_id)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT kind, COUNT(*) AS n,"
+                f" COALESCE(SUM({part_size_sql()}), 0) AS size"
+                f" FROM items WHERE {where} GROUP BY kind",
+                params,
+            ).fetchall()
+            tagged = conn.execute(
+                f"SELECT COUNT(*) AS n FROM items WHERE {where}"
+                " AND NOT EXISTS (SELECT 1 FROM item_performers ip"
+                " WHERE ip.item_id = items.id AND ip.performer_id = ?)",
+                (*params, int(star_id)),
+            ).fetchone()
+        kinds = [
+            {
+                "kind": row["kind"],
+                "label": KIND_LABELS.get(row["kind"], "File"),
+                "count": int(row["n"]),
+                "size": int(row["size"]),
+            }
+            for row in sorted(rows, key=lambda row: int(row["n"]), reverse=True)
+        ]
+        return {
+            "kinds": kinds,
+            "total": sum(entry["count"] for entry in kinds),
+            "total_size": sum(entry["size"] for entry in kinds),
+            "tagged": int(tagged["n"]) if tagged else 0,
+        }
 
     def create_performer(
         self, chat_id: Optional[int], **fields: Any
@@ -1812,6 +1951,7 @@ class Catalog:
             "name_source", "folder_source", "tags_source", "fav_source",
             "has_thumb", "thumb_version", "play_pos", "played_at",
             "imdb_id", "imdb_json", "imdb_poster_version", "meta_json",
+            "part_base", "part_ext", "part_num",
         }
         updates = {key: value for key, value in fields.items() if key in allowed}
         if not updates:
@@ -1825,9 +1965,30 @@ class Catalog:
         return self.get(item_id)
 
     def rename(self, item_id: int, name: str) -> Optional[Dict[str, Any]]:
+        clean = clean_name(name)
+        part = parse_part_name(clean)
         return self.update(
-            item_id, name=clean_name(name), name_source="user"
+            item_id,
+            name=clean,
+            name_source="user",
+            part_base=part["base"].lower() if part else "",
+            part_ext=part["ext"] if part else "",
+            part_num=int(part["num"]) if part else 0,
         )
+
+    def part_members(
+        self, chat_id: int, part_base: str, part_ext: str
+    ) -> List[Dict[str, Any]]:
+        """Every stored volume of one split set, in volume order."""
+        if not part_base:
+            return []
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM items WHERE chat_id = ? AND part_base = ?"
+                " AND part_ext = ? AND part_num > 0 ORDER BY part_num",
+                (int(chat_id), part_base, part_ext or ""),
+            ).fetchall()
+        return [row_to_dict(row) for row in rows]
 
     def move(self, item_id: int, folder: str) -> Optional[Dict[str, Any]]:
         folder = clean_folder_path(folder, "Other")

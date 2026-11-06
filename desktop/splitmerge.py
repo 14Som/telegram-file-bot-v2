@@ -29,6 +29,175 @@ RAR_PART_RE = re.compile(
 _SPLIT_TIMEOUT = 6 * 3600
 _MERGE_TIMEOUT = 6 * 3600
 
+SEVENZ_MAGIC = b"7z\xbc\xaf\x27\x1c"
+SEVENZ_SIGNATURE = 32
+
+
+def _read_number(data: bytes, pos: int) -> Tuple[int, int]:
+    """Decode one 7-Zip variable-length number."""
+    first = data[pos]
+    pos += 1
+    mask = 0x80
+    value = 0
+    for index in range(8):
+        if not first & mask:
+            return value | ((first & (mask - 1)) << (8 * index)), pos
+        value |= data[pos] << (8 * index)
+        pos += 1
+        mask >>= 1
+    return value, pos
+
+
+def stored_file_size(signature: bytes, header: bytes) -> Optional[int]:
+    """Return the size of a single stored file, or None for other archives.
+
+    Our split tool writes store-mode archives with exactly one file, so the
+    payload is a plain byte run after the 32-byte signature. Decoding just the
+    folder coder proves that before anything is skipped or extracted.
+    """
+    if len(signature) < SEVENZ_SIGNATURE or signature[:6] != SEVENZ_MAGIC:
+        return None
+    try:
+        next_offset = int.from_bytes(signature[12:20], "little")
+        pos = 0
+        if header[pos] != 0x01:  # kHeader; encoded headers are not parsed
+            return None
+        pos += 1
+        if header[pos] == 0x02:  # optional kArchiveProperties
+            pos += 1
+            while header[pos] != 0x00:
+                pos += 1
+                size, pos = _read_number(header, pos)
+                pos += size
+            pos += 1
+        if header[pos] != 0x04:  # kMainStreamsInfo
+            return None
+        pos += 1
+        unpack_size: Optional[int] = None
+        while True:
+            marker = header[pos]
+            pos += 1
+            if marker == 0x00:
+                break
+            if marker == 0x06:  # kPackInfo
+                _pack_pos, pos = _read_number(header, pos)
+                packs, pos = _read_number(header, pos)
+                while True:
+                    item = header[pos]
+                    pos += 1
+                    if item == 0x00:
+                        break
+                    if item != 0x09:
+                        return None
+                    for _ in range(packs):
+                        _size, pos = _read_number(header, pos)
+            elif marker == 0x07:  # kUnpackInfo
+                if header[pos] != 0x0B:  # kFolder
+                    return None
+                pos += 1
+                folders, pos = _read_number(header, pos)
+                if folders != 1 or header[pos] != 0:
+                    return None
+                pos += 1
+                coders, pos = _read_number(header, pos)
+                if coders != 1:
+                    return None
+                flags = header[pos]
+                pos += 1
+                id_size = flags & 0x0F
+                coder_id = header[pos:pos + id_size]
+                pos += id_size
+                if coder_id != b"\x00":  # Copy coder
+                    return None
+                if not flags & 0x10 and not flags & 0x20:
+                    in_streams, out_streams = 1, 1
+                else:
+                    return None
+                if in_streams != 1 or out_streams != 1:
+                    return None
+                if header[pos] != 0x0C:  # kCodersUnpackSize
+                    return None
+                pos += 1
+                unpack_size, pos = _read_number(header, pos)
+            elif marker == 0x08:  # kSubStreamsInfo comes after UnpackInfo
+                break
+            else:
+                return None
+    except (IndexError, ValueError):
+        return None
+    if unpack_size is None or unpack_size != next_offset:
+        return None
+    return unpack_size
+
+
+def _read_signature(volumes: List[Path]) -> bytes:
+    return _read_tail(volumes, 0, SEVENZ_SIGNATURE)
+
+
+def _read_tail(volumes: List[Path], start: int, length: int) -> bytes:
+    """Read length bytes at an absolute offset, crossing volume boundaries."""
+    chunks: List[bytes] = []
+    offset = 0
+    remaining = length
+    for volume in volumes:
+        size = volume.stat().st_size
+        within = start - offset
+        if within < size:
+            with volume.open("rb") as handle:
+                handle.seek(within)
+                data = handle.read(min(size - within, remaining))
+            chunks.append(data)
+            remaining -= len(data)
+            if remaining <= 0:
+                break
+        offset += size
+    return b"".join(chunks)
+
+
+def _merge_stored_archive(
+    volumes: List[Path], workdir: Path
+) -> Tuple[Path, str]:
+    """Join store-mode volumes without an archive tool (works on Android)."""
+    signature = _read_signature(volumes)
+    if signature[:6] != SEVENZ_MAGIC:
+        raise RuntimeError("These parts are not a 7-Zip archive.")
+    next_offset = int.from_bytes(signature[12:20], "little")
+    next_size = int.from_bytes(signature[20:28], "little")
+    header = _read_tail(
+        volumes, SEVENZ_SIGNATURE + next_offset, next_size
+    )
+    size = stored_file_size(signature, header)
+    if size is None:
+        raise RuntimeError(
+            "This archive uses compression that cannot be opened on this "
+            "device. Download it on the desktop app instead."
+        )
+    part = parse_part_name(volumes[0].name)
+    name = part["base"] if part else volumes[0].name
+    out_dir = Path(workdir) / "out"
+    if out_dir.exists():
+        shutil.rmtree(out_dir, ignore_errors=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    target = out_dir / name
+    written = 0
+    with target.open("wb") as out:
+        for index, volume in enumerate(volumes):
+            with volume.open("rb") as handle:
+                if index == 0:
+                    handle.seek(SEVENZ_SIGNATURE)
+                while written < size:
+                    chunk = handle.read(min(1024 * 1024, size - written))
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    written += len(chunk)
+            if written >= size:
+                break
+    if written != size:
+        target.unlink(missing_ok=True)
+        raise RuntimeError("The parts are incomplete, so they cannot be joined.")
+    return target, target.name
+
 
 def seven_zip() -> Path:
     base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
@@ -75,7 +244,7 @@ def split_file(
     # Running with the source file's folder as cwd keeps the stored entry
     # name a bare file name, so extraction restores "Movie.mkv" directly.
     command = [
-        str(exe), "a", "-y", "-mx=0", f"-v{int(part_size)}b", "--",
+        str(exe), "a", "-y", "-mx=0", "-mhc=off", f"-v{int(part_size)}b", "--",
         str(workdir / stem), path.name,
     ]
     result = subprocess.run(
@@ -148,9 +317,14 @@ def merge_parts(volumes: List[Path], workdir: Path) -> Tuple[Path, str]:
 
     Returns (path_to_original_file, original_file_name).
     """
-    exe = seven_zip()
     if not volumes:
         raise RuntimeError("No parts were given.")
+    try:
+        exe = seven_zip()
+    except RuntimeError:
+        # Android has no 7-Zip binary; our own store-mode volumes can be
+        # joined by copying their payload bytes.
+        return _merge_stored_archive(volumes, workdir)
     # The caller passes volumes in part order; 7-Zip itself locates the
     # remaining volumes by name, only the first one matters here.
     out_dir = Path(workdir) / "out"

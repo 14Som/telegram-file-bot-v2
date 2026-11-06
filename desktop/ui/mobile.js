@@ -64,6 +64,7 @@ const S = {
   tag: "",
   collection: null,
   star: null,
+  starInfo: null,
   hidden: false,
   filterLabel: "",
   items: [],
@@ -593,6 +594,11 @@ const KIND_CHIPS = [
   ["all", "All"], ["image", "Images"], ["video", "Videos"],
   ["audio", "Audio"], ["document", "Docs"]
 ];
+const KIND_TITLES = {
+  video: "Videos", image: "Images", document: "Docs", audio: "Audio",
+  voice: "Voice notes", model: "3D models", cad: "CAD files",
+  gif: "GIFs", sticker: "Stickers", other: "Other"
+};
 
 function renderChips() {
   $("chips").hidden = S.tab !== "files";
@@ -605,6 +611,24 @@ function renderChips() {
     chip.title = "Clear this filter";
     chip.addEventListener("click", () => clearFilters());
     $("chips").append(chip);
+    const related = S.star && S.starInfo ? S.starInfo.related : null;
+    if (related) {
+      const entries = [["all", "All", related.total]].concat(
+        (related.kinds || []).map((entry) => [entry.kind, KIND_TITLES[entry.kind] || entry.label, entry.count])
+      );
+      for (const [value, label, count] of entries) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "chip" + (S.kind === value ? " active" : "");
+        button.textContent = `${label} ${count}`;
+        button.addEventListener("click", () => {
+          S.kind = value;
+          renderChips();
+          loadItems({ reset: true });
+        });
+        $("chips").append(button);
+      }
+    }
     return;
   }
   for (const [value, label] of KIND_CHIPS) {
@@ -693,6 +717,7 @@ function clearFilters(reload = true) {
   S.tag = "";
   S.collection = null;
   S.star = null;
+  S.starInfo = null;
   S.hidden = false;
   S.filterLabel = "";
   S.kind = "all";
@@ -708,6 +733,7 @@ function useFilter(kind, value, label) {
   S.tag = kind === "tag" ? value : "";
   S.collection = kind === "collection" ? value : null;
   S.star = kind === "star" ? value : null;
+  S.starInfo = null;
   S.hidden = kind === "hidden";
   S.filterLabel = label;
   S.folder = "";
@@ -723,6 +749,15 @@ function useFilter(kind, value, label) {
   updateChrome();
   renderChips();
   loadItems({ reset: true });
+  if (S.star) {
+    api(`/api/stars/${S.star}`)
+      .then((star) => {
+        if (S.star !== value) return;
+        S.starInfo = star;
+        renderChips();
+      })
+      .catch(() => {});
+  }
 }
 
 async function loadItems({ reset = false } = {}) {
@@ -843,10 +878,10 @@ function itemTile(item, index) {
     badge.textContent = duration;
     tile.append(badge);
   }
-  if (item.part_of) {
+  if (item.part_of && item.part_of.count > 1) {
     const part = document.createElement("span");
     part.className = "part";
-    part.textContent = `${item.part_of.num}/${item.part_of.count}`;
+    part.textContent = `${item.part_of.count} parts`;
     tile.append(part);
   }
   const caption = document.createElement("span");
@@ -1146,6 +1181,8 @@ $("searchClose").addEventListener("click", () => {
 /* ---------------------------------------------------------------- viewer */
 function openViewer(index) {
   if (index < 0 || index >= S.items.length) return;
+  const item = S.items[index];
+  if (item && item.part_of && item.part_of.count > 1) { openItemInfo(item); return; }
   S.viewerIndex = index;
   renderViewer();
   $("viewer").hidden = false;
@@ -1173,6 +1210,7 @@ function currentItem() {
 function renderViewer() {
   const item = currentItem();
   if (!item) { closeViewer(); return; }
+  if (item.part_of && item.part_of.count > 1) { closeViewer(); openItemInfo(item); return; }
   $("viewerName").textContent = item.name || "File";
   const bits = [shortKind(item), humanSize(item.size)];
   if (item.folder) bits.push(item.folder);
@@ -1740,19 +1778,19 @@ function openItemInfo(item) {
     row.querySelector("b").textContent = value;
     body.append(row);
   }
-  if (item.part_of) {
+  if (item.part_of && item.part_of.count > 1) {
     const row = document.createElement("div");
     row.className = "info-row";
     row.innerHTML = "<span>Split file</span><b></b>";
     row.querySelector("b").textContent =
-      `Part ${item.part_of.num} of ${item.part_of.count} — ${item.part_of.base}`;
+      `${item.part_of.count} parts · ${humanSize(item.part_of.size)}`;
     body.append(row);
   }
   const actions = document.createElement("div");
   actions.className = "sheet-buttons";
   const download = document.createElement("button");
   download.className = "btn primary";
-  download.textContent = item.part_of ? "Join all parts and download" : "Download";
+  download.textContent = "Download";
   download.addEventListener("click", () => { closeSheet(); downloadItem(item); });
   actions.append(download);
 

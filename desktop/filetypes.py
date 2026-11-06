@@ -23,6 +23,15 @@ CAD_EXT = {
     ".scad",
 }
 
+# A split upload always arrives as archive documents, so the kind is recovered
+# from the original file name inside the volume name ("Movie.mkv.7z.001").
+VIDEO_EXT = {
+    ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".webm", ".m4v", ".mpg",
+    ".mpeg", ".ts", ".m2ts", ".flv", ".3gp", ".ogv",
+}
+AUDIO_EXT = {".mp3", ".m4a", ".flac", ".wav", ".ogg", ".opus", ".aac", ".wma", ".m4b"}
+IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".heic", ".tiff", ".tif", ".avif"}
+
 # Extensions the in-browser viewer can load directly.
 VIEWER_EXT = {".stl", ".3mf", ".obj", ".ply"}
 
@@ -88,7 +97,8 @@ def classify(name: str, kind: str = "document") -> str:
     """Return the best kind for a stored file based on its name.
 
     Only converts generic documents; photos, videos and audio keep their
-    content-detected kind.
+    content-detected kind. Generic documents are retyped from the extension so
+    archive volumes show the kind of the file they hold.
     """
     if kind not in ("", "document", "other"):
         return kind
@@ -97,6 +107,14 @@ def classify(name: str, kind: str = "document") -> str:
         return "model"
     if ext in CAD_EXT:
         return "cad"
+    if ext in VIDEO_EXT:
+        return "video"
+    if ext in AUDIO_EXT:
+        return "audio"
+    if ext == ".gif":
+        return "gif"
+    if ext in IMAGE_EXT:
+        return "image"
     return kind or "document"
 
 

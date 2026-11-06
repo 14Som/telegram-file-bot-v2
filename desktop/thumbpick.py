@@ -29,6 +29,7 @@ log = logging.getLogger("tfe.thumbpick")
 
 COUNT = 5
 SIZE = 640
+AUTO_SIZE = 640
 MAX_BUILD_SECONDS = 5 * 60
 RETRY_AFTER = 10 * 60
 CAND_DIR = appconfig.CACHE_DIR / "thumbpicks"
@@ -265,6 +266,70 @@ def _run(
         log.warning("Thumbnail candidates for item %s failed: %s", item.get("id"), exc)
         with _lock:
             _errors[key] = (str(exc) or "Could not build thumbnails.", time.time())
+
+
+def _grab_auto(
+    ffmpeg: Path, url: str, cookie: str, second: float, target: Path
+) -> Optional[Path]:
+    try:
+        result = subprocess.run(
+            [
+                str(ffmpeg),
+                "-hide_banner", "-loglevel", "error",
+                "-headers", _headers(cookie),
+                "-ss", f"{second:.3f}",
+                "-i", url,
+                "-frames:v", "1",
+                "-vf", f"scale={AUTO_SIZE}:-2",
+                "-q:v", "3",
+                "-y", str(target),
+            ],
+            capture_output=True,
+            timeout=120,
+            creationflags=_NO_WINDOW,
+        )
+        if result.returncode == 0 and target.is_file() and target.stat().st_size > 0:
+            return target
+    except (OSError, subprocess.SubprocessError):
+        pass
+    target.unlink(missing_ok=True)
+    return None
+
+
+def auto_thumb(item: Dict[str, Any], url: str, cookie: str) -> bool:
+    """Keep one frame as the thumbnail for a video without a Telegram preview.
+
+    A keyframe seek reads only the start of the stream, so this is cheap even
+    for multi-gigabyte files. The frame is stored as the picked cover, which
+    vault snapshots already carry to other PCs.
+    """
+    target = custom_path(int(item["id"]))
+    if target.is_file():
+        return True
+    ffmpeg = mediatools.tool_path("ffmpeg")
+    if ffmpeg is None:
+        raise RuntimeError("ffmpeg is not installed yet.")
+    duration = float(item.get("duration") or 0)
+    if duration <= 0:
+        duration = storyboard.probe_duration(ffmpeg, url, cookie)
+    second = 5.0
+    if duration > 0:
+        second = min(max(2.0, duration * 0.12), max(0.2, duration - 0.3))
+    work = CAND_DIR / f"auto-{int(item['id'])}"
+    work.mkdir(parents=True, exist_ok=True)
+    try:
+        frame = _grab_auto(ffmpeg, url, cookie, second, work / "frame.jpg")
+        if frame is None and second > 0.2:
+            frame = _grab_auto(ffmpeg, url, cookie, 0.0, work / "frame.jpg")
+        if frame is None:
+            return False
+        appconfig.THUMB_DIR.mkdir(parents=True, exist_ok=True)
+        temp = target.with_suffix(".tmp")
+        shutil.copyfile(frame, temp)
+        os.replace(temp, target)
+        return True
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 def reset(item: Dict[str, Any]) -> None:

@@ -104,8 +104,11 @@ survives on the boot volume.
 - **Stars** — a Stash-style index of the performers in your library. Give each star a
   portrait, details and aliases, then assign files from a file's **Stars** menu or
   select several and use **Stars** in the bulk bar. The Stars page lists every file
-  they appear in; search matches names and aliases. *Look up online* fills the details
-  and portrait from Wikipedia
+  they appear in — assigned, tagged with her name, or named after her — split into
+  All, Videos, Images and Documents tabs with counts. Pick the portrait from any of
+  her images: click the portrait, use **Change portrait…**, or right-click an image
+  and choose **Use as star portrait…**. Search matches names and aliases. *Look up
+  online* fills the details and portrait from Wikipedia
 - **IMDb details** — select a movie file and use **IMDb** (or its **⋯** menu) to look
   it up by name. The app fills title, year, rating and votes, genres, runtime,
   director, writers, cast, plot, country, language and poster, and shows them in the
@@ -124,8 +127,9 @@ survives on the boot volume.
   On the phone the player is libVLC, so every format, embedded subtitle and audio
   track plays natively, with lock, PiP and fit-to-screen controls. Images open in
   Viewer.js with zoom, pan, rotate, flip, one-to-one size, slideshow and a
-  thumbnail strip for stepping through the folder. Videos with a poor Telegram
-  cover can get a new one from *Thumbnail*: five frames are pulled from the stream
+  thumbnail strip for stepping through the folder. A video without a Telegram
+  cover gets a frame automatically the first time it is listed; a poor cover can
+  be replaced from *Thumbnail*: five frames are pulled from the stream
   and you keep the one you like, or shuffle for five more taken from random
   points; the pick is kept across syncs, sign-outs and vault restores. PDF and text
   preview inline; downloads keep the original filename
@@ -167,8 +171,9 @@ survives on the boot volume.
   cancel a running upload from the Uploads panel. Video, audio and image files are
   recognized from their content (even without a file extension) so they preview and
   stream. Anything above Telegram's
-  2 GB limit (4 GB with Premium) is split into parts automatically and rejoined
-  with one click, up to 64 GB
+  2 GB limit (4 GB with Premium) is split into parts automatically, stored as
+  one file in the library, and joined back together when you download it, up to
+  64 GB
 - **Faster transfers** — downloads pull several 512 KB ranges at once, and uploads
   send up to three files (or split volumes) in parallel, so large files don't wait
   on round-trip time
@@ -317,6 +322,7 @@ into `TelegramFileExplorerSetup.exe`. Desktop dependencies:
 ## Limits & safety
 
 - Telegram allows 2 GB per file (4 GB with Premium); the app splits anything larger
+  into parts, shows the set as one file, and joins the parts on download
 - Legacy `.doc` reading needs Microsoft Word installed; `.docx` does not
 - `/delete` removes the index entry only — the message in your chat is the actual copy
 - A restored index works only with the **same bot token**, because Telegram file IDs

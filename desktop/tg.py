@@ -1791,6 +1791,22 @@ class TelegramService:
         transfer["size"] = int(total or transfer["size"] or 0)
         transfer["state"] = "uploading"
 
+    def _split_progress(self, transfer_id: str, index: int, sent: int) -> None:
+        """Sum each volume's own bytes; per-volume offsets would double count.
+
+        Volumes upload in parallel and every progress callback reports that
+        volume's own bytes only, so adding its offset to the total counts the
+        volumes before it twice and pushes the bar past the file size.
+        """
+        transfer = self.transfers.get(transfer_id)
+        if transfer is None:
+            return
+        progress = transfer.setdefault("part_progress", {})
+        progress[index] = int(sent or 0)
+        done = sum(progress.values())
+        size = int(transfer.get("size") or 0)
+        self._progress(transfer_id, min(done, size) if size else done, None)
+
     async def upload_one(self, entry: Dict[str, Any], catalog: Catalog) -> Dict[str, Any]:
         client = self._require_ready()
         # Pin the target channel for the whole upload: a vault switch must
@@ -1805,7 +1821,6 @@ class TelegramService:
         if transfer is None or transfer.get("cancel"):
             raise TransferCancelled()
         shared = bool(entry.get("shared"))
-        sent_base = int(entry.get("sent_base") or 0)
         transfer["state"] = "uploading"
         kind, mime = media_hint(path, name)
         attributes = [DocumentAttributeFilename(name)]
@@ -1825,15 +1840,9 @@ class TelegramService:
             if transfer.get("cancel"):
                 raise TransferCancelled()
             if shared:
-                # Split volumes upload in parallel; sum every volume so the
-                # bar only moves forward.
-                index = int(entry.get("part_index") or 0)
-                progress = transfer.setdefault("part_progress", {})
-                progress[index] = (sent_base, int(sent or 0))
-                done = sum(base + value for base, value in progress.values())
-                self._progress(transfer_id, done, None)
+                self._split_progress(transfer_id, int(entry.get("part_index") or 0), sent)
             else:
-                self._progress(transfer_id, sent_base + sent, total)
+                self._progress(transfer_id, sent, total)
 
         try:
             # Telethon picks 128-256 KiB parts below 750 MiB, which leaves the

@@ -319,6 +319,7 @@ const S = {
   transferRates: {},
   localUpload: null,
   seenTransfers: new Set(),
+  autoSaved: new Set(),
   refreshTimer: null,
   previewToken: 0,
   previewCollapsed: SAVED_PREFS.preview === "hidden",
@@ -3112,9 +3113,11 @@ function buildThumb(item) {
   }
   return thumb;
 }
+function isSplitItem(item) {
+  return Boolean(item && item.part_of && item.part_of.count > 1);
+}
 function partLabel(item) {
-  const part = item.part_of;
-  return part && part.count > 1 ? `Part ${part.num}/${part.count}` : "";
+  return isSplitItem(item) ? plural(item.part_of.count, "part") : "";
 }
 function buildRow(item) {
   const nameBlock = h("div", { class: "name-block" },
@@ -3188,6 +3191,7 @@ function stopHoverPreview() {
 }
 
 function startHoverPreview(tile, item) {
+  if (isSplitItem(item)) return;
   const media = tile.querySelector(".tile-media");
   if (!media) return;
   hoverTarget = tile;
@@ -3376,7 +3380,7 @@ function setScope(scope, pushHistory) {
     renderItems();
     loadStars();
   } else loadItems({ reset: true });
-  if (S.starId && !S.starInfo) loadStarInfo(S.starId);
+  if (S.starId && (!S.starInfo || !S.starInfo.related)) loadStarInfo(S.starId);
   void previous;
 }
 function navigateScope(scope) {
@@ -3442,7 +3446,7 @@ function applyHistory() {
     renderItems();
     loadStars();
   } else loadItems({ reset: true });
-  if (S.starId && !S.starInfo) loadStarInfo(S.starId);
+  if (S.starId && (!S.starInfo || !S.starInfo.related)) loadStarInfo(S.starId);
 }
 function snapshot() {
   return {
@@ -3623,7 +3627,7 @@ function renderPreview() {
   if (item.duration) addMeta("Duration", fmtDuration(item.duration));
   addMeta("Folder", item.folder || "—");
   if (item.part_of && item.part_of.count > 1) {
-    addMeta("Split parts", `${item.part_of.num} of ${item.part_of.count} · ${fmtSize(item.part_of.size)} complete file`);
+    addMeta("Split file", `${plural(item.part_of.count, "part")} · ${fmtSize(item.part_of.size)}`);
   }
   if (item.added_at) addMeta("Added", fmtDate(item.added_at));
   addMeta("Message", `#${item.message_id}`);
@@ -3646,7 +3650,7 @@ function renderPreview() {
   $("modelBtn").hidden = !viewable;
   $("cadBtn").hidden = !(item.family === "cad" || (item.family === "model" && !viewable));
   $("restoreBtn").hidden = !item.hidden;
-  $("completeBtn").hidden = !(item.part_of && item.part_of.count > 1);
+  $("openBtn").hidden = isSplitItem(item);
   const link = $("tgLink");
   if (item.telegram_link) {
     link.hidden = false;
@@ -3722,6 +3726,12 @@ function isVideoMime(item) {
   return (item.mime || "").startsWith("video/");
 }
 function renderInlinePreview(container, item, token) {
+  if (isSplitItem(item)) {
+    container.append(h("div", { class: "preview-file" }, fileIcon(item.kind),
+      h("span", { text: `Split file · ${plural(item.part_of.count, "part")} · ${fmtSize(item.part_of.size)}` }),
+      h("span", { text: "Download joins all parts into the original file automatically." })));
+    return;
+  }
   const kind = item.kind;
   if (kind === "image") {
     const image = h("img", { src: item.stream_url, alt: item.name, loading: "lazy" });
@@ -3800,7 +3810,7 @@ function viewerFamily(item) {
 }
 function buildViewerList(item) {
   const family = viewerFamily(item);
-  const list = family ? S.items.filter(family) : [];
+  const list = family ? S.items.filter((entry) => family(entry) && !isSplitItem(entry)) : [];
   if (!list.some((entry) => entry.id === item.id)) list.push(item);
   return list;
 }
@@ -3819,6 +3829,7 @@ function updateViewerBar() {
 }
 function openViewerFor(item) {
   if (!item) return;
+  if (isSplitItem(item)) { downloadItem(item); return; }
   if (item.viewer) { openModelViewer(item); return; }
   if (item.reader) { openReaderFor(item); return; }
   if (item.family === "cad" || item.family === "model") { openExternalItem(item); return; }
@@ -4042,6 +4053,62 @@ function playUrl(item, token) {
   return `/api/play/${item.id}/info`;
 }
 
+// WebView2 plays the audio of containers it can demux but whose video codec
+// it cannot decode (HEVC on Windows without the HEVC extension), and reports
+// no error, so check the codec before handing the file to the <video> element.
+const WEB_VIDEO_CODECS = new Set(["h264", "vp8", "vp9", "av1"]);
+
+function videoCodec(info) {
+  const list = (info && info.tracks && info.tracks.video) || [];
+  return String((list[0] && list[0].codec) || "").toLowerCase();
+}
+
+function browserCanPlayCodec(codec) {
+  if (!codec || WEB_VIDEO_CODECS.has(codec)) return true;
+  const types = {
+    hevc: 'video/mp4; codecs="hvc1.1.6.L93.B0"',
+    h265: 'video/mp4; codecs="hvc1.1.6.L93.B0"',
+    av1: 'video/mp4; codecs="av01.0.05M.08"',
+    vp9: 'video/mp4; codecs="vp09.00.10.08"',
+    mpeg4: 'video/mp4; codecs="mp4v.20.9"'
+  };
+  const sample = document.createElement("video");
+  return Boolean(types[codec] && sample.canPlayType(types[codec]));
+}
+
+function codecLabel(codec) {
+  const labels = {
+    hevc: "HEVC (H.265)", h265: "HEVC (H.265)", mpeg4: "MPEG-4 Part 2",
+    msmpeg4v3: "DivX", wmv3: "WMV", vc1: "VC-1", av1: "AV1"
+  };
+  return labels[codec] || String(codec || "").toUpperCase();
+}
+
+function showCodecChoice(item, token, codec) {
+  const label = codec ? codecLabel(codec) : "";
+  const stage = $("viewerStage");
+  stage.classList.add("video");
+  if (!PLAY.cover || !PLAY.cover.root.isConnected) {
+    stage.innerHTML = "";
+    PLAY.cover = makePlayCover(item);
+    stage.append(PLAY.cover.root);
+  }
+  PLAY.tools = null;
+  PLAY.panel = null;
+  PLAY.panelKind = "";
+  PLAY.cover.message(
+    `${label ? `${label} video` : "This video"} can’t play in the built-in player`,
+    label
+      ? `This PC can stream the sound but has no ${label} decoder for the picture. Play it in mpv to stream it now, or convert the file to H.264.`
+      : `This PC can stream the sound but cannot show the picture. Play it in mpv to stream it now, or convert the file to H.264.`
+  );
+  PLAY.cover.buttons([
+    { label: "Play in mpv", primary: true, onClick: () => openInMpv(item) },
+    { label: "Convert to H.264", onClick: () => playMovie(item, token, { forceTranscode: true }) },
+    { label: "Close", onClick: closeViewer }
+  ]);
+}
+
 async function prepareMovie(item, token, video, audio, onProgress) {
   const query = `video=${encodeURIComponent(video)}&audio=${audio}`;
   try {
@@ -4134,17 +4201,10 @@ async function playMovie(item, token, options) {
     startVideoPlayer(item, token, fromUrl, { type: "video/mp4", startAt: opts.startAt || info.play_pos });
     return;
   }
-  if (!opts.forceTranscode && info.direct) {
-    PLAY.cover.remove();
-    restoreSubtitleChoice(prefs);
-    startVideoPlayer(item, token, info.stream_url, {
-      type: item.mime || "video/mp4",
-      startAt: Number(info.play_pos || 0)
-    });
-    return;
-  }
 
-  // MKV and friends: convert once to MP4 on this PC, then stream the copy.
+  const codec = videoCodec(info);
+  // A converted copy that is already on disk always wins: it will actually
+  // show a picture even when the original uses an unsupported codec.
   const ready = !opts.forceTranscode && info.prepare && info.prepare.state === "ready"
     && info.prepare.source_url;
   if (ready) {
@@ -4157,6 +4217,23 @@ async function playMovie(item, token, options) {
     });
     return;
   }
+
+  if (!opts.forceTranscode && codec && !browserCanPlayCodec(codec)) {
+    showCodecChoice(item, token, codec);
+    return;
+  }
+
+  if (!opts.forceTranscode && info.direct) {
+    PLAY.cover.remove();
+    restoreSubtitleChoice(prefs);
+    startVideoPlayer(item, token, info.stream_url, {
+      type: item.mime || "video/mp4",
+      startAt: Number(info.play_pos || 0)
+    });
+    return;
+  }
+
+  // MKV and friends: convert once to MP4 on this PC, then stream the copy.
   if (!info.ffmpeg) {
     PLAY.cover.message(
       "A converter is needed",
@@ -4269,6 +4346,40 @@ function startVideoPlayer(item, token, source, options) {
     try { const playing = player.play(); if (playing && playing.catch) playing.catch(() => {}); } catch (_) {}
     try { player.focus({ preventScroll: true }); } catch (_) {}
   });
+  // HEVC without an OS decoder gives sound and a black picture without any
+  // error event. Watch for decoded frames, but only for codecs this browser
+  // may not support: resuming an H.264 file shows no frames for the first
+  // moment after the seek, which must not be mistaken for a missing decoder.
+  const codec = videoCodec(PLAY.info || {});
+  if (!codec || !browserCanPlayCodec(codec)) {
+    let checks = 0;
+    let lastTime = -1;
+    let blind = 0;
+    const frameTimer = setInterval(() => {
+      if (token !== VIEWER.token || VIEWER.player !== player) { clearInterval(frameTimer); return; }
+      const played = Number(player.currentTime() || 0);
+      if (played < 3) {
+        checks += 1;
+        if (checks > 45) clearInterval(frameTimer);
+        return;
+      }
+      let frames = null;
+      try {
+        frames = Number(player.tech(true).el().getVideoPlaybackQuality().totalVideoFrames);
+      } catch (_) { frames = null; }
+      if (frames === null || frames > 0) { clearInterval(frameTimer); return; }
+      // Only conclude the picture is missing while the clock keeps moving.
+      if (played < lastTime + 0.5) return;
+      lastTime = played;
+      blind += 1;
+      if (blind < 4) return;
+      clearInterval(frameTimer);
+      item.play_pos = played;
+      try { player.dispose(); } catch (_) {}
+      if (VIEWER.player === player) VIEWER.player = null;
+      showCodecChoice(item, token, codec);
+    }, 1000);
+  }
 }
 
 function buildPlayerTools(player) {
@@ -4851,6 +4962,7 @@ function promptInstallTool(tool, after) {
 }
 async function downloadItem(item) {
   if (!item || item.id === undefined) return;
+  const joining = isSplitItem(item);
   try {
     const data = await api("/api/downloads", { method: "POST", body: { item_id: item.id } });
     if (data.transfer) {
@@ -4858,7 +4970,9 @@ async function downloadItem(item) {
       renderTransfers();
       showTransferBar();
       startTransferPolling();
-      setStatus(`Downloading ${item.name || "file"}…`);
+      setStatus(joining
+        ? `Downloading and joining ${plural(item.part_of.count, "part")}…`
+        : `Downloading ${item.name || "file"}…`);
     }
   } catch (error) {
     toast(error.message || "The download could not start.", "error", 6000);
@@ -4887,18 +5001,6 @@ function promptReupload(item) {
       }
     ]
   });
-}
-async function startMergeDownload(item) {
-  if (!item || !item.part_of) return;
-  try {
-    await api("/api/merge", { method: "POST", body: { item_id: item.id } });
-    toast(`Downloading ${plural(item.part_of.count, "part")} of ${item.part_of.base} — see Transfers.`, "success", 5000);
-    showTransferBar();
-    startTransferPolling();
-    await fetchTransfers(false);
-  } catch (error) {
-    toast(error.message, "error", 6000);
-  }
 }
 
 /* ------------------------------------------------------------------- stars */
@@ -5034,6 +5136,39 @@ function renderStarCatalogue() {
     grid.append(card);
   }
 }
+const STAR_KIND_TITLES = {
+  video: "Videos", image: "Images", document: "Documents", audio: "Audio",
+  voice: "Voice notes", model: "3D models", cad: "CAD files",
+  gif: "GIFs", sticker: "Stickers", other: "Other"
+};
+function starKindTabs(star) {
+  const related = star && star.related;
+  if (!related) return null;
+  const active = S.kind || "";
+  const wrap = h("div", { class: "star-kind-tabs", role: "tablist", "aria-label": "Files by type" });
+  const add = (key, label, count) => {
+    const tab = h("button", {
+      class: "star-kind-tab" + (active === key ? " active" : ""),
+      type: "button",
+      role: "tab",
+      "aria-selected": active === key ? "true" : "false"
+    }, h("span", { text: label }), h("b", { text: String(count) }));
+    tab.addEventListener("click", () => {
+      if ((S.kind || "") === key) return;
+      S.kind = key;
+      $("kindSelect").value = key;
+      updateBreadcrumb();
+      renderStarBanner();
+      loadItems({ reset: true });
+    });
+    wrap.append(tab);
+  };
+  add("", "All files", related.total || 0);
+  for (const entry of related.kinds || []) {
+    add(entry.kind, STAR_KIND_TITLES[entry.kind] || entry.label || "Files", entry.count || 0);
+  }
+  return wrap;
+}
 function renderStarBanner() {
   const banner = $("starBanner");
   const star = currentStar();
@@ -5043,19 +5178,27 @@ function renderStarBanner() {
     return;
   }
   banner.hidden = false;
-  const portrait = h("div", { class: "star-portrait large" });
+  const portrait = h("button", {
+    class: "star-portrait large portrait-edit",
+    type: "button",
+    title: "Choose a portrait from this star’s images"
+  });
+  const badge = h("span", { class: "star-portrait-edit", html: svgRaw("image") });
+  const showInitials = () => {
+    portrait.classList.add("initial");
+    portrait.replaceChildren(h("span", { class: "portrait-initials", text: initials(star.name) }), badge);
+  };
   if (star.image_url) {
     const image = h("img", { src: star.image_url, alt: "", loading: "lazy" });
     image.addEventListener("error", () => {
       image.remove();
-      portrait.classList.add("initial");
-      portrait.textContent = initials(star.name);
+      showInitials();
     });
-    portrait.append(image);
+    portrait.replaceChildren(image, badge);
   } else {
-    portrait.classList.add("initial");
-    portrait.textContent = initials(star.name);
+    showInitials();
   }
+  portrait.addEventListener("click", () => promptStarPortrait(star));
   const fav = h("button", {
     class: "icon-btn star-fav-btn" + (star.favorite ? " active" : ""),
     type: "button",
@@ -5084,11 +5227,17 @@ function renderStarBanner() {
   ].filter(([, value]) => String(value || "").trim());
   const dl = h("dl", { class: "star-facts" });
   for (const [label, value] of facts) dl.append(h("dt", { text: label }), h("dd", { text: value }));
-  const counts = `${plural(star.n || 0, "file")} · ${plural(star.videos || 0, "video")} · ${plural(star.images || 0, "image")} · ${fmtSize(star.total_size || 0)}`;
+  const related = star.related || null;
+  const total = related ? related.total : (star.n || 0);
+  const totalSize = related ? related.total_size : (star.total_size || 0);
+  let counts = `${plural(total, "file")} · ${plural(star.videos || 0, "video")} · ${plural(star.images || 0, "image")} · ${fmtSize(totalSize)}`;
+  if (related && related.tagged > 0) {
+    counts += ` · ${related.tagged} matched by name or tag`;
+  }
   const actions = h("div", { class: "star-banner-actions" },
     btn("Edit details", "btn", () => promptStarEditor(star)),
     btn("Look up online", "btn", () => promptStarLookup(star)),
-    btn("Portrait", "btn", () => promptStarPortrait(star)),
+    btn("Change portrait…", "btn", () => promptStarPortrait(star)),
     btn("All stars", "link-btn", () => navigateScope({ navMode: "stars", starId: null, q: "" }))
   );
   banner.replaceChildren(h("div", { class: "star-banner-inner" },
@@ -5096,6 +5245,7 @@ function renderStarBanner() {
     h("div", { class: "star-banner-main" },
       h("div", { class: "star-banner-head" }, h("h2", { text: star.name }), fav),
       h("div", { class: "star-banner-counts", text: counts }),
+      starKindTabs(star),
       dl,
       star.note ? h("p", { class: "star-note", text: star.note }) : null,
       actions
@@ -5302,7 +5452,7 @@ function promptStarLookup(star) {
 function promptStarPortrait(star) {
   if (!star) return;
   const file = h("input", { type: "file", accept: "image/jpeg,image/png,image/gif,image/webp", hidden: "" });
-  const status = h("p", { class: "modal-note", text: "Upload a picture, or click a thumbnail from this star’s files." });
+  const status = h("p", { class: "modal-note", text: "Upload a picture, or choose an image from this star’s files." });
   const grid = h("div", { class: "star-portrait-grid" });
   const upload = btn("Upload image…", "btn", () => file.click());
   file.addEventListener("change", async () => {
@@ -5330,7 +5480,33 @@ function promptStarPortrait(star) {
     content: h("div", {}, status, h("div", { class: "star-portrait-actions" }, upload), file, grid),
     actions: [{ label: "Close", onClick: closeModal }]
   });
-  api(`/api/items?star=${star.id}&limit=60&sort=date&direction=desc`)
+  const choose = async (item, tile) => {
+    tile.disabled = true;
+    status.textContent = "Setting portrait…";
+    try {
+      const updated = await api(`/api/stars/${star.id}/image/from-item`, {
+        method: "POST",
+        body: { item_id: item.id }
+      });
+      closeModal();
+      toast("Portrait updated.", "success");
+      await afterStarChange(updated);
+    } catch (error) {
+      tile.disabled = false;
+      status.textContent = error.message;
+      toast(error.message, "error");
+    }
+  };
+  const addChoices = (items) => {
+    for (const item of items) {
+      const tile = h("button", { class: "star-portrait-choice", type: "button", title: item.name },
+        h("img", { src: item.thumb_url, alt: "", loading: "lazy" })
+      );
+      tile.addEventListener("click", () => choose(item, tile));
+      grid.append(tile);
+    }
+  };
+  api(`/api/items?star=${star.id}&limit=200&sort=date&direction=desc`)
     .then((data) => {
       if (!grid.isConnected) return;
       const items = (data.items || []).filter((entry) => entry.has_thumb);
@@ -5338,26 +5514,65 @@ function promptStarPortrait(star) {
         grid.append(h("p", { class: "modal-note", text: "This star has no file thumbnails yet — upload a picture instead." }));
         return;
       }
-      grid.append(h("p", { class: "star-portrait-hint", text: "Thumbnails from this star’s files" }));
-      for (const item of items) {
-        const tile = h("button", { class: "star-portrait-choice", type: "button", title: item.name },
-          h("img", { src: item.thumb_url, alt: "", loading: "lazy" })
-        );
-        tile.addEventListener("click", async () => {
-          try {
-            const updated = await api(`/api/stars/${star.id}/image/from-item`, {
-              method: "POST",
-              body: { item_id: item.id }
-            });
-            closeModal();
-            toast("Portrait updated.", "success");
-            await afterStarChange(updated);
-          } catch (error) { toast(error.message, "error"); }
-        });
-        grid.append(tile);
+      const images = items.filter((entry) => entry.kind === "image" || entry.kind === "gif");
+      const others = items.filter((entry) => entry.kind !== "image" && entry.kind !== "gif");
+      if (images.length) {
+        grid.append(h("p", { class: "star-portrait-hint", text: `${plural(images.length, "image")} from this star’s files` }));
+        addChoices(images);
+      }
+      if (others.length) {
+        grid.append(h("p", { class: "star-portrait-hint", text: "Frames from other files" }));
+        addChoices(others);
       }
     })
     .catch(() => {});
+}
+async function setStarPortraitFromItem(item, star) {
+  try {
+    const updated = await api(`/api/stars/${star.id}/image/from-item`, {
+      method: "POST",
+      body: { item_id: item.id }
+    });
+    toast(`Portrait updated for ${updated.name || star.name}.`, "success");
+    await afterStarChange(updated);
+  } catch (error) { toast(error.message, "error"); }
+}
+async function promptPortraitSource(item) {
+  let stars = [];
+  try {
+    const data = await api("/api/stars?limit=2000");
+    stars = data.stars || [];
+  } catch (error) { toast(error.message, "error"); return; }
+  if (!stars.length) { toast("Create a star first.", "error"); return; }
+  const list = h("div", { class: "star-pick-list" });
+  for (const star of stars) {
+    const row = h("button", { class: "star-pick", type: "button" });
+    const portrait = h("span", { class: "star-pick-portrait" });
+    if (star.image_url) portrait.append(h("img", { src: star.image_url, alt: "", loading: "lazy" }));
+    else { portrait.classList.add("initial"); portrait.textContent = initials(star.name); }
+    row.append(
+      portrait,
+      h("span", { class: "star-pick-body" },
+        h("span", { class: "star-pick-name", text: star.name }),
+        h("span", { class: "star-pick-meta", text: plural(star.n || 0, "file") })
+      )
+    );
+    row.addEventListener("click", () => {
+      closeModal();
+      setStarPortraitFromItem(item, star);
+    });
+    list.append(row);
+  }
+  openModal({
+    title: "Use as star portrait",
+    subtitle: item.name,
+    wide: true,
+    content: h("div", {},
+      h("p", { class: "modal-note", text: "Choose the star whose portrait this image becomes." }),
+      list
+    ),
+    actions: [{ label: "Cancel", onClick: closeModal }]
+  });
 }
 async function promptStars(item) {
   const bulk = !item;
@@ -6782,54 +6997,88 @@ async function windowsThumbnail(item) {
   } catch (error) { toast(error.message, "error"); }
 }
 
-/* --------------------------------------- automatic thumbnails (3D, PDFs) */
-const AUTO_THUMB_KEY = "tfe.autothumbs.v2";
+/* --------------------------------------- automatic thumbnails (videos, 3D, PDFs) */
+const AUTO_THUMB_KEY = "tfe.autothumbs.v3";
 const AUTO_THUMB_MAX = 256 * 1024 * 1024;
+const AUTO_THUMB_RETRY_MS = 30 * 60 * 1000;
 const autoThumbQueue = [];
 const autoThumbTried = loadAutoThumbTried();
 let autoThumbBusy = false;
 
 function loadAutoThumbTried() {
+  const map = new Map();
   try {
-    const raw = JSON.parse(localStorage.getItem(AUTO_THUMB_KEY) || "[]");
-    return new Set(Array.isArray(raw) ? raw : []);
-  } catch (_) {
-    return new Set();
-  }
+    const raw = JSON.parse(localStorage.getItem(AUTO_THUMB_KEY) || "{}");
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return map;
+    for (const [key, value] of Object.entries(raw)) {
+      const at = Number(value);
+      if (Number.isFinite(at)) map.set(key, at);
+    }
+  } catch (_) {}
+  return map;
 }
 function autoThumbKey(item) {
   return `${item.id}:${Number(item.size) || 0}`;
 }
 function saveAutoThumbTried() {
   try {
-    localStorage.setItem(AUTO_THUMB_KEY, JSON.stringify(Array.from(autoThumbTried).slice(-400)));
+    const entries = Array.from(autoThumbTried.entries())
+      .sort((a, b) => a[1] - b[1])
+      .slice(-400);
+    localStorage.setItem(AUTO_THUMB_KEY, JSON.stringify(Object.fromEntries(entries)));
   } catch (_) {}
 }
 function rememberAutoThumb(item) {
-  autoThumbTried.add(autoThumbKey(item));
+  autoThumbTried.set(autoThumbKey(item), Date.now());
   saveAutoThumbTried();
 }
 function forgetAutoThumb(item) {
   autoThumbTried.delete(autoThumbKey(item));
   saveAutoThumbTried();
 }
+function autoThumbCooling(item) {
+  const at = autoThumbTried.get(autoThumbKey(item));
+  return Number.isFinite(at) && Date.now() - at < AUTO_THUMB_RETRY_MS;
+}
+function isVideo(item) {
+  return String((item && item.kind) || "").toLowerCase() === "video";
+}
 function autoThumbKind(item) {
   if (!item || item.has_thumb) return "";
+  if (isVideo(item)) return "video";
   if (Number(item.size) > AUTO_THUMB_MAX) return "";
   if (item.viewer) return "model";
   if (isPdf(item)) return "pdf";
   return "";
 }
-function queueAutoThumbnails(items) {
+function queueAutoThumbnails(items, options) {
+  const batch = [];
   for (const item of items || []) {
     if (!autoThumbKind(item)) continue;
-    if (autoThumbTried.has(autoThumbKey(item))) continue;
-    if (autoThumbQueue.some((entry) => entry.id === item.id)) continue;
-    autoThumbQueue.push(item);
+    if (autoThumbCooling(item)) continue;
+    if (batch.some((entry) => entry.id === item.id)) continue;
+    batch.push(item);
+  }
+  if (!batch.length) return;
+  if (options && options.front) {
+    for (const entry of batch) {
+      const at = autoThumbQueue.findIndex((queued) => queued.id === entry.id);
+      if (at >= 0) autoThumbQueue.splice(at, 1);
+    }
+    autoThumbQueue.unshift(...batch);
+  } else {
+    for (const entry of batch) {
+      if (!autoThumbQueue.some((queued) => queued.id === entry.id)) {
+        autoThumbQueue.push(entry);
+      }
+    }
   }
   runAutoThumbQueue();
 }
 async function renderAutoThumb(item) {
+  if (isVideo(item)) {
+    return api(`/api/items/${item.id}/thumb/frame`, { method: "POST", body: {} });
+  }
   let image;
   if (isPdf(item)) {
     if (!window.TFEReader || typeof window.TFEReader.renderThumbnail !== "function") {
@@ -6852,18 +7101,26 @@ async function runAutoThumbQueue() {
   try {
     const data = await renderAutoThumb(item);
     window.__tfeThumbUpdated(data.item, { silent: true });
-  } catch (_) {
-    /* remember the failed attempt so a broken file is not retried every render */
-    rememberAutoThumb(item);
+  } catch (error) {
+    /* a file from another vault is not broken, so it gets no cooldown */
+    if (!error || error.status !== 404) rememberAutoThumb(item);
   } finally {
     autoThumbBusy = false;
     if (autoThumbQueue.length) setTimeout(runAutoThumbQueue, 250);
   }
 }
 async function generateAutoThumbnail(item) {
-  if (!item || (!item.viewer && !isPdf(item))) return;
+  if (!item || (!isVideo(item) && !item.viewer && !isPdf(item))) return;
   forgetAutoThumb(item);
-  toast(isPdf(item) ? "Rendering a PDF thumbnail…" : "Rendering a 3D thumbnail…", "info", 6000);
+  toast(
+    isVideo(item)
+      ? "Grabbing a video frame…"
+      : isPdf(item)
+        ? "Rendering a PDF thumbnail…"
+        : "Rendering a 3D thumbnail…",
+    "info",
+    6000
+  );
   try {
     const data = await renderAutoThumb(item);
     window.__tfeThumbUpdated(data.item, { silent: false });
@@ -7507,7 +7764,7 @@ function promptSettings() {
     h("h3", { text: "Good to know" }),
     h("p", { class: "modal-note", text: "Files live in your private Telegram channel. Folders, tags, favorites, collections and names are the local index; renaming also updates the Telegram caption." }),
     h("p", { class: "modal-note", text: "The Telegram session and library database are stored in your Windows profile (%APPDATA%\\TelegramFileExplorer). The bot runs on your always-on server, so this app never starts or stops it, and the bot token is never used here." }),
-    h("p", { class: "modal-note", text: `Files above your Telegram account limit (${uploadLimitLabel()} per file) are split into archive parts automatically. Picking "Download complete file" on any part fetches all parts and joins them back into the original file. Deleting from Telegram removes the message from the channel.` })
+    h("p", { class: "modal-note", text: `Files above your Telegram account limit (${uploadLimitLabel()} per file) are split into archive parts automatically. The library shows the set as one file, and Download fetches every part and joins them back into the original file. Deleting from Telegram removes the message from the channel.` })
   );
   const content = h("div", {}, account, sectionAppearance, sectionSecurity, sectionChannel, sectionLibrary, sectionTools, sectionConnection, shortcuts, notes);
   openModal({
@@ -7689,7 +7946,7 @@ function openItemMenu(event, item) {
   event.preventDefault();
   selectItem(item.id);
   const entries = [
-    { label: "Open", icon: "play", key: "Enter", onClick: () => openViewerFor(item) },
+    isSplitItem(item) ? null : { label: "Open", icon: "play", key: "Enter", onClick: () => openViewerFor(item) },
     item.viewer ? { label: "View 3D model", icon: "cube", onClick: () => openModelViewer(item) } : null,
     item.family === "cad" || (item.family === "model" && !item.viewer)
       ? { label: "Open in its Windows app", icon: "external", onClick: () => openExternalItem(item) }
@@ -7701,9 +7958,6 @@ function openItemMenu(event, item) {
     item.kind === "document" && !item.part_of
       ? { label: "Fix video streaming…", icon: "video", onClick: () => promptReupload(item) }
       : null,
-    item.part_of && item.part_of.count > 1
-      ? { label: `Download complete file (${item.part_of.count} parts)`, icon: "download", onClick: () => startMergeDownload(item) }
-      : null,
     item.hidden ? { label: "Restore to library", icon: "eyeOff", onClick: () => restoreItem(item) } : null,
     { separator: true },
     { label: "Rename…", icon: "edit", key: "F2", onClick: () => promptRename() },
@@ -7714,10 +7968,21 @@ function openItemMenu(event, item) {
     (item.family === "model" || item.family === "cad")
       ? { label: "Use Windows thumbnail", icon: "image", onClick: () => windowsThumbnail(item) }
       : null,
-    item.viewer || isPdf(item)
-      ? { label: isPdf(item) ? "Generate PDF thumbnail" : "Generate 3D thumbnail", icon: "image", onClick: () => generateAutoThumbnail(item) }
+    item.viewer || isPdf(item) || isVideo(item)
+      ? {
+          label: isVideo(item)
+            ? "Generate video thumbnail"
+            : isPdf(item)
+              ? "Generate PDF thumbnail"
+              : "Generate 3D thumbnail",
+          icon: "image",
+          onClick: () => generateAutoThumbnail(item)
+        }
       : null,
     { label: "Stars…", icon: "user", onClick: () => promptStars(item) },
+    item.kind === "image" && item.has_thumb
+      ? { label: "Use as star portrait…", icon: "user", onClick: () => promptPortraitSource(item) }
+      : null,
     (item.kind === "video" || item.kind === "document") && !item.part_of
       ? { label: item.movie ? "Update IMDb details…" : "Add IMDb details…", icon: "video", onClick: () => promptMovie(item) }
       : null,
@@ -7979,7 +8244,13 @@ function transferSub(transfer) {
   if (state === "merging") return "Joining parts into one file…";
   if (state === "ready") return "Complete file ready to save";
   if (state === "downloading") {
-    if (!transfer.kind) return `Downloading parts · ${written}`;
+    if (!transfer.kind) {
+      const count = transfer.parts || 0;
+      const head = count > 1 && transfer.part_num
+        ? `Downloading part ${transfer.part_num} of ${count} · ${written}`
+        : `Downloading parts · ${written}`;
+      return rate ? `${head} · ${rate}` : head;
+    }
     const head = transfer.zipped ? `Downloading ZIP · ${written}` : `Downloading · ${written}`;
     return rate ? `${head} · ${rate}` : head;
   }
@@ -8036,7 +8307,7 @@ function renderTransfers() {
       button.addEventListener("click", () => revealTransfer(transfer.id));
       actions.append(button);
     }
-    if (state === "ready" && transfer.result_url) {
+    if (state === "ready" && transfer.result_url && !S.autoSaved.has(transfer.id)) {
       const button = h("button", { class: "link-btn", type: "button", text: "Save file" });
       button.addEventListener("click", () => saveMergedFile(transfer.result_url));
       actions.append(button);
@@ -8091,14 +8362,18 @@ async function pollTransfers() {
     const active = transfers.filter((transfer) => transferActive(transfer.state));
     let newlyDone = 0;
     let newlySaved = 0;
-    let newlyReady = 0;
+    const doneIds = [];
+    const newlyReady = [];
     let newlyCancelled = 0;
     sampleTransferRates(transfers);
     for (const transfer of transfers) {
       if (transfer.state === "done" && !S.seenTransfers.has(transfer.id)) {
         S.seenTransfers.add(transfer.id);
         if (transfer.kind === "download") newlySaved += 1;
-        else newlyDone += 1;
+        else {
+          newlyDone += 1;
+          if (transfer.item_id) doneIds.push(transfer.item_id);
+        }
       }
       if (transfer.state === "error" && !S.seenTransfers.has(`e:${transfer.id}`)) {
         S.seenTransfers.add(`e:${transfer.id}`);
@@ -8106,7 +8381,7 @@ async function pollTransfers() {
       }
       if (transfer.state === "ready" && !S.seenTransfers.has(`r:${transfer.id}`)) {
         S.seenTransfers.add(`r:${transfer.id}`);
-        newlyReady += 1;
+        newlyReady.push(transfer);
       }
       if (transfer.state === "cancelled" && !S.seenTransfers.has(`c:${transfer.id}`)) {
         S.seenTransfers.add(`c:${transfer.id}`);
@@ -8117,6 +8392,10 @@ async function pollTransfers() {
     renderTransfers();
     if (newlyDone) {
       await Promise.all([loadNav(), loadItems({ reset: true })]);
+      const fresh = doneIds
+        .map((id) => S.items.find((entry) => entry.id === id))
+        .filter(Boolean);
+      if (fresh.length) queueAutoThumbnails(fresh, { front: true });
       toast(`${plural(newlyDone, "upload")} complete.`, "success");
       setStatus("Upload complete");
     }
@@ -8126,9 +8405,21 @@ async function pollTransfers() {
         : `${newlySaved} downloads complete — saved to Downloads.`, "success", 5000);
       setStatus("Download complete");
     }
-    if (newlyReady) {
-      toast(`Complete file ready — click Save file in the transfers bar.`, "success", 7000);
-      setStatus("Merged file ready");
+    if (newlyReady.length) {
+      // A split download is finished when the volumes are joined; save it
+      // without asking the user to press anything.
+      let saved = 0;
+      for (const transfer of newlyReady) {
+        if (!transfer.result_url || S.autoSaved.has(transfer.id)) continue;
+        S.autoSaved.add(transfer.id);
+        saveMergedFile(transfer.result_url);
+        saved += 1;
+      }
+      if (saved) renderTransfers();
+      const first = newlyReady[0];
+      const name = first.result_name || first.name;
+      toast(`Download complete — ${plural(first.parts || 0, "part")} joined into ${name}.`, "success", 7000);
+      setStatus("Download complete");
     }
     if (newlyCancelled) {
       // A split upload may have already sent parts; the app removes them
@@ -8522,7 +8813,6 @@ function bindEvents() {
   });
   $("thumbBtn").addEventListener("click", () => promptThumbPicker(selectedItem()));
   $("movieBtn").addEventListener("click", () => promptMovie(selectedItem()));
-  $("completeBtn").addEventListener("click", () => startMergeDownload(selectedItem()));
   $("favoriteBtn").addEventListener("click", promptFavorite);
   $("restoreBtn").addEventListener("click", () => restoreItem(selectedItem()));
   $("renameBtn").addEventListener("click", promptRename);
