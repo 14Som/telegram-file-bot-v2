@@ -5454,6 +5454,9 @@ function promptStarPortrait(star) {
   const file = h("input", { type: "file", accept: "image/jpeg,image/png,image/gif,image/webp", hidden: "" });
   const status = h("p", { class: "modal-note", text: "Upload a picture, or choose an image from this star’s files." });
   const grid = h("div", { class: "star-portrait-grid" });
+  // The scrollbar library wraps a host's children, so the tiles need a
+  // permanent parent inside that wrapper instead of the scrolling host.
+  const scroller = h("div", { class: "star-portrait-scroll" }, grid);
   const upload = btn("Upload image…", "btn", () => file.click());
   file.addEventListener("change", async () => {
     const chosen = file.files && file.files[0];
@@ -5477,7 +5480,7 @@ function promptStarPortrait(star) {
     title: "Star portrait",
     subtitle: star.name,
     wide: true,
-    content: h("div", {}, status, h("div", { class: "star-portrait-actions" }, upload), file, grid),
+    content: h("div", {}, status, h("div", { class: "star-portrait-actions" }, upload), file, scroller),
     actions: [{ label: "Close", onClick: closeModal }]
   });
   const choose = async (item, tile) => {
@@ -9176,7 +9179,7 @@ const SCROLLBAR_TARGETS = [
   ".sidebar", "#content", ".preview-scroll", ".vault-list", ".upload-list",
   ".modal-body", ".channel-list", ".lock-vault-list", ".login-card",
   ".text-preview", ".viewer-stage pre", ".picker-tree", ".star-note",
-  ".star-pick-list", ".star-portrait-grid", ".movie-cast", ".movie-results",
+  ".star-pick-list", ".star-portrait-scroll", ".movie-cast", ".movie-results",
   ".check-list", ".batch-preview"
 ].join(",");
 const scrollInstances = new Map();

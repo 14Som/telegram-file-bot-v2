@@ -268,7 +268,6 @@ a { color: var(--accent); }
 [data-overlayscrollbars~=host].channel-list,
 [data-overlayscrollbars~=host].lock-vault-list,
 [data-overlayscrollbars~=host].star-pick-list,
-[data-overlayscrollbars~=host].star-portrait-grid,
 [data-overlayscrollbars~=host].movie-cast,
 [data-overlayscrollbars~=host].movie-results,
 [data-overlayscrollbars~=host].check-list,
@@ -299,11 +298,6 @@ a { color: var(--accent); }
 .movie-results > [data-overlayscrollbars-viewport] { gap: 5px; }
 .check-list > [data-overlayscrollbars-viewport] { gap: 2px; }
 .batch-preview > [data-overlayscrollbars-viewport] { gap: 2px; }
-.star-portrait-grid > [data-overlayscrollbars-viewport] {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(84px, 1fr));
-  gap: 7px;
-}
 .movie-cast > [data-overlayscrollbars-viewport] {
   display: flex;
   flex-wrap: wrap;
@@ -3317,7 +3311,8 @@ a { color: var(--accent); }
 .star-pick-new .btn { flex: none; height: 32px; }
 
 .star-portrait-actions { display: flex; gap: 7px; margin-top: 10px; }
-.star-portrait-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(84px, 1fr)); gap: 7px; margin-top: 10px; max-height: 250px; overflow-y: auto; }
+.star-portrait-scroll { margin-top: 10px; max-height: 250px; overflow-y: auto; }
+.star-portrait-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(84px, 1fr)); gap: 7px; }
 .star-portrait-choice { padding: 0; border: 2px solid var(--border); border-radius: 7px; overflow: hidden; background: var(--hover); cursor: pointer; }
 .star-portrait-choice img { display: block; width: 100%; aspect-ratio: 3 / 4; object-fit: cover; }
 .star-portrait-choice:hover { border-color: var(--accent); }
