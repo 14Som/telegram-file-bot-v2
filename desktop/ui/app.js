@@ -537,6 +537,8 @@ async function boot() {
 }
 
 async function applyPendingVault() {
+  const pin = unlockPin;
+  unlockPin = "";
   if (!pendingVault) return;
   const target = pendingVault;
   pendingVault = null;
@@ -546,7 +548,7 @@ async function applyPendingVault() {
   try {
     const data = await api("/api/vaults/switch", {
       method: "POST",
-      body: { id: target.id }
+      body: { id: target.id, pin }
     });
     S.status = {
       ...(S.status || {}),
@@ -993,13 +995,18 @@ async function switchVault(vault) {
     return;
   }
   closeVaultMenu();
+  let pin = "";
+  if (S.status && S.status.pin_set) {
+    pin = await askSwitchPin(vault);
+    if (pin === null) return;
+  }
   S.vaultBusy = true;
   updateChrome();
   setStatus(`Switching to ${vault.title || vault.id}…`);
   try {
     const data = await api("/api/vaults/switch", {
       method: "POST",
-      body: { id: vault.id }
+      body: { id: vault.id, pin }
     });
     await afterVaultChanged(data, vault.title || vault.id, false);
     toast(`Now using ${vault.title || vault.id}.`, "success", 4000);
@@ -1009,6 +1016,42 @@ async function switchVault(vault) {
     S.vaultBusy = false;
     updateChrome();
   }
+}
+
+function askSwitchPin(vault) {
+  return new Promise((resolve) => {
+    const pin = pinInput();
+    const note = h("p", { class: "modal-note", text: "Storage is protected by your app PIN." });
+    openModal({
+      title: `Switch to ${vault.title || vault.id}?`,
+      content: h("div", {},
+        field("PIN", pin, "The 4-digit PIN that unlocks this app."),
+        note
+      ),
+      actions: [
+        {
+          label: "Cancel",
+          onClick: async () => {
+            closeModal();
+            resolve(null);
+          }
+        },
+        {
+          label: "Switch",
+          class: "primary",
+          onClick: async () => {
+            if (!/^\d{4}$/.test(pin.value)) {
+              note.textContent = "Enter the 4-digit PIN.";
+              pin.focus();
+              return;
+            }
+            closeModal();
+            resolve(pin.value);
+          }
+        }
+      ]
+    });
+  });
 }
 
 async function toggleDefaultVault(vault) {
@@ -1270,11 +1313,13 @@ function applyVaultUpdate(data) {
 let pinBuffer = "";
 let recoveryTimer = null;
 let pendingVault = null;
+let unlockPin = "";
 
 function restoreLockView() {
   clearInterval(recoveryTimer);
   recoveryTimer = null;
   pinBuffer = "";
+  unlockPin = "";
   renderLockDots();
   $("lockTitle").textContent = "Enter your PIN";
   $("lockSub").textContent = "Telegram File Explorer is locked";
@@ -1593,6 +1638,7 @@ async function submitPin() {
     await api("/api/unlock", { method: "POST", body: { pin } });
     pinBuffer = "";
     renderLockDots();
+    unlockPin = pin;
     S.status.locked = false;
     hideLock();
     updateChrome();

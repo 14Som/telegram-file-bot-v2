@@ -78,7 +78,7 @@ log = logging.getLogger("tfe.server")
 
 QUIT = threading.Event()
 COOKIE = "tfe_session"
-APP_VERSION = "2.6.10"
+APP_VERSION = "2.6.11"
 # The Android build extracts the interface next to its writable data and runs
 # the same server there; the desktop EXE keeps using the bundled copy.
 UI_DIR = Path(
@@ -148,6 +148,7 @@ class VaultBody(BaseModel):
 
 class VaultSwitchBody(BaseModel):
     id: str
+    pin: str = ""
 
 
 class VaultDefaultBody(BaseModel):
@@ -1687,6 +1688,12 @@ async def switch_vault(body: VaultSwitchBody, request: Request):
     state = _state(request)
     if not body.id.strip():
         raise TGError("Choose a vault first.")
+    if applock.has_pin():
+        if not (body.pin or "").strip():
+            raise TGError("Enter your PIN to switch storage.")
+        if not applock.verify(body.pin):
+            await asyncio.sleep(0.8)
+            raise TGError("Wrong PIN.")
     await state.service.set_vault(body.id)
     return await _after_vault_change(state)
 

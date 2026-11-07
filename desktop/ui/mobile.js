@@ -2464,19 +2464,12 @@ async function openVaultSheet() {
         async () => {
           closeSheet();
           if (active) return;
-          try {
-            toast("Switching vault…");
-            await api("/api/vaults/switch", { method: "POST", body: { id: String(vault.id) } });
-            S.status = await api("/api/status");
-            clearFilters(false);
-            S.folder = "";
-            await loadNav();
-            updateChrome();
-            if (S.tab === "more") renderMore();
-            else loadItems({ reset: true });
-            toast(`Switched to ${vault.title || "the new vault"}`, "success");
-            pollSync();
-          } catch (error) { toast(error.message, "error"); }
+          if ((S.status || {}).pin_set) {
+            openSwitchPin(vault, (pin) => switchToVault(vault, pin));
+            return;
+          }
+          try { await switchToVault(vault, ""); }
+          catch (error) { toast(error.message, "error"); }
         }
       );
       body.append(row);
@@ -2487,6 +2480,71 @@ async function openVaultSheet() {
     p.textContent = error.message;
     body.append(p);
   }
+}
+
+async function switchToVault(vault, pin) {
+  toast("Switching vault…");
+  await api("/api/vaults/switch", { method: "POST", body: { id: String(vault.id), pin } });
+  S.status = await api("/api/status");
+  clearFilters(false);
+  S.folder = "";
+  await loadNav();
+  updateChrome();
+  if (S.tab === "more") renderMore();
+  else loadItems({ reset: true });
+  toast(`Switched to ${vault.title || "the new vault"}`, "success");
+  pollSync();
+}
+
+function openSwitchPin(vault, onPin) {
+  const body = document.createElement("div");
+  const text = document.createElement("p");
+  text.textContent = `Enter your 4-digit PIN to open ${vault.title || "this vault"}.`;
+  const input = document.createElement("input");
+  input.type = "password";
+  input.inputMode = "numeric";
+  input.maxLength = 4;
+  input.autocomplete = "off";
+  input.placeholder = "4 digits";
+  input.addEventListener("input", () => {
+    input.value = input.value.replace(/\D/g, "").slice(0, 4);
+  });
+  const error = document.createElement("p");
+  error.className = "form-error";
+  error.hidden = true;
+  const actions = document.createElement("div");
+  actions.className = "sheet-buttons";
+  const go = document.createElement("button");
+  go.type = "button";
+  go.className = "btn primary";
+  go.textContent = "Switch";
+  go.addEventListener("click", async () => {
+    if (input.value.length !== 4) {
+      error.textContent = "Enter the 4-digit PIN.";
+      error.hidden = false;
+      return;
+    }
+    go.disabled = true;
+    try {
+      await onPin(input.value);
+      closeSheet();
+    } catch (err) {
+      error.textContent = err.message;
+      error.hidden = false;
+      input.value = "";
+      input.focus();
+      go.disabled = false;
+    }
+  });
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "btn ghost";
+  cancel.textContent = "Cancel";
+  cancel.addEventListener("click", () => closeSheet());
+  actions.append(go, cancel);
+  body.append(text, input, error, actions);
+  openSheet("Switch storage", body);
+  setTimeout(() => input.focus(), 50);
 }
 
 function sortLabel(value) {
