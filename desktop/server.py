@@ -14,7 +14,6 @@ import sqlite3
 import struct
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import urllib.parse
@@ -47,6 +46,7 @@ from . import (
     starlookup,
     storyboard,
     streamcache,
+    thumbcrypt,
     thumbpick,
     updater,
     vaultstore,
@@ -79,7 +79,7 @@ log = logging.getLogger("tfe.server")
 
 QUIT = threading.Event()
 COOKIE = "tfe_session"
-APP_VERSION = "2.6.13"
+APP_VERSION = "2.6.14"
 # The Android build extracts the interface next to its writable data and runs
 # the same server there; the desktop EXE keeps using the bundled copy.
 UI_DIR = Path(
@@ -534,11 +534,7 @@ def _looks_like_image(data: bytes) -> bool:
 
 
 def _store_star_image(star_id: int, data: bytes) -> int:
-    path = _star_image_path(star_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_bytes(data)
-    os.replace(tmp, path)
+    thumbcrypt.write_bytes(_star_image_path(star_id), data)
     return int(time.time() * 1000)
 
 
@@ -547,11 +543,7 @@ def _movie_poster_path(item_id: int) -> Path:
 
 
 def _store_movie_poster(item_id: int, data: bytes) -> int:
-    path = _movie_poster_path(item_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_bytes(data)
-    os.replace(tmp, path)
+    thumbcrypt.write_bytes(_movie_poster_path(item_id), data)
     return int(time.time() * 1000)
 
 
@@ -612,11 +604,14 @@ async def _portrait_bytes(
     item_id = int(item["id"])
     custom = thumbpick.custom_path(item_id)
     if custom.is_file():
-        return await run_in_threadpool(custom.read_bytes), "image/jpeg"
+        data = await run_in_threadpool(thumbcrypt.read_bytes, custom)
+        if data:
+            return data, "image/jpeg"
     cache = appconfig.THUMB_DIR / f"{item_id}.thumb"
     if cache.is_file():
-        data = await run_in_threadpool(cache.read_bytes)
-        return data, _sniff_image(data)
+        data = await run_in_threadpool(thumbcrypt.read_bytes, cache)
+        if data:
+            return data, _sniff_image(data)
     if not item.get("has_thumb"):
         return None
     try:
@@ -790,6 +785,7 @@ def _content_disposition(name: str, download: bool) -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     appconfig.ensure_dirs()
+    thumbcrypt.ensure_key()
     # A swipe-away on Android kills the process before lifespan shutdown, so
     # streamed bytes from the last run are dropped on boot as well.
     try:
@@ -830,6 +826,8 @@ async def lifespan(app: FastAPI):
     # After restore: a PIN that arrived with the vault snapshot must lock the
     # app on this boot too.
     state.locked = applock.has_pin()
+    if not state.locked:
+        _spawn(state, _migrate_previews())
     state.catalog = Catalog(appconfig.LIBRARY_PATH, _status_chat_id(state.service.status()))
     state.downloads = downloadjobs.DownloadJobs(state)
     resumed = state.downloads.restore()
@@ -1041,13 +1039,17 @@ async def unlock(body: PinBody, request: Request):
     state = _state(request)
     if not applock.has_pin():
         state.locked = False
+        thumbcrypt.unlock("")
         _start_thumb_warm(state)
+        _spawn(state, _migrate_previews())
         return {"unlocked": True}
     if not applock.verify(body.pin or ""):
         await asyncio.sleep(1.2)
         raise TGError("Wrong PIN.")
     state.locked = False
+    thumbcrypt.unlock(body.pin or "")
     _start_thumb_warm(state)
+    _spawn(state, _migrate_previews())
     return {"unlocked": True}
 
 
@@ -1057,6 +1059,7 @@ async def lock_now(request: Request):
     if not applock.has_pin():
         raise TGError("Set a PIN first (Settings → Security).")
     state.locked = True
+    thumbcrypt.lock()
     _stop_thumb_warm(state)
     return {"locked": True}
 
@@ -1150,6 +1153,7 @@ async def pin_set(body: PinBody, request: Request):
         applock.set_pin(body.pin or "")
     except ValueError as exc:
         raise TGError(str(exc))
+    thumbcrypt.set_pin(body.pin or "")
     return {"pin_set": True}
 
 
@@ -1162,6 +1166,7 @@ async def pin_remove(body: PinBody, request: Request):
         await asyncio.sleep(1.2)
         raise TGError("Wrong PIN.")
     applock.clear_pin()
+    thumbcrypt.clear_pin()
     state.locked = False
     return {"pin_set": False}
 
@@ -1212,6 +1217,7 @@ async def pin_reset(body: PinResetBody, request: Request):
         await asyncio.sleep(1.2)
         raise TGError("Wrong or expired code. Ask for a new code.")
     applock.set_pin(body.pin)
+    thumbcrypt.set_pin(body.pin)
     state.locked = False
     log.info("PIN reset with a Telegram recovery code")
     return {"pin_set": True, "unlocked": True}
@@ -1236,23 +1242,8 @@ def _custom_thumb_ids() -> List[int]:
 
 
 def _store_thumb(item_id: int, data: bytes) -> None:
-    """Write a thumbnail through a unique temp file so the warmer and a live
-    card request can never interleave into the same cache file."""
-    appconfig.THUMB_DIR.mkdir(parents=True, exist_ok=True)
-    cache = appconfig.THUMB_DIR / f"{item_id}.thumb"
-    handle, name = tempfile.mkstemp(
-        dir=appconfig.THUMB_DIR, prefix=f"{item_id}.", suffix=".tmp"
-    )
-    try:
-        with os.fdopen(handle, "wb") as fh:
-            fh.write(data)
-        os.replace(name, cache)
-    except BaseException:
-        try:
-            os.unlink(name)
-        except OSError:
-            pass
-        raise
+    """Encrypt and atomically replace one thumbnail cache file."""
+    thumbcrypt.write_bytes(appconfig.THUMB_DIR / f"{item_id}.thumb", data)
 
 
 def _stop_thumb_warm(state: Any) -> None:
@@ -1263,6 +1254,13 @@ def _stop_thumb_warm(state: Any) -> None:
     warm = getattr(state, "thumb_warm", None)
     if isinstance(warm, dict):
         warm["state"] = "idle"
+
+
+async def _migrate_previews() -> None:
+    try:
+        await run_in_threadpool(thumbcrypt.migrate)
+    except Exception:
+        log.exception("Preview cache encryption failed")
 
 
 def _start_thumb_warm(state: Any) -> None:
@@ -2337,7 +2335,9 @@ async def movie_poster(item_id: int, request: Request):
     path = _movie_poster_path(item["id"])
     if not await run_in_threadpool(path.is_file):
         raise HTTPException(status_code=404, detail="No poster for this file.")
-    data = await run_in_threadpool(path.read_bytes)
+    data = await run_in_threadpool(thumbcrypt.read_bytes, path)
+    if not data:
+        raise HTTPException(status_code=404, detail="No poster for this file.")
     return Response(
         content=data,
         media_type=_sniff_image(data),
@@ -2444,7 +2444,9 @@ async def star_image(star_id: int, request: Request):
     path = _star_image_path(star_id)
     if not await run_in_threadpool(path.is_file):
         raise HTTPException(status_code=404, detail="No star image yet.")
-    data = await run_in_threadpool(path.read_bytes)
+    data = await run_in_threadpool(thumbcrypt.read_bytes, path)
+    if not data:
+        raise HTTPException(status_code=404, detail="No star image yet.")
     return Response(
         content=data,
         media_type=_sniff_image(data),
@@ -2653,7 +2655,9 @@ async def _windows_thumbnail(state: Any, item: Dict[str, Any]) -> bytes:
     lock = _shell_thumb_locks.setdefault(int(item["id"]), asyncio.Lock())
     async with lock:
         if cache.is_file():
-            return await run_in_threadpool(cache.read_bytes)
+            cached = await run_in_threadpool(thumbcrypt.read_bytes, cache)
+            if cached:
+                return cached
         path = await _download_item_copy(state, item, "shellthumb")
         try:
             data = await run_in_threadpool(winshell.thumbnail, path, 640)
@@ -2661,10 +2665,7 @@ async def _windows_thumbnail(state: Any, item: Dict[str, Any]) -> bytes:
             _drop_copy(path)
         if not data:
             raise TGError("Windows has no preview for this file.")
-        appconfig.THUMB_DIR.mkdir(parents=True, exist_ok=True)
-        tmp = cache.with_suffix(".tmp")
-        await run_in_threadpool(tmp.write_bytes, data)
-        os.replace(tmp, cache)
+        await run_in_threadpool(thumbcrypt.write_bytes, cache, data)
         await run_in_threadpool(
             state.catalog.update,
             item["id"],
@@ -2704,8 +2705,7 @@ async def set_thumb_image(item_id: int, body: ThumbImageBody, request: Request):
     ):
         raise TGError("That image is not a usable JPEG.")
     target = thumbpick.custom_path(item_id)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    await run_in_threadpool(target.write_bytes, data)
+    await run_in_threadpool(thumbcrypt.write_bytes, target, data)
     updated = await run_in_threadpool(
         state.catalog.update,
         item_id,
@@ -3064,8 +3064,13 @@ async def storyboard_sprite(item_id: int, request: Request):
     sprite = storyboard.sprite_path(item)
     if not sprite.is_file():
         raise HTTPException(status_code=404, detail="No preview sheet yet.")
-    return FileResponse(
-        sprite, media_type="image/jpeg", headers={"Cache-Control": "max-age=3600"}
+    data = await run_in_threadpool(thumbcrypt.read_bytes, sprite)
+    if not data:
+        raise HTTPException(status_code=404, detail="No preview sheet yet.")
+    return Response(
+        content=data,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "max-age=3600"},
     )
 
 
@@ -3111,8 +3116,13 @@ async def thumb_picker_frame(item_id: int, index: int, request: Request):
     path = thumbpick.frame_path(item, index)
     if not path.is_file():
         raise HTTPException(status_code=404, detail="That frame is not ready.")
-    return FileResponse(
-        path, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"}
+    data = await run_in_threadpool(thumbcrypt.read_bytes, path)
+    if not data:
+        raise HTTPException(status_code=404, detail="That frame is not ready.")
+    return Response(
+        content=data,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "private, max-age=3600"},
     )
 
 
@@ -3902,21 +3912,22 @@ async def thumb(item_id: int, request: Request):
     item = await _scoped_item(state, item_id)
     custom = thumbpick.custom_path(item_id)
     if custom.is_file():
-        data = await run_in_threadpool(custom.read_bytes)
-        return Response(
-            content=data,
-            media_type="image/jpeg",
-            headers={"Cache-Control": "private, max-age=86400"},
-        )
+        data = await run_in_threadpool(thumbcrypt.read_bytes, custom)
+        if data:
+            return Response(
+                content=data,
+                media_type="image/jpeg",
+                headers={"Cache-Control": "private, max-age=86400"},
+            )
     cache = appconfig.THUMB_DIR / f"{item_id}.thumb"
     if cache.exists():
-        data = await run_in_threadpool(cache.read_bytes)
-        media_type = _sniff_image(data)
-        return Response(
-            content=data,
-            media_type=media_type,
-            headers={"Cache-Control": "private, max-age=86400"},
-        )
+        data = await run_in_threadpool(thumbcrypt.read_bytes, cache)
+        if data:
+            return Response(
+                content=data,
+                media_type=_sniff_image(data),
+                headers={"Cache-Control": "private, max-age=86400"},
+            )
     if not item.get("has_thumb"):
         if filetypes.classify(
             str(item.get("name") or ""), str(item.get("kind") or "")

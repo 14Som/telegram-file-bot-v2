@@ -41,7 +41,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from telethon.tl.types import DocumentAttributeFilename
 
-from . import appconfig
+from . import appconfig, thumbcrypt
 
 log = logging.getLogger("tfe.vaultstore")
 
@@ -54,6 +54,10 @@ SCAN_LIMIT = 120
 IS_MOBILE = bool(os.environ.get("TFE_MOBILE"))
 STAGE_DIR = appconfig.CACHE_DIR / "vault"
 WIPE_CHUNK = 1024 * 1024
+# Telethon picks 128 KiB parts on its own, which made a 40 MB snapshot outlive
+# the close-time timeout while a video stream shared the link. 512 KiB is
+# Telegram's maximum part size.
+UPLOAD_PART_KB = 512
 
 _SAVE_LOCK: Optional[asyncio.Lock] = None
 
@@ -222,9 +226,13 @@ def _snapshot_thumbs() -> list:
         rel = path.relative_to(root)
         parts = rel.parts
         if len(parts) == 1 and rel.name.endswith(".custom.jpg"):
+            thumbcrypt.seal_file(path)
             keep.append(path)
         elif len(parts) == 2 and parts[0] == "stars":
+            thumbcrypt.seal_file(path)
             keep.append(path)
+    if thumbcrypt.KEY_PATH.is_file():
+        keep.append(thumbcrypt.KEY_PATH)
     return keep
 
 
@@ -279,9 +287,12 @@ async def _save(service: Any) -> Dict[str, Any]:
                         indent=2,
                     ),
                 )
+            uploaded = await client.upload_file(
+                str(zip_path), part_size_kb=UPLOAD_PART_KB
+            )
             await client.send_file(
                 entity,
-                str(zip_path),
+                uploaded,
                 caption=f"{MARKER} {name}",
                 force_document=True,
                 attributes=[DocumentAttributeFilename(name)],

@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import appconfig, mediatools
+from . import appconfig, mediatools, thumbcrypt
 
 log = logging.getLogger("tfe.storyboard")
 
@@ -212,7 +212,7 @@ def _build(item: Dict[str, Any], key: str, url: str, cookie: str) -> None:
         if result.returncode != 0 or not (work / "sprite.jpg").is_file():
             raise RuntimeError("Could not build the preview sheet.")
         SPRITE_DIR.mkdir(parents=True, exist_ok=True)
-        os.replace(work / "sprite.jpg", sprite)
+        thumbcrypt.write_bytes(sprite, (work / "sprite.jpg").read_bytes())
         payload = {
             "state": "ready",
             "item_id": item.get("id"),

@@ -23,7 +23,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import appconfig, mediatools, storyboard
+from . import appconfig, mediatools, storyboard, thumbcrypt
 
 log = logging.getLogger("tfe.thumbpick")
 
@@ -181,6 +181,8 @@ def _build(
         if target_dir.exists():
             shutil.rmtree(target_dir, ignore_errors=True)
         work.rename(target_dir)
+        for index in range(COUNT):
+            thumbcrypt.seal_file(target_dir / f"frame-{index + 1}.jpg")
         with _lock:
             _errors.pop(key, None)
         log.info("Thumbnail candidates ready for item %s", item.get("id"))
@@ -323,10 +325,7 @@ def auto_thumb(item: Dict[str, Any], url: str, cookie: str) -> bool:
             frame = _grab_auto(ffmpeg, url, cookie, 0.0, work / "frame.jpg")
         if frame is None:
             return False
-        appconfig.THUMB_DIR.mkdir(parents=True, exist_ok=True)
-        temp = target.with_suffix(".tmp")
-        shutil.copyfile(frame, temp)
-        os.replace(temp, target)
+        thumbcrypt.write_bytes(target, frame.read_bytes())
         return True
     finally:
         shutil.rmtree(work, ignore_errors=True)
@@ -348,9 +347,9 @@ def select(item: Dict[str, Any], index: int) -> Path:
     source = frame_path(item, index)
     if not source.is_file():
         raise FileNotFoundError("Generate the frames first.")
+    data = thumbcrypt.read_bytes(source)
+    if data is None:
+        raise FileNotFoundError("Generate the frames first.")
     target = custom_path(int(item["id"]))
-    appconfig.THUMB_DIR.mkdir(parents=True, exist_ok=True)
-    temp = target.with_suffix(".tmp")
-    shutil.copyfile(source, temp)
-    os.replace(temp, target)
+    thumbcrypt.write_bytes(target, data)
     return target
