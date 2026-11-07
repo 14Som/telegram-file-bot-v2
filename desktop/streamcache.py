@@ -24,13 +24,16 @@ MAX_BYTES = 2 * 1024 ** 3
 # the current window on its own task, which is what gives playback its runway.
 PREFETCH_AHEAD = 192 * 1024 * 1024
 PREFETCH_RUN = 16  # blocks per pass, so seeks are picked up within ~32 MiB
+PRUNE_INTERVAL = 60.0
 
 DIR = appconfig.HOME / "cache" / "stream"
 
 _locks: Dict[str, asyncio.Lock] = {}
 _builders: Dict[str, Dict[str, Any]] = {}
+_active_key: "str | None" = None
 _fills = 0
 _prune_task: "asyncio.Task[None] | None" = None
+_last_prune = 0.0
 
 
 def _dir_for(key: str) -> Path:
@@ -169,11 +172,15 @@ def _prune_sync() -> None:
 
 
 async def _maybe_prune() -> None:
-    global _prune_task
+    global _prune_task, _last_prune
     if _prune_task is not None and not _prune_task.done():
         return
     if not DIR.exists():
         return
+    now = time.time()
+    if now - _last_prune < PRUNE_INTERVAL:
+        return
+    _last_prune = now
     _prune_task = asyncio.create_task(asyncio.to_thread(_prune_sync))
 
 
@@ -187,10 +194,13 @@ def warm(
 ) -> None:
     """Keep filling blocks onto disk past the window just served.
 
-    Called for every inline range request: the block builder runs on its own
-    task, so the download continues while the player is still chewing through
-    the bytes it has. A seek moves the anchor and the builder re-targets.
+    Called for every real playback range request: the block builder runs on
+    its own task, so the download continues while the player is still chewing
+    through the bytes it has. A seek moves the anchor and the builder
+    re-targets. Only one item may build at a time; a new playback target stops
+    the previous builder so browsing cannot fan out into a Telegram flood.
     """
+    global _active_key
     if not size or size <= 0:
         return
     end = min(start + length, size)
@@ -201,6 +211,12 @@ def warm(
     else:
         state["end"] = end
         state["size"] = size
+    if _active_key != key:
+        previous = _builders.get(_active_key or "")
+        task = previous.get("task") if previous else None
+        if task is not None and not task.done():
+            task.cancel()
+        _active_key = key
     task = state.get("task")
     if task is None or task.done():
         state["task"] = asyncio.create_task(_build(service, message, key))
@@ -231,6 +247,7 @@ async def _build(service: Any, message: Any, key: str) -> None:
                 # The player jumped somewhere else; drop this pass quickly.
                 if abs(state["end"] - anchor) > 2 * BLOCK:
                     break
+            await _maybe_prune()
             await asyncio.sleep(0)
     except asyncio.CancelledError:
         raise
@@ -273,6 +290,8 @@ async def shutdown() -> None:
     The cache only exists to smooth playback, so it is thrown away when the
     app closes; prepared/converted movies in the play cache are kept.
     """
+    global _active_key
+    _active_key = None
     tasks = []
     for state in _builders.values():
         task = state.get("task")
@@ -291,6 +310,8 @@ async def purge() -> None:
     Android can kill the app from the recents screen before the lifespan
     shutdown runs, so the cache is also emptied when the app starts.
     """
+    global _active_key
+    _active_key = None
     _builders.clear()
     await asyncio.to_thread(_clear_sync)
 

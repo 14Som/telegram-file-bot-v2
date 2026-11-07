@@ -79,7 +79,7 @@ log = logging.getLogger("tfe.server")
 
 QUIT = threading.Event()
 COOKIE = "tfe_session"
-APP_VERSION = "2.6.14"
+APP_VERSION = "2.6.15"
 # The Android build extracts the interface next to its writable data and runs
 # the same server there; the desktop EXE keeps using the bundled copy.
 UI_DIR = Path(
@@ -2727,7 +2727,9 @@ async def auto_thumb_frame(item_id: int, request: Request):
     if not cached:
         lock = _auto_thumb_locks.setdefault(item_id, asyncio.Lock())
         async with lock:
-            url = f"{request.base_url}api/stream/{item_id}"
+            # Frame grabs only need the bytes they seek to, so they must not
+            # start a playback prefetch.
+            url = f"{request.base_url}api/stream/{item_id}?preview=1"
             try:
                 made = await run_in_threadpool(
                     thumbpick.auto_thumb, item, url, state.key
@@ -3053,7 +3055,8 @@ async def open_in_mpv(item_id: int, body: MpvBody, request: Request):
 async def storyboard_info(item_id: int, request: Request):
     state = _state(request)
     item = await _scoped_item(state, item_id)
-    url = f"{request.base_url}api/stream/{item_id}"
+    # Building a preview sheet must not prefetch the movie ahead of playback.
+    url = f"{request.base_url}api/stream/{item_id}?preview=1"
     return await run_in_threadpool(storyboard.describe, item, url, state.key)
 
 
@@ -3095,7 +3098,7 @@ async def thumb_picker_info(item_id: int, request: Request, force: bool = False)
     item = await _scoped_item(state, item_id)
     if force:
         await run_in_threadpool(thumbpick.reset, item)
-    url = f"{request.base_url}api/stream/{item_id}"
+    url = f"{request.base_url}api/stream/{item_id}?preview=1"
     data = await run_in_threadpool(thumbpick.describe, item, url, state.key)
     return _picker_payload(item_id, data)
 
@@ -3104,7 +3107,7 @@ async def thumb_picker_info(item_id: int, request: Request, force: bool = False)
 async def thumb_picker_shuffle(item_id: int, request: Request):
     state = _state(request)
     item = await _scoped_item(state, item_id)
-    url = f"{request.base_url}api/stream/{item_id}"
+    url = f"{request.base_url}api/stream/{item_id}?preview=1"
     data = await run_in_threadpool(thumbpick.describe, item, url, state.key, True)
     return _picker_payload(item_id, data)
 
@@ -3964,12 +3967,14 @@ async def thumb(item_id: int, request: Request):
 # -------------------------------------------------------------------- streams
 @app.get("/api/stream/{item_id}")
 async def stream(item_id: int, request: Request):
-    return await _serve_media(request, item_id, download=False)
+    preview = request.query_params.get("preview") == "1"
+    return await _serve_media(request, item_id, download=False, preview=preview)
 
 
 @app.head("/api/stream/{item_id}")
 async def stream_head(item_id: int, request: Request):
-    return await _serve_media(request, item_id, download=False)
+    preview = request.query_params.get("preview") == "1"
+    return await _serve_media(request, item_id, download=False, preview=preview)
 
 
 @app.get("/api/download/{item_id}")
@@ -4001,7 +4006,11 @@ INLINE_STREAM_WINDOW = 32 * 1024 * 1024
 
 
 async def _serve_media(
-    request: Request, item_id: int, download: bool, full: bool = False
+    request: Request,
+    item_id: int,
+    download: bool,
+    full: bool = False,
+    preview: bool = False,
 ) -> Response:
     state = _state(request)
     item = await _scoped_item(state, item_id)
@@ -4044,7 +4053,7 @@ async def _serve_media(
     async def body() -> AsyncIterator[bytes]:
         sent = 0
         if can_cache:
-            if not full:
+            if not full and not preview:
                 streamcache.warm(
                     state.service, message, cache_key, start, length, size
                 )

@@ -3213,6 +3213,13 @@ let hoverTarget = null;
 let hoverVideo = null;
 let hoverObserver = null;
 
+// Browsing must not start a background download: previews only fetch the
+// bytes on screen, while the player is the one that prefetches ahead.
+function previewStreamUrl(url) {
+  if (!url) return url;
+  return `${url}${url.includes("?") ? "&" : "?"}preview=1`;
+}
+
 function hoverPreviewWindow(item) {
   const duration = Number(item.duration) || 0;
   if (duration <= HOVER_PREVIEW_SECONDS + 4) return null;
@@ -3249,7 +3256,7 @@ function startHoverPreview(tile, item) {
   video.playsInline = true;
   video.preload = "metadata";
   hoverVideo = video;
-  video.src = item.stream_url;
+  video.src = previewStreamUrl(item.stream_url);
   const previewWindow = hoverPreviewWindow(item);
   if (previewWindow) {
     let rewinding = false;
@@ -3779,28 +3786,29 @@ function renderInlinePreview(container, item, token) {
     return;
   }
   const kind = item.kind;
+  const previewUrl = previewStreamUrl(item.stream_url);
   if (kind === "image") {
-    const image = h("img", { src: item.stream_url, alt: item.name, loading: "lazy" });
+    const image = h("img", { src: previewUrl, alt: item.name, loading: "lazy" });
     container.append(image);
   } else if (kind === "gif" || (kind === "sticker" && isVideoMime(item))) {
-    const video = h("video", { src: item.stream_url, autoplay: "", loop: "", muted: "", playsinline: "" });
+    const video = h("video", { src: previewUrl, autoplay: "", loop: "", muted: "", playsinline: "" });
     container.append(video);
   } else if (kind === "video") {
-    const video = h("video", { src: item.stream_url, controls: "", preload: "metadata", playsinline: "" });
+    const video = h("video", { src: previewUrl, controls: "", preload: "metadata", playsinline: "" });
     if (item.thumb_url) video.poster = item.thumb_url;
     container.append(video);
   } else if (kind === "audio" || kind === "voice") {
-    container.append(h("audio", { src: item.stream_url, controls: "", preload: "metadata" }));
+    container.append(h("audio", { src: previewUrl, controls: "", preload: "metadata" }));
   } else if (kind === "sticker") {
-    container.append(h("img", { src: item.stream_url, alt: item.name, loading: "lazy" }));
+    container.append(h("img", { src: previewUrl, alt: item.name, loading: "lazy" }));
   } else if (item.reader) {
     renderDocCard(container, item);
   } else if (isPdf(item)) {
-    container.append(h("iframe", { src: item.stream_url, title: item.name }));
+    container.append(h("iframe", { src: previewUrl, title: item.name }));
   } else if (isText(item)) {
     const pre = h("pre", { class: "text-preview", text: "Loading preview…" });
     container.append(pre);
-    fetch(`${item.stream_url}`, { headers: { Range: "bytes=0-65535" }, credentials: "same-origin" })
+    fetch(previewStreamUrl(item.stream_url), { headers: { Range: "bytes=0-65535" }, credentials: "same-origin" })
       .then((response) => response.text())
       .then((text) => {
         if (token !== S.previewToken) return;
