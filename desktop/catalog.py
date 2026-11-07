@@ -1321,6 +1321,36 @@ class Catalog:
             rows = conn.execute(sql, params).fetchall()
         return [dict(row) for row in rows]
 
+    def thumb_candidates(
+        self, chat_id: Optional[int] = None, limit: int = 200, offset: int = 0
+    ) -> List[Dict[str, Any]]:
+        """Thumb-bearing items, newest first, for the local thumbnail cache."""
+        clause = f"WHERE hidden = 0 AND has_thumb = 1 AND {part_visible_sql()}"
+        params: List[Any] = []
+        if chat_id is not None:
+            clause += " AND chat_id = ?"
+            params.append(int(chat_id))
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT id, chat_id, message_id, kind, name, size, thumb_version"
+                f" FROM items {clause}"
+                " ORDER BY COALESCE(tg_date, added_at) DESC, id DESC LIMIT ? OFFSET ?",
+                (*params, max(1, int(limit)), max(0, int(offset))),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def thumb_candidate_count(self, chat_id: Optional[int] = None) -> int:
+        clause = f"WHERE hidden = 0 AND has_thumb = 1 AND {part_visible_sql()}"
+        params: List[Any] = []
+        if chat_id is not None:
+            clause += " AND chat_id = ?"
+            params.append(int(chat_id))
+        with self.connect() as conn:
+            row = conn.execute(
+                f"SELECT COUNT(*) AS n FROM items {clause}", params
+            ).fetchone()
+        return int(row["n"])
+
     def stats(self, chat_id: Optional[int] = None) -> Dict[str, Any]:
         clause = f"WHERE hidden = 0 AND {part_visible_sql()}"
         params: List[Any] = []

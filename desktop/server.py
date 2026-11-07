@@ -14,6 +14,7 @@ import sqlite3
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -78,7 +79,7 @@ log = logging.getLogger("tfe.server")
 
 QUIT = threading.Event()
 COOKIE = "tfe_session"
-APP_VERSION = "2.6.11"
+APP_VERSION = "2.6.13"
 # The Android build extracts the interface next to its writable data and runs
 # the same server there; the desktop EXE keeps using the bundled copy.
 UI_DIR = Path(
@@ -92,6 +93,14 @@ UI_DIR = Path(
 MOBILE = os.environ.get("TFE_MOBILE") == "1"
 NO_UPLOAD = os.environ.get("TFE_NO_UPLOAD") == "1"
 UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+# Background warmer for the local thumbnail cache: it fills thumbs/{id}.thumb
+# while the app is idle, newest items first, so later opens show artwork at
+# once instead of waiting on Telegram. The phone stops after a session cap so
+# a fresh install does not eat mobile data.
+THUMB_WARM_PAGE = 200
+THUMB_WARM_GAP = 0.05
+THUMB_WARM_DELAY = 2.5
+THUMB_WARM_MOBILE_LIMIT = 300
 # API paths that stay reachable while the app is PIN-locked (status, lock
 # control and quit — none of them expose file data).
 LOCK_OPEN_PATHS = {
@@ -112,6 +121,11 @@ UPLOAD_LIMIT = PART_SIZE if MOBILE else SPLIT_HARD_CAP
 # Uploads are RTT-bound (Telegram takes 512 KiB parts), so a few files or
 # volumes can be in flight at once. Stay modest to avoid FloodWait.
 UPLOAD_CONCURRENCY = 4
+# Telethon waits for a reply with no timeout of its own, so one dropped
+# save-part request can leave an upload spinning forever. Stop it when the
+# byte counter has not moved for this long and let the user retry.
+UPLOAD_STALL_SECONDS = 90.0
+UPLOAD_WATCH_INTERVAL = 3.0
 _upload_gate: Optional[asyncio.Semaphore] = None
 
 
@@ -798,6 +812,9 @@ async def lifespan(app: FastAPI):
     state.merge_jobs: Dict[str, Dict[str, Any]] = {}
     state.vault_restore: Dict[str, Any] = {}
     state.vault_saved_at = 0.0
+    state.thumb_warm: Dict[str, Any] = {"state": "idle"}
+    state.thumb_warm_task: Optional[asyncio.Task] = None
+    state.thumb_touch = 0.0
     await state.service.start()
     info = state.service.status()
     if info["authorized"] and info.get("vault"):
@@ -829,9 +846,13 @@ async def lifespan(app: FastAPI):
         # them right away instead of leaving them visible until the next sync.
         _spawn(state, _hide_snapshots_quietly(state))
         _spawn(state, _prime_vaults(state))
+        # Artwork for the newest items is fetched once and kept on disk, so
+        # every later open draws from the cache instead of Telegram.
+        _start_thumb_warm(state)
     try:
         yield
     finally:
+        _stop_thumb_warm(state)
         for task in list(state.tasks):
             task.cancel()
         try:
@@ -989,6 +1010,9 @@ async def status(request: Request):
     payload["mobile"] = MOBILE
     payload["can_upload"] = not NO_UPLOAD
     payload["upload_limit"] = UPLOAD_LIMIT
+    warm = getattr(state, "thumb_warm", None)
+    if isinstance(warm, dict):
+        payload["thumb_cache"] = dict(warm)
     return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
 
@@ -1017,11 +1041,13 @@ async def unlock(body: PinBody, request: Request):
     state = _state(request)
     if not applock.has_pin():
         state.locked = False
+        _start_thumb_warm(state)
         return {"unlocked": True}
     if not applock.verify(body.pin or ""):
         await asyncio.sleep(1.2)
         raise TGError("Wrong PIN.")
     state.locked = False
+    _start_thumb_warm(state)
     return {"unlocked": True}
 
 
@@ -1031,6 +1057,7 @@ async def lock_now(request: Request):
     if not applock.has_pin():
         raise TGError("Set a PIN first (Settings → Security).")
     state.locked = True
+    _stop_thumb_warm(state)
     return {"locked": True}
 
 
@@ -1206,6 +1233,133 @@ def _custom_thumb_ids() -> List[int]:
     except OSError:
         pass
     return ids
+
+
+def _store_thumb(item_id: int, data: bytes) -> None:
+    """Write a thumbnail through a unique temp file so the warmer and a live
+    card request can never interleave into the same cache file."""
+    appconfig.THUMB_DIR.mkdir(parents=True, exist_ok=True)
+    cache = appconfig.THUMB_DIR / f"{item_id}.thumb"
+    handle, name = tempfile.mkstemp(
+        dir=appconfig.THUMB_DIR, prefix=f"{item_id}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(handle, "wb") as fh:
+            fh.write(data)
+        os.replace(name, cache)
+    except BaseException:
+        try:
+            os.unlink(name)
+        except OSError:
+            pass
+        raise
+
+
+def _stop_thumb_warm(state: Any) -> None:
+    task = getattr(state, "thumb_warm_task", None)
+    state.thumb_warm_task = None
+    if task is not None and not task.done():
+        task.cancel()
+    warm = getattr(state, "thumb_warm", None)
+    if isinstance(warm, dict):
+        warm["state"] = "idle"
+
+
+def _start_thumb_warm(state: Any) -> None:
+    _stop_thumb_warm(state)
+    info = state.service.status()
+    if state.locked or not (info.get("authorized") and info.get("vault")):
+        return
+    state.thumb_warm = {
+        "state": "warm",
+        "checked": 0,
+        "cached": 0,
+        "failed": 0,
+        "total": 0,
+    }
+    state.thumb_touch = 0.0
+    state.thumb_warm_task = _spawn(state, _warm_thumbs(state))
+
+
+async def _warm_thumbs(state: Any) -> None:
+    """Fill the local thumbnail cache in the background."""
+    await asyncio.sleep(THUMB_WARM_DELAY)
+    progress = state.thumb_warm
+    try:
+        chat_id = _chat_id(state)
+        if chat_id is None:
+            progress["state"] = "off"
+            return
+        progress["total"] = await run_in_threadpool(
+            state.catalog.thumb_candidate_count, chat_id
+        )
+        budget = THUMB_WARM_MOBILE_LIMIT if MOBILE else None
+        fetched = 0
+        offset = 0
+        while not state.locked and progress["checked"] < progress["total"]:
+            if budget is not None and fetched >= budget:
+                break
+            rows = await run_in_threadpool(
+                state.catalog.thumb_candidates, chat_id, THUMB_WARM_PAGE, offset
+            )
+            if not rows:
+                break
+            offset += len(rows)
+            for row in rows:
+                if state.locked:
+                    return
+                if budget is not None and fetched >= budget:
+                    break
+                item_id = int(row["id"])
+                progress["checked"] += 1
+                if _thumb_cached(item_id):
+                    progress["cached"] += 1
+                    continue
+                # Whatever the user is looking at right now comes first.
+                wait_until = time.time() + 4.0
+                while (
+                    time.time() < wait_until
+                    and time.time() - getattr(state, "thumb_touch", 0.0) < 1.5
+                    and not state.locked
+                ):
+                    await asyncio.sleep(0.4)
+                if _thumb_cached(item_id):
+                    progress["cached"] += 1
+                    continue
+                try:
+                    result = await state.service.thumbnail(row)
+                except TGError:
+                    result = None
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception("Thumbnail warm failed for item %s", item_id)
+                    result = None
+                if not result:
+                    progress["failed"] += 1
+                    continue
+                try:
+                    await run_in_threadpool(_store_thumb, item_id, result[0])
+                except OSError:
+                    progress["failed"] += 1
+                    continue
+                fetched += 1
+                progress["cached"] += 1
+                await asyncio.sleep(THUMB_WARM_GAP)
+        progress["state"] = (
+            "limited" if budget is not None and fetched >= budget else "done"
+        )
+        log.info(
+            "Thumbnail cache warm %s: %d cached, %d unavailable",
+            progress["state"],
+            progress["cached"],
+            progress["failed"],
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        progress["state"] = "error"
+        log.exception("Thumbnail cache warm stopped")
 
 
 def _folders_with_covers(state, chat_id) -> List[Dict[str, Any]]:
@@ -1674,6 +1828,7 @@ async def _after_vault_change(state: Any) -> Dict[str, Any]:
     if chat_id is not None:
         await run_in_threadpool(state.catalog.adopt_unscoped_folders, chat_id)
     _spawn(state, _sync_and_snapshot(state))
+    _start_thumb_warm(state)
     await asyncio.sleep(0)
     info = state.service.status()
     return {
@@ -1877,6 +2032,9 @@ async def _sync_and_snapshot(state, full: bool = False) -> None:
         await _hide_snapshots(state)
     except Exception:
         log.exception("Could not hide vault data snapshots")
+    task = getattr(state, "thumb_warm_task", None)
+    if task is None or task.done():
+        _start_thumb_warm(state)
 
 
 async def _hide_snapshots(state) -> None:
@@ -3352,6 +3510,47 @@ async def _run_uploads(state: Any, entries: List[Dict[str, Any]]) -> None:
     )
 
 
+async def _watch_transfer(transfer: Optional[Dict[str, Any]], action: Any) -> None:
+    """Run an upload and abort it when the byte counter stops moving.
+
+    Telethon awaits the reply to each save-part request with no timeout, so a
+    connection that dies mid-upload leaves the task pending forever: the
+    transfer bar sits still and the file never reaches the vault.
+    """
+    task = asyncio.create_task(action)
+    last_sent = -1
+    last_change = time.time()
+    try:
+        while not task.done():
+            await asyncio.sleep(UPLOAD_WATCH_INTERVAL)
+            if task.done():
+                break
+            if transfer is None or transfer.get("state") != "uploading":
+                # Queued behind other uploads, or still splitting the file.
+                last_sent = -1
+                last_change = time.time()
+                continue
+            sent = int(transfer.get("sent") or 0)
+            if sent != last_sent:
+                last_sent = sent
+                last_change = time.time()
+                continue
+            if time.time() - last_change > UPLOAD_STALL_SECONDS:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                raise TGError(
+                    "The upload stopped making progress and was cancelled. "
+                    "Check your connection and add the file again."
+                )
+        await task
+    finally:
+        if not task.done():
+            task.cancel()
+
+
 async def _run_upload_entry(
     state: Any, entry: Dict[str, Any], gate: asyncio.Semaphore
 ) -> None:
@@ -3383,15 +3582,18 @@ async def _run_upload_entry(
                     async with gate:
                         if transfer is not None and transfer.get("cancel"):
                             raise TransferCancelled()
-                        await state.service.upload_one(
-                            {
-                                **entry,
-                                "path": str(volume),
-                                "name": volume.name,
-                                "part_index": index,
-                                "shared": True,
-                            },
-                            state.catalog,
+                        await _watch_transfer(
+                            transfer,
+                            state.service.upload_one(
+                                {
+                                    **entry,
+                                    "path": str(volume),
+                                    "name": volume.name,
+                                    "part_index": index,
+                                    "shared": True,
+                                },
+                                state.catalog,
+                            ),
                         )
 
                 results = await asyncio.gather(
@@ -3415,7 +3617,9 @@ async def _run_upload_entry(
                 shutil.rmtree(workdir, ignore_errors=True)
         else:
             async with gate:
-                await state.service.upload_one(entry, state.catalog)
+                await _watch_transfer(
+                    transfer, state.service.upload_one(entry, state.catalog)
+                )
     except TransferCancelled:
         if transfer is not None:
             transfer.update(state="cancelled", error=None)
@@ -3694,6 +3898,7 @@ async def merged_download(job_id: str, request: Request):
 @app.get("/api/thumb/{item_id}")
 async def thumb(item_id: int, request: Request):
     state = _state(request)
+    state.thumb_touch = time.time()
     item = await _scoped_item(state, item_id)
     custom = thumbpick.custom_path(item_id)
     if custom.is_file():
@@ -3734,10 +3939,10 @@ async def thumb(item_id: int, request: Request):
     if not result:
         raise HTTPException(status_code=404, detail="No thumbnail.")
     data, media_type = result
-    appconfig.THUMB_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = cache.with_suffix(".tmp")
-    await run_in_threadpool(tmp.write_bytes, data)
-    os.replace(tmp, cache)
+    try:
+        await run_in_threadpool(_store_thumb, item_id, data)
+    except OSError:
+        log.warning("Could not cache thumbnail for item %s", item_id)
     return Response(
         content=data,
         media_type=media_type,
