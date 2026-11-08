@@ -79,7 +79,7 @@ log = logging.getLogger("tfe.server")
 
 QUIT = threading.Event()
 COOKIE = "tfe_session"
-APP_VERSION = "2.6.15"
+APP_VERSION = "2.6.26"
 # The Android build extracts the interface next to its writable data and runs
 # the same server there; the desktop EXE keeps using the bundled copy.
 UI_DIR = Path(
@@ -100,7 +100,10 @@ UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 THUMB_WARM_PAGE = 200
 THUMB_WARM_GAP = 0.05
 THUMB_WARM_DELAY = 2.5
-THUMB_WARM_MOBILE_LIMIT = 300
+# The phone opens its library first and syncs afterwards, so give that sync
+# the link to itself before artwork starts competing with it.
+THUMB_WARM_MOBILE_DELAY = 20.0
+THUMB_WARM_MOBILE_LIMIT = 400
 # API paths that stay reachable while the app is PIN-locked (status, lock
 # control and quit — none of them expose file data).
 LOCK_OPEN_PATHS = {
@@ -126,6 +129,14 @@ UPLOAD_CONCURRENCY = 4
 # byte counter has not moved for this long and let the user retry.
 UPLOAD_STALL_SECONDS = 90.0
 UPLOAD_WATCH_INTERVAL = 3.0
+# A phone on mobile data can need minutes for the ~45 MB snapshot, and
+# cancelling it midway would abort the upload without saving the marker.
+VAULT_SAVE_TIMEOUT = 600.0
+# The snapshot restore blocks the server from listening, so a stalled
+# Telegram download must not keep the app on its starting overlay forever.
+# A normal mobile restore takes about five minutes; after this the library
+# opens from local data and the next launch retries the restore.
+VAULT_RESTORE_TIMEOUT = 540.0
 _upload_gate: Optional[asyncio.Semaphore] = None
 
 
@@ -808,21 +819,44 @@ async def lifespan(app: FastAPI):
     state.merge_jobs: Dict[str, Dict[str, Any]] = {}
     state.vault_restore: Dict[str, Any] = {}
     state.vault_saved_at = 0.0
+    state.login_restored = False
     state.thumb_warm: Dict[str, Any] = {"state": "idle"}
     state.thumb_warm_task: Optional[asyncio.Task] = None
     state.thumb_touch = 0.0
+    state.vault_saving = False
+    state.session_pin = ""
     await state.service.start()
     info = state.service.status()
-    if info["authorized"] and info.get("vault"):
+    restore_pending = bool(info["authorized"] and info.get("vault"))
+    # The phone can show its local library and lock screen at once, then pull
+    # a newer snapshot in the background: the snapshot is a ~45 MB download
+    # that used to hold the starting overlay for minutes. A device with no
+    # local PIN or library still waits, because the snapshot may be the only
+    # copy of both.
+    background = (
+        restore_pending
+        and MOBILE
+        and applock.has_pin()
+        and appconfig.LIBRARY_PATH.exists()
+    )
+    if restore_pending and not background:
         try:
-            state.vault_restore = await vaultstore.restore(state.service)
+            state.vault_restore = await asyncio.wait_for(
+                vaultstore.restore(state.service), timeout=VAULT_RESTORE_TIMEOUT
+            )
             if state.vault_restore.get("restored"):
                 log.info(
                     "Library restored from the vault (%s)",
                     state.vault_restore.get("stamp"),
                 )
+        except asyncio.TimeoutError:
+            log.error(
+                "Vault data restore took too long; using the local library"
+            )
         except Exception:
             log.exception("Vault data restore failed; using the local library")
+    elif background:
+        state.vault_restore = {"state": "pending"}
     # After restore: a PIN that arrived with the vault snapshot must lock the
     # app on this boot too.
     state.locked = applock.has_pin()
@@ -838,6 +872,8 @@ async def lifespan(app: FastAPI):
     )
     if marked:
         log.info("Kept %d custom thumbnail(s) visible", marked)
+    if background:
+        _spawn(state, _restore_in_background(state))
     info = state.service.status()
     if info["authorized"] and info.get("vault"):
         # Snapshot zips uploaded since the last sync are indexed on boot; hide
@@ -845,8 +881,10 @@ async def lifespan(app: FastAPI):
         _spawn(state, _hide_snapshots_quietly(state))
         _spawn(state, _prime_vaults(state))
         # Artwork for the newest items is fetched once and kept on disk, so
-        # every later open draws from the cache instead of Telegram.
-        _start_thumb_warm(state)
+        # every later open draws from the cache instead of Telegram. A phone
+        # restoring in the background starts the warmer itself when done.
+        if not background:
+            _start_thumb_warm(state)
     try:
         yield
     finally:
@@ -863,7 +901,7 @@ async def lifespan(app: FastAPI):
             # in the vault, so the shutdown path must not upload it twice.
             if not state.vault_saved_at:
                 try:
-                    await asyncio.wait_for(vaultstore.save(state.service), timeout=120.0)
+                    await asyncio.wait_for(vaultstore.save(state.service), timeout=VAULT_SAVE_TIMEOUT)
                 except Exception:
                     log.exception("Vault data save on close failed")
         await state.service.close()
@@ -1011,6 +1049,9 @@ async def status(request: Request):
     warm = getattr(state, "thumb_warm", None)
     if isinstance(warm, dict):
         payload["thumb_cache"] = dict(warm)
+    restore = getattr(state, "vault_restore", None)
+    if isinstance(restore, dict):
+        payload["vault_restore"] = dict(restore)
     return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
 
@@ -1039,6 +1080,7 @@ async def unlock(body: PinBody, request: Request):
     state = _state(request)
     if not applock.has_pin():
         state.locked = False
+        state.session_pin = ""
         thumbcrypt.unlock("")
         _start_thumb_warm(state)
         _spawn(state, _migrate_previews())
@@ -1047,6 +1089,7 @@ async def unlock(body: PinBody, request: Request):
         await asyncio.sleep(1.2)
         raise TGError("Wrong PIN.")
     state.locked = False
+    state.session_pin = body.pin or ""
     thumbcrypt.unlock(body.pin or "")
     _start_thumb_warm(state)
     _spawn(state, _migrate_previews())
@@ -1059,13 +1102,14 @@ async def lock_now(request: Request):
     if not applock.has_pin():
         raise TGError("Set a PIN first (Settings → Security).")
     state.locked = True
+    state.session_pin = ""
     thumbcrypt.lock()
     _stop_thumb_warm(state)
     return {"locked": True}
 
 
 # ------------------------------------------------------------------- cache
-CACHE_DIRS = ("stream", "thumbpicks", "inspect", "external", "reupload", "merge", "uploads")
+CACHE_DIRS = ("stream", "thumbpicks", "inspect", "external", "reupload", "merge", "uploads", "docpdf")
 REGENERATED_THUMB_DIRS = ("storyboards", "movies")
 
 
@@ -1168,6 +1212,7 @@ async def pin_remove(body: PinBody, request: Request):
     applock.clear_pin()
     thumbcrypt.clear_pin()
     state.locked = False
+    state.session_pin = ""
     return {"pin_set": False}
 
 
@@ -1281,7 +1326,7 @@ def _start_thumb_warm(state: Any) -> None:
 
 async def _warm_thumbs(state: Any) -> None:
     """Fill the local thumbnail cache in the background."""
-    await asyncio.sleep(THUMB_WARM_DELAY)
+    await asyncio.sleep(THUMB_WARM_MOBILE_DELAY if MOBILE else THUMB_WARM_DELAY)
     progress = state.thumb_warm
     try:
         chat_id = _chat_id(state)
@@ -1321,6 +1366,9 @@ async def _warm_thumbs(state: Any) -> None:
                     and not state.locked
                 ):
                     await asyncio.sleep(0.4)
+                while getattr(state, "vault_saving", False) and not state.locked:
+                    # A snapshot upload shares this link; artwork can wait.
+                    await asyncio.sleep(1.5)
                 if _thumb_cached(item_id):
                     progress["cached"] += 1
                     continue
@@ -1768,13 +1816,19 @@ async def setup(body: SetupBody, request: Request):
 @app.post("/api/login/qr/start")
 async def login_qr_start(request: Request):
     state = _state(request)
+    state.login_restored = False
     return await state.service.start_qr()
 
 
 @app.get("/api/login/qr")
 async def login_qr_state(request: Request):
     state = _state(request)
-    return state.service.qr_payload()
+    payload = state.service.qr_payload()
+    if payload.get("authorized") and not getattr(state, "login_restored", False):
+        state.login_restored = True
+        await _restore_for_mobile(state)
+        payload = state.service.qr_payload()
+    return payload
 
 
 @app.post("/api/login/qr/cancel")
@@ -1783,12 +1837,96 @@ async def login_qr_cancel(request: Request):
     return await state.service.cancel_qr()
 
 
+def _settle_lock_after_restore(state: Any) -> None:
+    """Keep an unlocked session unlocked when the snapshot shares its PIN.
+
+    A snapshot carries its own PIN hash and thumbnail key. Re-locking on every
+    background restore would drop the user on the lock screen mid-browse, so
+    re-unwrap the restored key with the PIN this session already proved. When
+    the vault holds a different PIN, the app locks and that PIN wins instead.
+    """
+    if not applock.has_pin():
+        state.locked = False
+        state.session_pin = ""
+        thumbcrypt.unlock("")
+        return
+    pin = "" if state.locked else (getattr(state, "session_pin", "") or "")
+    if pin and applock.verify(pin):
+        thumbcrypt.unlock(pin)
+        return
+    state.locked = True
+    state.session_pin = ""
+    thumbcrypt.lock()
+
+
+async def _restore_in_background(state: Any) -> None:
+    """Pull a newer vault snapshot while the phone UI is already usable."""
+    state.vault_restore = {"state": "running", "started": time.time()}
+    try:
+        result = await asyncio.wait_for(
+            vaultstore.restore(state.service), timeout=VAULT_RESTORE_TIMEOUT
+        )
+        state.vault_restore = {"state": "done", **result}
+        if result.get("restored"):
+            catalog = getattr(state, "catalog", None)
+            if catalog is not None:
+                catalog.invalidate()
+            log.info(
+                "Library restored from the vault in the background (%s)",
+                result.get("stamp"),
+            )
+        _settle_lock_after_restore(state)
+    except asyncio.TimeoutError:
+        state.vault_restore = {
+            "state": "done",
+            "restored": False,
+            "reason": "timeout",
+        }
+        log.error("Background vault restore took too long; keeping the local library")
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        state.vault_restore = {
+            "state": "done",
+            "restored": False,
+            "reason": str(exc),
+        }
+        log.exception("Background vault restore failed; keeping the local library")
+    _start_thumb_warm(state)
+
+
+async def _restore_for_mobile(state: Any, timeout: float = 180.0) -> None:
+    """Give a phone that just signed in the vault's library instead of a
+    freshly scanned, annotation-free index."""
+    if not vaultstore.IS_MOBILE:
+        return
+    info = state.service.status()
+    if not (info.get("authorized") and info.get("vault")):
+        return
+    try:
+        result = await asyncio.wait_for(
+            vaultstore.restore(state.service), timeout=timeout
+        )
+        if result.get("restored"):
+            state.vault_restore = {"state": "done", **result}
+            catalog = getattr(state, "catalog", None)
+            if catalog is not None:
+                catalog.invalidate()
+            _settle_lock_after_restore(state)
+            log.info(
+                "Library restored after sign-in (%s)", result.get("stamp")
+            )
+    except Exception:
+        log.exception("Vault restore after sign-in failed; keeping the local library")
+
+
 @app.post("/api/vault")
 async def set_vault(body: VaultBody, request: Request):
     state = _state(request)
     if not body.vault.strip():
         raise TGError("Choose a channel first.")
     await state.service.set_vault(body.vault)
+    await _restore_for_mobile(state)
     return state.service.status()
 
 
@@ -1799,7 +1937,11 @@ async def save_vault(request: Request):
     info = state.service.status()
     if not (info["authorized"] and info.get("vault")):
         return {"saved": False, "reason": "no vault"}
-    result = await asyncio.wait_for(vaultstore.save(state.service), timeout=120.0)
+    state.vault_saving = True
+    try:
+        result = await asyncio.wait_for(vaultstore.save(state.service), timeout=VAULT_SAVE_TIMEOUT)
+    finally:
+        state.vault_saving = False
     if result.get("saved"):
         state.vault_saved_at = time.time()
     return result
@@ -1899,13 +2041,21 @@ async def login_send_code(body: PhoneBody, request: Request):
 @app.post("/api/login/code")
 async def login_code(body: CodeBody, request: Request):
     state = _state(request)
-    return await state.service.verify_code(body.code)
+    result = await state.service.verify_code(body.code)
+    if result.get("authorized"):
+        await _restore_for_mobile(state)
+        result = state.service.status()
+    return result
 
 
 @app.post("/api/login/password")
 async def login_password(body: PasswordBody, request: Request):
     state = _state(request)
-    return await state.service.verify_password(body.password)
+    result = await state.service.verify_password(body.password)
+    if result.get("authorized"):
+        await _restore_for_mobile(state)
+        result = state.service.status()
+    return result
 
 
 @app.post("/api/logout")
@@ -1919,7 +2069,7 @@ async def logout(request: Request):
         try:
             # Same vault snapshot the app writes on close: sign-out must not
             # lose names, folders, tags, covers or settings.
-            await asyncio.wait_for(vaultstore.save(service), timeout=120.0)
+            await asyncio.wait_for(vaultstore.save(service), timeout=VAULT_SAVE_TIMEOUT)
         except Exception as exc:
             log.exception("Vault snapshot before sign-out failed")
             raise HTTPException(
@@ -1951,7 +2101,7 @@ async def quit_app(request: Request):
         # The process exits as soon as the window closes, so the snapshot has
         # to be uploaded while the API call is still waiting, not on shutdown.
         try:
-            result = await asyncio.wait_for(vaultstore.save(state.service), timeout=120.0)
+            result = await asyncio.wait_for(vaultstore.save(state.service), timeout=VAULT_SAVE_TIMEOUT)
             if result.get("saved"):
                 state.vault_saved_at = time.time()
         except Exception:
@@ -4053,7 +4203,9 @@ async def _serve_media(
     async def body() -> AsyncIterator[bytes]:
         sent = 0
         if can_cache:
-            if not full and not preview:
+            if not preview:
+                # Readers ask for small ranges one at a time; warming past the
+                # newest range is what turns the second open into a local read.
                 streamcache.warm(
                     state.service, message, cache_key, start, length, size
                 )

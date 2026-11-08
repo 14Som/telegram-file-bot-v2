@@ -115,6 +115,10 @@ VAULT_ABOUT = (
     f"{VAULT_MARKER}. Files stay in this channel; the app keeps an index on "
     "your PC and a copy of the index here."
 )
+# A rescan walks the dialog list and inspects unknown channels. Telethon waits
+# on a stalled request with no timeout of its own, so cap the whole scan and
+# fall back to the known vaults instead of holding the vault list forever.
+VAULT_SCAN_TIMEOUT = 45.0
 ACTIVE_TRANSFER_STATES = {
     "queued",
     "uploading",
@@ -908,7 +912,7 @@ class TelegramService:
             return None
 
     async def list_vaults(self, refresh: bool = False) -> List[Dict[str, Any]]:
-        """Return every known storage channel, scanning Telegram when needed."""
+        """Return every known storage channel, scanning Telegram when asked."""
         client = self._require_client()
         if not self._authorized:
             raise TGError("Log in first.")
@@ -919,6 +923,11 @@ class TelegramService:
             and now - self._vaults_cache_at < 120
         ):
             return self._flagged_vaults(self._vaults_cache)
+        if not refresh and self._vault_registry:
+            # The registry travels inside the library snapshot, so the known
+            # list is enough to switch vaults. Never make the switcher wait on
+            # a Telegram scan that a slow connection can stall for minutes.
+            return self._publish_vaults([dict(entry) for entry in self._vault_registry])
         async with self._vaults_lock:
             if (
                 not refresh
@@ -937,39 +946,45 @@ class TelegramService:
                     "icon": self._vault.get("icon") or "",
                 }
             try:
-                await self._scan_vaults(client, merged)
+                await asyncio.wait_for(
+                    self._scan_vaults(client, merged), timeout=VAULT_SCAN_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                log.warning("Vault scan did not finish in time; using known vaults")
             except Exception as exc:
                 if not merged:
                     raise TGError(friendly_error(exc))
                 log.warning("Vault scan incomplete: %s", friendly_error(exc))
-            # Every vault gets a distinct icon the first time it is seen.
-            taken = {
-                entry["icon"]
-                for entry in merged.values()
-                if entry.get("icon") in appconfig.VAULT_ICONS
-            }
-            for entry in merged.values():
-                if entry.get("icon") not in appconfig.VAULT_ICONS:
-                    entry["icon"] = appconfig.pick_vault_icon(taken)
-                    taken.add(entry["icon"])
-            active_id = str((self._vault or {}).get("id") or "")
-            entries = list(merged.values())
-            entries.sort(
-                key=lambda entry: (
-                    entry["id"] != active_id,
-                    entry["title"].casefold(),
-                )
+            return self._publish_vaults(list(merged.values()))
+
+    def _publish_vaults(self, entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        # Every vault gets a distinct icon the first time it is seen.
+        taken = {
+            entry["icon"]
+            for entry in entries
+            if entry.get("icon") in appconfig.VAULT_ICONS
+        }
+        for entry in entries:
+            if entry.get("icon") not in appconfig.VAULT_ICONS:
+                entry["icon"] = appconfig.pick_vault_icon(taken)
+                taken.add(entry["icon"])
+        active_id = str((self._vault or {}).get("id") or "")
+        entries.sort(
+            key=lambda entry: (
+                entry["id"] != active_id,
+                entry["title"].casefold(),
             )
-            self._vault_registry = entries[: appconfig.VAULT_LIMIT]
-            try:
-                appconfig.save_settings(
-                    {"vaults": json.dumps(self._vault_registry)}
-                )
-            except OSError:
-                pass
-            self._vaults_cache = [dict(entry) for entry in self._vault_registry]
-            self._vaults_cache_at = time.time()
-            return self._flagged_vaults(self._vault_registry)
+        )
+        self._vault_registry = entries[: appconfig.VAULT_LIMIT]
+        try:
+            appconfig.save_settings(
+                {"vaults": json.dumps(self._vault_registry)}
+            )
+        except OSError:
+            pass
+        self._vaults_cache = [dict(entry) for entry in self._vault_registry]
+        self._vaults_cache_at = time.time()
+        return self._flagged_vaults(self._vault_registry)
 
     async def _scan_vaults(
         self, client: TelegramClient, found: Dict[str, Dict[str, str]]

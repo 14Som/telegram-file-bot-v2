@@ -14,8 +14,10 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.Insets;
+import android.media.MediaMetadataRetriever;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -24,11 +26,15 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
 import android.database.Cursor;
+import android.util.Base64;
 import android.util.Log;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.Window;
 import android.view.WindowInsets;
+import android.view.WindowInsetsController;
+import android.view.WindowManager;
 import android.webkit.CookieManager;
 import android.webkit.DownloadListener;
 import android.webkit.JavascriptInterface;
@@ -81,7 +87,10 @@ public class MainActivity extends Activity {
     private static final String TAG = "TFE";
     private static final String HOST = "127.0.0.1";
     private static final int PORT = 8737;
-    private static final int START_TIMEOUT_MS = 60_000;
+    // The first launch after the other device saved has to fetch the whole
+    // vault snapshot (~45 MB) before the server answers, so this covers a
+    // slow restore instead of failing the start halfway through.
+    private static final int START_TIMEOUT_MS = 300_000;
     private static final int STORAGE_REQUEST = 7001;
     private static final int NOTIFICATION_REQUEST = 7002;
     private static final int FILE_CHOOSER_REQUEST = 7003;
@@ -109,6 +118,8 @@ public class MainActivity extends Activity {
     private boolean backendStarting = false;
     private boolean pageLoaded = false;
     private int failedStarts = 0;
+    private int insetTop = 0;
+    private int insetBottom = 0;
 
     private BroadcastReceiver downloadReceiver;
     private ValueCallback<Uri[]> fileChooserCallback;
@@ -116,11 +127,37 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        enableEdgeToEdge();
         buildContentView();
         configureWebView();
         restoreTrackedDownloads();
         registerDownloadReceiver();
         startBackend();
+    }
+
+    /** Let the page paint behind the status and navigation bars. */
+    private void enableEdgeToEdge() {
+        Window window = getWindow();
+        if (Build.VERSION.SDK_INT >= 30) {
+            window.setDecorFitsSystemWindows(false);
+        } else {
+            window.getDecorView().setSystemUiVisibility(
+                    View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                            | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                            | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
+        }
+        if (Build.VERSION.SDK_INT >= 29) {
+            window.setStatusBarContrastEnforced(false);
+            window.setNavigationBarContrastEnforced(false);
+        }
+        if (Build.VERSION.SDK_INT >= 28) {
+            WindowManager.LayoutParams attributes = window.getAttributes();
+            attributes.layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+            window.setAttributes(attributes);
+        }
+        window.setStatusBarColor(Color.TRANSPARENT);
+        window.setNavigationBarColor(Color.TRANSPARENT);
     }
 
     /* --------------------------------------------------------------- layout */
@@ -195,13 +232,20 @@ public class MainActivity extends Activity {
             int bottom;
             if (Build.VERSION.SDK_INT >= 30) {
                 Insets bars = insets.getInsets(WindowInsets.Type.systemBars());
-                top = bars.top;
-                bottom = bars.bottom;
+                Insets cutout = insets.getInsets(WindowInsets.Type.displayCutout());
+                top = Math.max(bars.top, cutout.top);
+                bottom = Math.max(bars.bottom, cutout.bottom);
             } else {
-                top = insets.getSystemWindowInsetTop();
-                bottom = insets.getSystemWindowInsetBottom();
+                top = Math.max(insets.getSystemWindowInsetTop(), insets.getStableInsetTop());
+                bottom = Math.max(insets.getSystemWindowInsetBottom(),
+                        insets.getStableInsetBottom());
             }
-            view.setPadding(0, top, 0, bottom);
+            if (top != insetTop || bottom != insetBottom) {
+                insetTop = top;
+                insetBottom = bottom;
+                overlay.setPadding(dp(32), dp(32) + top, dp(32), dp(32) + bottom);
+                pushInsetsToPage();
+            }
             return insets;
         });
 
@@ -288,6 +332,7 @@ public class MainActivity extends Activity {
             @Override
             public void onPageFinished(WebView view, String url) {
                 pageLoaded = true;
+                pushInsetsToPage();
                 hideOverlay();
             }
 
@@ -342,7 +387,7 @@ public class MainActivity extends Activity {
         backendStarting = true;
         main.postDelayed(() -> {
             if (backendStarting && !pageLoaded) {
-                setOverlayState("Connecting to Telegram…", true);
+                setOverlayState("Syncing the library… this can take a few minutes.", true);
             }
         }, 12_000);
         worker.execute(() -> {
@@ -463,6 +508,44 @@ public class MainActivity extends Activity {
 
     private void hideOverlay() {
         overlay.setVisibility(View.GONE);
+    }
+
+    private void pushInsetsToPage() {
+        if (webView == null || !pageLoaded) {
+            return;
+        }
+        // Window insets are device pixels; the page works in CSS pixels.
+        float density = getResources().getDisplayMetrics().density;
+        int cssTop = Math.round(insetTop / density);
+        int cssBottom = Math.round(insetBottom / density);
+        String script = "document.documentElement.style.setProperty('--safe-top','"
+                + cssTop + "px');document.documentElement.style.setProperty('--safe-bottom','"
+                + cssBottom + "px');";
+        webView.evaluateJavascript(script, null);
+    }
+
+    /** Light icons on dark pages, dark icons on light pages. */
+    private void applyBarIcons(boolean dark) {
+        if (Build.VERSION.SDK_INT >= 30) {
+            WindowInsetsController controller = getWindow().getInsetsController();
+            if (controller == null) {
+                return;
+            }
+            int mask = WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS
+                    | WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS;
+            controller.setSystemBarsAppearance(dark ? 0 : mask, mask);
+        } else {
+            int flags = getWindow().getDecorView().getSystemUiVisibility();
+            if (Build.VERSION.SDK_INT >= 23) {
+                flags = dark ? flags & ~View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
+                        : flags | View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+            }
+            if (Build.VERSION.SDK_INT >= 26) {
+                flags = dark ? flags & ~View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+                        : flags | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
+            }
+            getWindow().getDecorView().setSystemUiVisibility(flags);
+        }
     }
 
     /* ------------------------------------------------------------------ ui/ */
@@ -644,8 +727,112 @@ public class MainActivity extends Activity {
         }
 
         @JavascriptInterface
+        public boolean copyText(String text) {
+            if (text == null) {
+                return false;
+            }
+            try {
+                final android.content.ClipboardManager clipboard =
+                        (android.content.ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+                if (clipboard == null) {
+                    return false;
+                }
+                clipboard.setPrimaryClip(
+                        android.content.ClipData.newPlainText("Telegram File Explorer", text));
+                return true;
+            } catch (Exception error) {
+                Log.e(TAG, "copyText failed", error);
+                return false;
+            }
+        }
+
+        @JavascriptInterface
         public String versionName() {
             return BuildConfig.VERSION_NAME;
+        }
+
+        @JavascriptInterface
+        public String frameAt(String url, long timeMs) {
+            if (url == null || url.isEmpty()) {
+                return "";
+            }
+            String absolute = url.startsWith("/")
+                    ? "http://" + HOST + ":" + PORT + url
+                    : url;
+            MediaMetadataRetriever retriever = new MediaMetadataRetriever();
+            try {
+                java.util.Map<String, String> headers = new java.util.HashMap<>();
+                String cookie = CookieManager.getInstance().getCookie(absolute);
+                if (cookie != null && !cookie.isEmpty()) {
+                    headers.put("Cookie", cookie);
+                }
+                retriever.setDataSource(absolute, headers);
+                Bitmap frame = retriever.getFrameAtTime(
+                        Math.max(0L, timeMs) * 1000L,
+                        MediaMetadataRetriever.OPTION_CLOSEST_SYNC);
+                if (frame == null) {
+                    return "";
+                }
+                if (frame.getWidth() > 640) {
+                    int height = Math.max(
+                            1, Math.round(frame.getHeight() * 640f / frame.getWidth()));
+                    Bitmap scaled = Bitmap.createScaledBitmap(frame, 640, height, true);
+                    if (scaled != frame) {
+                        frame.recycle();
+                        frame = scaled;
+                    }
+                }
+                java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+                frame.compress(Bitmap.CompressFormat.JPEG, 78, out);
+                frame.recycle();
+                return "data:image/jpeg;base64," + Base64.encodeToString(
+                        out.toByteArray(), Base64.NO_WRAP);
+            } catch (Exception error) {
+                Log.e(TAG, "frameAt failed", error);
+                return "";
+            } finally {
+                try {
+                    retriever.release();
+                } catch (Exception ignored) {
+                    // Already released.
+                }
+            }
+        }
+
+        @JavascriptInterface
+        public long durationOf(String url) {
+            if (url == null || url.isEmpty()) {
+                return 0L;
+            }
+            String absolute = url.startsWith("/")
+                    ? "http://" + HOST + ":" + PORT + url
+                    : url;
+            MediaMetadataRetriever retriever = new MediaMetadataRetriever();
+            try {
+                java.util.Map<String, String> headers = new java.util.HashMap<>();
+                String cookie = CookieManager.getInstance().getCookie(absolute);
+                if (cookie != null && !cookie.isEmpty()) {
+                    headers.put("Cookie", cookie);
+                }
+                retriever.setDataSource(absolute, headers);
+                String value = retriever.extractMetadata(
+                        MediaMetadataRetriever.METADATA_KEY_DURATION);
+                return value == null ? 0L : Long.parseLong(value.trim());
+            } catch (Exception error) {
+                Log.e(TAG, "durationOf failed", error);
+                return 0L;
+            } finally {
+                try {
+                    retriever.release();
+                } catch (Exception ignored) {
+                    // Already released.
+                }
+            }
+        }
+
+        @JavascriptInterface
+        public void setDarkMode(final boolean dark) {
+            main.post(() -> applyBarIcons(dark));
         }
 
         @JavascriptInterface

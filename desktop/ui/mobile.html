@@ -2,12 +2,21 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
   <meta name="color-scheme" content="light dark">
-  <meta name="theme-color" content="#0b84ff">
+  <meta name="theme-color" content="#ffffff" id="themeMeta">
   <title>Telegram File Explorer</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/static/mobile.css?v=9">
+  <link rel="stylesheet" href="/static/mobile.css?v=17">
+  <link rel="stylesheet" href="/static/vendor/viewerjs/viewer.min.css">
+  <script>
+    (function () {
+      try {
+        var theme = localStorage.getItem("tfe_theme") || "system";
+        document.documentElement.dataset.theme = theme;
+      } catch (_) { /* storage blocked */ }
+    })();
+  </script>
 </head>
 <body>
   <div class="screen boot" id="bootScreen">
@@ -21,8 +30,17 @@
     <img class="logo" src="/favicon.svg" alt="">
     <h1>App locked</h1>
     <p class="muted">Enter your PIN to open the library.</p>
+    <button class="pin-vault" id="pinVault" type="button" hidden>
+      <span class="pin-vault-icon" id="pinVaultIcon"></span>
+      <span class="pin-vault-copy">
+        <small>Storage vault</small>
+        <strong id="pinVaultName">Choose a vault</strong>
+      </span>
+      <span class="pin-vault-chev" id="pinVaultChev"></span>
+    </button>
     <div class="pin-dots" id="pinDots" aria-live="polite"></div>
     <p class="form-error" id="pinError"></p>
+    <p class="muted small" id="pinNote" hidden></p>
     <div class="pin-pad" id="pinPad">
       <button type="button" data-key="1">1</button>
       <button type="button" data-key="2">2</button>
@@ -37,6 +55,7 @@
       <button type="button" data-key="0">0</button>
       <button type="button" class="back" data-key="back" aria-label="Delete digit"></button>
     </div>
+    <button class="text-btn pin-forgot" id="pinForgot" type="button">Forgot PIN?</button>
   </div>
 
   <div class="screen auth" id="authScreen" hidden>
@@ -98,15 +117,16 @@
 
   <div id="main" hidden>
     <header class="topbar" id="mainTopbar">
-      <img class="topbar-logo" src="/favicon.svg" alt="">
+      <button class="icon-btn" id="backBtn" type="button" aria-label="Back" hidden></button>
+      <img class="topbar-logo" id="topLogo" src="/favicon.svg" alt="">
       <div class="topbar-title">
         <strong id="topTitle">All files</strong>
         <small id="topSub"></small>
       </div>
+      <button class="icon-btn" id="viewBtn" type="button" aria-label="Switch between grid and list"></button>
       <button class="icon-btn" id="searchBtn" type="button" aria-label="Search"></button>
-      <button class="icon-btn" id="syncBtn" type="button" aria-label="Sync with Telegram"></button>
       <button class="icon-btn" id="selectBtn" type="button" aria-label="Select files"></button>
-      <button class="icon-btn" id="lockBtn" type="button" aria-label="Lock app" title="Lock app" hidden></button>
+      <button class="icon-btn" id="menuBtn" type="button" aria-label="More actions"></button>
     </header>
     <header class="topbar select-topbar" id="selectTopbar" hidden>
       <button class="icon-btn" id="selectCancel" type="button" aria-label="Cancel selection"></button>
@@ -132,6 +152,7 @@
     <div class="load-more" id="loadMore" hidden><div class="spinner small"></div></div>
     <div class="select-actions" id="selectActions" hidden>
       <button class="btn primary" id="selectDownload" type="button">Download</button>
+      <button class="btn ghost" id="selectMore" type="button">More</button>
     </div>
 
     <section class="dlbar" id="dlBar" hidden aria-label="Downloads">
@@ -191,8 +212,9 @@
   <script src="/static/vendor/marked/marked.umd.js"></script>
   <script src="/static/vendor/dompurify/purify.min.js"></script>
   <script src="/static/vendor/mammoth/mammoth.browser.min.js"></script>
+  <script src="/static/vendor/viewerjs/viewer.min.js"></script>
   <script src="/static/viewer3d.js?v=4"></script>
-  <script src="/static/reader.js?v=23"></script>
-  <script src="/static/mobile.js?v=15"></script>
+  <script src="/static/reader.js?v=24"></script>
+  <script src="/static/mobile.js?v=27"></script>
 </body>
 </html>

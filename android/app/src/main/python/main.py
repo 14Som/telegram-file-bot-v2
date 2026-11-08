@@ -8,12 +8,15 @@ import socket
 import threading
 import time
 
-log = logging.getLogger("tfe.android")
-if not log.handlers:
+# One stream for everything under tfe.* so vault restore and save decisions
+# are visible in logcat; without it those loggers have no handler at all.
+_tfe = logging.getLogger("tfe")
+if not any(isinstance(h, logging.StreamHandler) for h in _tfe.handlers):
     _handler = logging.StreamHandler()
     _handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
-    log.addHandler(_handler)
-    log.setLevel(logging.INFO)
+    _tfe.addHandler(_handler)
+    _tfe.setLevel(logging.INFO)
+log = logging.getLogger("tfe.android")
 
 _server = None
 _thread = None
@@ -73,7 +76,16 @@ def start(home: str, ui_dir: str, port: int) -> bool:
                 # before opening the Telegram session again in this
                 # interpreter.
                 log.info("Waiting for the previous local server to stop")
-            previous_thread.join(timeout=60)
+            # Reopening the app right after closing it is normal; the close
+            # save can take minutes on mobile data, so keep waiting instead
+            # of reporting a failed start while it is still uploading.
+            deadline = time.time() + 600
+            note = time.time() + 20
+            while previous_thread.is_alive() and time.time() < deadline:
+                if time.time() >= note:
+                    log.info("Still waiting for the previous local server to stop")
+                    note = time.time() + 20
+                time.sleep(0.25)
             if previous_thread.is_alive():
                 log.error("The previous local server is still shutting down")
                 return False
@@ -113,8 +125,11 @@ def start(home: str, ui_dir: str, port: int) -> bool:
         )
         _thread.start()
         thread = _thread
-    # Telegram may need a while to reconnect after a close/reopen cycle.
-    deadline = time.time() + 180
+    # Telegram may need a while to reconnect after a close/reopen cycle, and
+    # the first launch after the other device saved restores the whole vault
+    # snapshot before the port opens. Give a slow phone network room instead
+    # of reporting a failed start while the server is still coming up.
+    deadline = time.time() + 600
     while time.time() < deadline:
         if _listening(port):
             log.info("Local server is listening on port %s", port)

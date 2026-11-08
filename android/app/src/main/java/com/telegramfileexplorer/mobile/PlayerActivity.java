@@ -141,6 +141,7 @@ public class PlayerActivity extends Activity implements MediaPlayer.EventListene
     private boolean controlsVisible = true;
 
     private final Runnable hideControls = () -> setControlsVisible(false);
+    private final Runnable hideSkipHint = this::hideHint;
     private final Runnable saveTick = new Runnable() {
         @Override
         public void run() {
@@ -415,6 +416,10 @@ public class PlayerActivity extends Activity implements MediaPlayer.EventListene
         timeView.setText("0:00");
         seekRow.addView(timeView);
 
+        TextView back10 = barButton("−10s", "Rewind 10 seconds");
+        back10.setOnClickListener(v -> skipBy(-10_000));
+        seekRow.addView(back10);
+
         seekBar = new SeekBar(this);
         LinearLayout.LayoutParams seekParams = new LinearLayout.LayoutParams(
                 0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
@@ -449,6 +454,10 @@ public class PlayerActivity extends Activity implements MediaPlayer.EventListene
         durationView.setTextSize(13);
         durationView.setText("0:00");
         seekRow.addView(durationView);
+
+        TextView fwd10 = barButton("+10s", "Forward 10 seconds");
+        fwd10.setOnClickListener(v -> skipBy(10_000));
+        seekRow.addView(fwd10);
 
         LinearLayout buttons = new LinearLayout(this);
         buttons.setOrientation(LinearLayout.HORIZONTAL);
@@ -605,6 +614,25 @@ public class PlayerActivity extends Activity implements MediaPlayer.EventListene
         } else {
             player.play();
         }
+        showControls();
+    }
+
+    private void skipBy(long deltaMs) {
+        if (player == null) {
+            return;
+        }
+        long length = player.getLength();
+        long target = Math.max(0, player.getTime() + deltaMs);
+        if (length > 0) {
+            target = Math.min(target, Math.max(0, length - 1000));
+        }
+        player.setTime(target, true);
+        showHint((deltaMs < 0 ? "−10 s" : "+10 s") + "  ·  " + formatTime(target));
+        main.removeCallbacks(hideSkipHint);
+        main.postDelayed(hideSkipHint, 1100);
+        seekPreviewMs = -1;
+        seekBar.setProgress((int) Math.min(target, Integer.MAX_VALUE));
+        timeView.setText(formatTime(target));
         showControls();
     }
 
@@ -1450,7 +1478,14 @@ public class PlayerActivity extends Activity implements MediaPlayer.EventListene
                     if (pendingSingleTap != null) {
                         main.removeCallbacks(pendingSingleTap);
                         pendingSingleTap = null;
-                        togglePlayPause();
+                        float width = Math.max(1f, videoLayout.getWidth());
+                        if (event.getX() < width * 0.3f) {
+                            skipBy(-10_000);
+                        } else if (event.getX() > width * 0.7f) {
+                            skipBy(10_000);
+                        } else {
+                            togglePlayPause();
+                        }
                     } else {
                         pendingSingleTap = () -> {
                             pendingSingleTap = null;

@@ -41,7 +41,11 @@ const ICONS = {
   cube: '<path d="m12 3 8 4.5v9L12 21l-8-4.5v-9z"/><path d="m4 7.5 8 4.5 8-4.5M12 12v9"/>',
   external: '<path d="M14 4h6v6"/><path d="M20 4 11 13"/><path d="M9 5H5v14h14v-4"/>',
   select: '<rect x="4" y="4" width="16" height="16" rx="4"/><path d="m8 12 3 3 5-6"/>',
-  check: '<path d="m5 13 4 4L19 7"/>'
+  check: '<path d="m5 13 4 4L19 7"/>',
+  list: '<path d="M9 6h11M9 12h11M9 18h11"/><path d="M4 6h.01M4 12h.01M4 18h.01"/>',
+  down: '<path d="m6 9 6 6 6-6"/>',
+  brush: '<path d="M14 4l6 6-7.5 7.5a3 3 0 0 1-4.2 0l-1.8-1.8a3 3 0 0 1 0-4.2z"/><path d="m5 21 2-5"/>',
+  edit: '<path d="M4 20h4l10-10-4-4L4 16z"/><path d="m13.5 5.5 4 4"/>'
 };
 
 function svg(name, cls = "") {
@@ -53,6 +57,35 @@ function setIcon(el, name) { if (el) el.innerHTML = svg(name); }
 
 const $ = (id) => document.getElementById(id);
 const SCREENS = ["bootScreen", "pinScreen", "authScreen", "vaultScreen"];
+
+function storeGet(key, fallback) {
+  try {
+    const value = localStorage.getItem(key);
+    return value === null ? fallback : value;
+  } catch (_) {
+    return fallback;
+  }
+}
+
+function storeSet(key, value) {
+  try { localStorage.setItem(key, String(value)); } catch (_) { /* storage blocked */ }
+}
+
+function readJson(key, fallback) {
+  try {
+    const value = JSON.parse(storeGet(key, ""));
+    return value === null || value === undefined ? fallback : value;
+  } catch (_) {
+    return fallback;
+  }
+}
+
+const THEMES = [
+  ["system", "System", "Follow the phone's light or dark setting"],
+  ["light", "Light", "Always use the light interface"],
+  ["dark", "Dark", "Always use the dark interface"],
+  ["black", "Black", "Dark interface with true-black surfaces"]
+];
 
 const S = {
   status: null,
@@ -78,9 +111,12 @@ const S = {
   selecting: false,
   suppressClick: 0,
   syncTimer: null,
+  restoreTimer: null,
   qrTimer: null,
   pin: "",
   pinBusy: false,
+  pinVault: null,
+  pinNote: "",
   authTab: "phone",
   toastTimer: null,
   dlItems: [],
@@ -94,8 +130,69 @@ const S = {
   uploadDismissed: new Set(),
   uploadSeen: new Set(),
   uploadTimer: null,
-  closing: false
+  closing: false,
+  view: storeGet("tfe_view", "grid") === "list" ? "list" : "grid",
+  theme: storeGet("tfe_theme", "system"),
+  treeOpen: new Set(readJson("tfe_tree_open", [])),
+  folderPanelOpen: storeGet("tfe_folder_panel", "1") !== "0",
+  rendered: 0,
+  listEl: null,
+  moreEl: null,
+  pageCache: new Map(),
+  imageViewer: null,
+  imageGallery: [],
+  slideshow: null,
+  slideshowDriven: false
 };
+
+/* --------------------------------------------------------------- settings */
+function applyTheme(theme) {
+  const value = THEMES.some(([key]) => key === theme) ? theme : "system";
+  S.theme = value;
+  storeSet("tfe_theme", value);
+  document.documentElement.dataset.theme = value;
+  const dark = value === "dark" || value === "black"
+    || (value === "system" && window.matchMedia
+      && window.matchMedia("(prefers-color-scheme: dark)").matches);
+  const meta = $("themeMeta");
+  if (meta) meta.setAttribute("content", value === "black" ? "#000000" : dark ? "#1e2024" : "#ffffff");
+  try {
+    if (window.AndroidBridge && AndroidBridge.setDarkMode) AndroidBridge.setDarkMode(dark);
+  } catch (_) { /* browser */ }
+}
+
+function setupViewport() {
+  const viewport = window.visualViewport;
+  const apply = () => {
+    if (!viewport) return;
+    const hidden = Math.max(0, Math.round(
+      window.innerHeight - viewport.height - viewport.offsetTop
+    ));
+    const keyboard = hidden > 90 ? hidden : 0;
+    document.documentElement.style.setProperty("--kb", `${keyboard}px`);
+    document.documentElement.classList.toggle("kb-open", keyboard > 0);
+  };
+  if (viewport) {
+    viewport.addEventListener("resize", apply);
+    viewport.addEventListener("scroll", apply);
+  }
+  window.addEventListener("resize", apply);
+  apply();
+}
+
+function keepFieldVisible(field) {
+  if (!field) return;
+  setTimeout(() => {
+    try { field.scrollIntoView({ block: "center", behavior: "smooth" }); }
+    catch (_) { field.scrollIntoView(); }
+  }, 280);
+}
+
+document.addEventListener("focusin", (event) => {
+  if (event.target.matches("input, textarea, select")) {
+    keepFieldVisible(event.target);
+  }
+});
 
 /* ------------------------------------------------------------------ utils */
 function showScreen(id) {
@@ -127,7 +224,20 @@ async function api(path, options = {}) {
     headers["Content-Type"] = "application/json";
     init.body = JSON.stringify(options.body);
   }
-  const res = await fetch(path, init);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), options.timeout || 60000);
+  init.signal = controller.signal;
+  let res;
+  try {
+    res = await fetch(path, init);
+  } catch (error) {
+    if (error && error.name === "AbortError") {
+      throw new Error("The app took too long to answer. Try again.");
+    }
+    throw new Error("The app is not answering. Try again.");
+  } finally {
+    clearTimeout(timer);
+  }
   let data = {};
   try { data = await res.json(); } catch (_) { /* empty body */ }
   if (!res.ok) {
@@ -219,8 +329,160 @@ function showPin() {
   S.pin = "";
   renderPinDots();
   $("pinError").textContent = "";
+  $("pinNote").hidden = true;
+  $("pinNote").textContent = "";
+  renderPinVault();
   showScreen("pinScreen");
 }
+
+function pinVaultChoices() {
+  const status = S.status || {};
+  return Array.isArray(status.vaults) ? status.vaults : [];
+}
+
+function pinVaultCurrent() {
+  if (S.pinVault) return S.pinVault;
+  const status = S.status || {};
+  if (status.vault) return status.vault;
+  const vaults = pinVaultChoices();
+  return vaults.find((vault) => vault.active) || vaults.find((vault) => vault.default)
+    || vaults[0] || null;
+}
+
+function renderPinVault() {
+  const button = $("pinVault");
+  const vault = pinVaultCurrent();
+  if (!vault) {
+    button.hidden = true;
+    return;
+  }
+  button.hidden = false;
+  $("pinVaultName").textContent = vault.title || String(vault.id);
+  const note = S.pinVault ? "Opens after unlock" : (vault.default ? "Default vault" : "Tap to change");
+  button.querySelector("small").textContent = `Storage vault · ${note}`;
+}
+
+function openPinVaultSheet() {
+  const vaults = pinVaultChoices();
+  const current = pinVaultCurrent();
+  const body = document.createElement("div");
+  if (!vaults.length) {
+    body.innerHTML = "<p>No storage vaults are known yet. Unlock once, then open More → Storage vault.</p>";
+    openSheet("Storage vault", body);
+    return;
+  }
+  for (const vault of vaults) {
+    const chosen = current && String(current.id) === String(vault.id);
+    const subtitle = chosen
+      ? (vault.default ? "Default vault" : "Opens with this PIN")
+      : (vault.default ? "Default vault" : "Tap to open this one");
+    const row = sheetButton("vault", vault.title || String(vault.id), subtitle, () => {
+      closeSheet();
+      S.pinVault = chosen && vault.active ? null : vault;
+      renderPinVault();
+    });
+    if (chosen) {
+      row.classList.add("on");
+      const mark = document.createElement("span");
+      mark.className = "sheet-check";
+      mark.innerHTML = svg("check");
+      row.append(mark);
+    }
+    body.append(row);
+  }
+  openSheet("Storage vault", body);
+}
+
+function openPinRecovery() {
+  const body = document.createElement("div");
+  const intro = document.createElement("p");
+  intro.textContent = "A recovery code is sent to your Telegram Saved Messages. You need the same account signed in on this phone.";
+  body.append(intro);
+  const actions = document.createElement("div");
+  actions.className = "sheet-buttons";
+  const send = document.createElement("button");
+  send.type = "button";
+  send.className = "btn primary";
+  send.textContent = "Send recovery code";
+  send.addEventListener("click", async () => {
+    send.disabled = true;
+    try {
+      await api("/api/pin/recover", { method: "POST", timeout: 60000 });
+      toast("Code sent to Saved Messages in Telegram.", "success", 5000);
+      showRecoveryForm();
+    } catch (error) {
+      toast(error.message, "error");
+      send.disabled = false;
+    }
+  });
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "btn ghost";
+  cancel.textContent = "Back";
+  cancel.addEventListener("click", () => closeSheet());
+  actions.append(send, cancel);
+  body.append(actions);
+  openSheet("Forgot PIN", body);
+}
+
+function showRecoveryForm() {
+  const body = document.createElement("div");
+  const intro = document.createElement("p");
+  intro.textContent = "Type the code from Saved Messages and choose a new 4-digit PIN.";
+  const code = editField("Recovery code", "", "Code from Telegram");
+  code.input.inputMode = "numeric";
+  code.input.autocomplete = "one-time-code";
+  const pin = editField("New PIN", "", "4 digits");
+  pin.input.type = "password";
+  pin.input.inputMode = "numeric";
+  pin.input.maxLength = 4;
+  pin.input.addEventListener("input", () => {
+    pin.input.value = pin.input.value.replace(/\D/g, "").slice(0, 4);
+  });
+  const error = document.createElement("p");
+  error.className = "form-error";
+  const actions = document.createElement("div");
+  actions.className = "sheet-buttons";
+  const go = document.createElement("button");
+  go.type = "button";
+  go.className = "btn primary";
+  go.textContent = "Set PIN and open";
+  go.addEventListener("click", async () => {
+    go.disabled = true;
+    error.textContent = "";
+    try {
+      await api("/api/pin/reset", {
+        method: "POST",
+        body: { code: code.input.value.trim(), pin: pin.input.value.trim() },
+        timeout: 60000
+      });
+      closeSheet(true);
+      S.pin = "";
+      S.pinVault = null;
+      S.status = await api("/api/status");
+      toast("PIN updated. The app is unlocked.", "success");
+      if (!S.status.locked) route();
+      else showPin();
+    } catch (err) {
+      error.textContent = err.message;
+      go.disabled = false;
+    }
+  });
+  const back = document.createElement("button");
+  back.type = "button";
+  back.className = "btn ghost";
+  back.textContent = "Back";
+  back.addEventListener("click", () => openPinRecovery());
+  actions.append(go, back);
+  body.append(intro, code.wrap, pin.wrap, error, actions);
+  openSheet("New PIN", body);
+  setTimeout(() => { try { code.input.focus(); } catch (_) {} }, 120);
+}
+
+$("pinVault").addEventListener("click", openPinVaultSheet);
+$("pinForgot").addEventListener("click", openPinRecovery);
+setIcon($("pinVaultIcon"), "vault");
+setIcon($("pinVaultChev"), "chev");
 
 function renderPinDots() {
   $("pinDots").innerHTML = [0, 1, 2, 3]
@@ -231,9 +493,12 @@ function renderPinDots() {
 async function submitPin() {
   if (S.pinBusy) return;
   S.pinBusy = true;
+  const pin = S.pin;
   try {
-    await api("/api/unlock", { method: "POST", body: { pin: S.pin } });
+    await api("/api/unlock", { method: "POST", body: { pin } });
     S.pin = "";
+    renderPinDots();
+    await applyPendingVault(pin);
     const status = await api("/api/status");
     S.status = status;
     route();
@@ -245,6 +510,29 @@ async function submitPin() {
     renderPinDots();
   } finally {
     S.pinBusy = false;
+    $("pinNote").hidden = true;
+  }
+}
+
+async function applyPendingVault(pin) {
+  const target = S.pinVault;
+  if (!target) return;
+  S.pinVault = null;
+  const active = (S.status && S.status.vault) || null;
+  if (active && String(active.id) === String(target.id)) return;
+  $("pinNote").hidden = false;
+  $("pinNote").textContent = `Opening ${target.title || "the vault"}…`;
+  try {
+    await api("/api/vaults/switch", {
+      method: "POST",
+      body: { id: String(target.id), pin },
+      timeout: 180000
+    });
+    S.status = { ...(S.status || {}), vault: target };
+  } catch (error) {
+    toast(error.message || "That vault could not be opened.", "error");
+  } finally {
+    $("pinNote").hidden = true;
   }
 }
 
@@ -509,6 +797,7 @@ $("vaultSignOut").addEventListener("click", () => confirmAction(
 async function enterMain() {
   showScreen("main");
   clearSelection();
+  applyTheme(S.theme);
   S.tab = "files";
   S.folder = "";
   S.q = "";
@@ -522,6 +811,47 @@ async function enterMain() {
   await Promise.all([loadNav(), loadItems({ reset: true })]);
   const count = (S.status.stats && S.status.stats.count) || 0;
   if (!count) startSync();
+  watchRestore();
+}
+
+/* The phone opens its local library first, then pulls a newer vault snapshot
+   in the background. Show that as the sync banner and refresh once it lands. */
+function restoreRunning(status) {
+  const restore = (status && status.vault_restore) || {};
+  return restore.state === "pending" || restore.state === "running";
+}
+
+function watchRestore() {
+  if (S.restoreTimer || !restoreRunning(S.status)) return;
+  $("syncBanner").hidden = false;
+  $("syncFill").style.width = "30%";
+  $("syncText").textContent = "Syncing the library from Telegram…";
+  S.restoreTimer = setInterval(restoreTick, 1500);
+}
+
+async function restoreTick() {
+  let status;
+  try {
+    status = await api("/api/status");
+  } catch (error) {
+    return;
+  }
+  S.status = status;
+  if (restoreRunning(status)) return;
+  clearInterval(S.restoreTimer);
+  S.restoreTimer = null;
+  $("syncBanner").hidden = true;
+  if (status.locked) {
+    showPin();
+    return;
+  }
+  const restore = status.vault_restore || {};
+  if (!restore.restored) return;
+  await loadNav();
+  if (S.tab === "more") renderMore();
+  else if (S.tab === "folders") renderFolders();
+  else await loadItems({ reset: true });
+  toast("Library updated from Telegram.", "success");
 }
 
 function updateChrome() {
@@ -537,14 +867,24 @@ function updateChrome() {
     : S.folder ? S.folder.split("/").pop()
     : "All files";
   const name = [user.first_name, user.last_name].filter(Boolean).join(" ");
-  $("topSub").textContent = vault.title
-    ? `${vault.title}${name ? " · " + name : ""}`
-    : name || "Telegram File Explorer";
-  $("selectBtn").hidden = S.tab === "folders" || S.tab === "more";
-  $("lockBtn").hidden = !status.pin_set;
+  const total = Number((status.stats && status.stats.count) || 0);
+  const shown = S.items.length;
+  const countText = S.tab === "files" && !S.q && !S.filterLabel
+    ? (total ? `${total.toLocaleString()} file${total === 1 ? "" : "s"}` : "")
+    : shown ? `${shown} shown` : "";
+  $("topSub").textContent = [vault.title || name || "Telegram File Explorer", countText]
+    .filter(Boolean).join(" · ");
+  const browsing = S.tab === "files" && (!!S.folder || !!S.filterLabel || !!S.q);
+  $("backBtn").hidden = !browsing;
+  $("topLogo").hidden = browsing;
+  const listTab = S.tab === "files" || S.tab === "favorites" || S.tab === "recent";
+  $("viewBtn").hidden = !listTab;
+  setIcon($("viewBtn"), S.view === "grid" ? "list" : "grid");
+  $("viewBtn").title = S.view === "grid" ? "Switch to list view" : "Switch to grid view";
+  $("selectBtn").hidden = !listTab;
   const canUpload = !!status.can_upload && (S.tab === "files" || S.tab === "folders");
-  $("uploadFab").hidden = !canUpload;
-  if (canUpload) positionUploadFab();
+  $("uploadFab").hidden = !canUpload || S.selecting;
+  if (canUpload && !S.selecting) positionUploadFab();
 }
 
 $("tabs").addEventListener("click", (event) => {
@@ -779,23 +1119,58 @@ async function loadItems({ reset = false } = {}) {
     if (!S.items.length) renderItems();
     return;
   }
+  if (reset) S.cursor = "";
+  const key = reset ? itemQuery().toString() : "";
   S.loading = true;
   if (reset) {
-    S.items = [];
-    S.cursor = "";
-    S.done = false;
-    $("content").innerHTML = '<div class="spinner"></div>';
-    $("content").scrollTop = 0;
-    renderCrumb();
+    const cached = S.pageCache.get(key);
+    if (cached && Date.now() - cached.at < 45000) {
+      S.items = cached.items.slice();
+      S.cursor = cached.cursor;
+      S.done = cached.done;
+      renderItems();
+    } else {
+      S.items = [];
+      S.cursor = "";
+      S.done = false;
+      $("content").innerHTML = '<div class="spinner"></div>';
+      $("content").scrollTop = 0;
+      renderCrumb();
+    }
   }
   try {
     const data = await api(`/api/items?${itemQuery().toString()}`);
     if (seq !== loadSeq) return;
     const items = data.items || [];
-    S.items = reset ? items : S.items.concat(items);
-    S.cursor = data.next_cursor || "";
-    S.done = !S.cursor;
-    renderItems();
+    const nextCursor = data.next_cursor || "";
+    const done = !nextCursor;
+    if (reset) {
+      const cached = S.pageCache.get(key);
+      const same = Boolean(cached
+        && cached.cursor === nextCursor
+        && cached.done === done
+        && cached.items.length === items.length
+        && cached.items.every((entry, index) => entry.id === items[index].id));
+      S.items = items;
+      S.cursor = nextCursor;
+      S.done = done;
+      S.pageCache.set(key, { items: items.slice(), cursor: nextCursor, done, at: Date.now() });
+      if (S.pageCache.size > 24) {
+        S.pageCache.delete(S.pageCache.keys().next().value);
+      }
+      if (!same) {
+        const top = $("content").scrollTop;
+        renderItems();
+        $("content").scrollTop = top;
+      }
+    } else {
+      const start = S.items.length;
+      S.items = S.items.concat(items);
+      S.cursor = nextCursor;
+      S.done = done;
+      appendItems(start);
+      updateChrome();
+    }
   } catch (error) {
     if (seq !== loadSeq) return;
     $("content").innerHTML = "";
@@ -820,6 +1195,13 @@ function renderItems() {
   renderChips();
   const content = $("content");
   content.innerHTML = "";
+  S.listEl = null;
+  S.moreEl = null;
+  S.rendered = 0;
+  if (S.tab === "files" && !S.q && !S.filterLabel) {
+    const panel = folderPanel();
+    if (panel) content.append(panel);
+  }
   if (!S.items.length) {
     const empty = document.createElement("div");
     empty.className = "empty";
@@ -842,18 +1224,153 @@ function renderItems() {
       empty.append(sync);
     }
     content.append(empty);
+    updateChrome();
     return;
   }
-  const grid = document.createElement("div");
-  grid.className = "grid";
-  S.items.forEach((item, index) => grid.append(itemTile(item, index)));
-  content.append(grid);
+  const list = document.createElement("div");
+  list.className = S.view === "list" ? "view-list" : "grid";
+  content.append(list);
+  S.listEl = list;
   const more = document.createElement("div");
   more.className = "load-more";
-  if (!S.done) more.innerHTML = '<div class="spinner small"></div>';
   content.append(more);
+  S.moreEl = more;
+  appendItems(0);
   updateChrome();
+}
+
+function appendItems(from) {
+  const list = S.listEl;
+  if (!list) return;
+  const fragment = document.createDocumentFragment();
+  for (let index = from; index < S.items.length; index += 1) {
+    const item = S.items[index];
+    const node = S.view === "list" ? itemRow(item, index) : itemTile(item, index);
+    if (S.selection.has(item.id)) paintTile(node, true);
+    fragment.append(node);
+  }
+  list.append(fragment);
+  S.rendered = S.items.length;
+  if (S.moreEl) {
+    S.moreEl.innerHTML = S.done ? "" : '<div class="spinner small"></div>';
+  }
   if (S.selecting) syncSelectionChrome();
+}
+
+function directFolders() {
+  const parent = S.folder || "";
+  return ((S.nav && S.nav.folders) || [])
+    .filter((folder) => (folder.parent || "") === parent && folder.folder !== parent);
+}
+
+function folderPanel() {
+  const folders = directFolders();
+  if (!folders.length) return null;
+  const panel = document.createElement("div");
+  panel.className = "folder-panel" + (S.folderPanelOpen ? "" : " collapsed");
+  const head = document.createElement("button");
+  head.type = "button";
+  head.className = "folder-panel-head";
+  head.innerHTML =
+    `<span class="chevd">${svg("down")}</span><span>Folders</span>` +
+    `<span class="count">${folders.length}</span>`;
+  head.setAttribute("aria-expanded", S.folderPanelOpen ? "true" : "false");
+  head.addEventListener("click", () => {
+    S.folderPanelOpen = !S.folderPanelOpen;
+    storeSet("tfe_folder_panel", S.folderPanelOpen ? "1" : "0");
+    panel.classList.toggle("collapsed", !S.folderPanelOpen);
+    head.setAttribute("aria-expanded", S.folderPanelOpen ? "true" : "false");
+  });
+  const cards = document.createElement("div");
+  cards.className = "folder-cards";
+  for (const folder of folders) {
+    const card = document.createElement("button");
+    card.type = "button";
+    card.className = "folder-card";
+    card.innerHTML =
+      `<span class="fold-ico">${svg("folder")}</span>` +
+      `<span class="fold-copy"><strong></strong><small></small></span>`;
+    card.querySelector("strong").textContent = folder.name || folder.folder;
+    card.querySelector("small").textContent =
+      `${folder.direct_n || folder.n || 0} file${(folder.direct_n || folder.n) === 1 ? "" : "s"}`;
+    card.addEventListener("click", () => openFolder(folder.folder));
+    cards.append(card);
+  }
+  panel.append(head, cards);
+  return panel;
+}
+
+function itemRow(item, index) {
+  const row = document.createElement("div");
+  row.className = "item-row selectable";
+  row.setAttribute("role", "button");
+  row.tabIndex = 0;
+  row.dataset.id = String(item.id);
+  const thumb = document.createElement("span");
+  thumb.className = "thumb";
+  if (item.has_thumb && item.thumb_url) {
+    const img = document.createElement("img");
+    img.loading = "lazy";
+    img.decoding = "async";
+    img.alt = "";
+    img.src = item.thumb_url;
+    thumb.append(img);
+  } else {
+    thumb.innerHTML = svg(itemIcon(item));
+  }
+  const copy = document.createElement("span");
+  copy.className = "copy";
+  const name = document.createElement("strong");
+  name.textContent = softBreaks(item.name || "File");
+  const meta = document.createElement("small");
+  const bits = [shortKind(item), humanSize(item.size)];
+  const date = humanDate(item.tg_date || item.added_at);
+  if (date) bits.push(date);
+  meta.textContent = bits.filter(Boolean).join(" · ");
+  copy.append(name, meta);
+  if (item.tags) {
+    const tags = document.createElement("span");
+    tags.className = "tags";
+    tags.textContent = String(item.tags).split(",").map((tag) => `#${tag.trim()}`)
+      .filter((tag) => tag.length > 1).join("  ");
+    copy.append(tags);
+  }
+  row.append(thumb, copy);
+  if (item.favorite) {
+    const mark = document.createElement("span");
+    mark.className = "fav-mark";
+    mark.innerHTML = svg("star");
+    row.append(mark);
+  }
+  const details = document.createElement("button");
+  details.type = "button";
+  details.className = "row-action";
+  details.setAttribute("aria-label", "File details");
+  details.innerHTML = svg("info");
+  details.addEventListener("click", (event) => {
+    event.stopPropagation();
+    openItemInfo(item);
+  });
+  row.append(details);
+  row.addEventListener("click", (event) => {
+    if (event.target.closest("button")) return;
+    if (Date.now() < S.suppressClick) return;
+    if (S.selecting) { toggleSelection(row, item.id); return; }
+    openViewer(index);
+  });
+  row.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    openViewer(index);
+  });
+  withLongPress(row, () => {
+    if (S.selecting) { toggleSelection(row, item.id); return; }
+    S.selecting = true;
+    S.selection.add(item.id);
+    paintTile(row, true);
+    syncSelectionChrome();
+  });
+  return row;
 }
 
 function softBreaks(text) {
@@ -863,7 +1380,7 @@ function softBreaks(text) {
 function itemTile(item, index) {
   const tile = document.createElement("button");
   tile.type = "button";
-  tile.className = "tile";
+  tile.className = "tile selectable";
   if (item.has_thumb && item.thumb_url) {
     const img = document.createElement("img");
     img.loading = "lazy";
@@ -965,7 +1482,7 @@ function syncSelectionChrome() {
   $("selectTitle").textContent = count
     ? `${count} selected`
     : "Select files";
-  const tiles = [...$("content").querySelectorAll(".tile[data-id]")];
+  const tiles = [...$("content").querySelectorAll(".selectable[data-id]")];
   const all = tiles.length > 0
     && tiles.every((tile) => S.selection.has(Number(tile.dataset.id)));
   $("selectAll").textContent = all ? "Clear all" : "Select all";
@@ -979,7 +1496,7 @@ function clearSelection() {
   S.selecting = false;
   if (S.selection.size) {
     S.selection.clear();
-    for (const tile of $("content").querySelectorAll(".tile.selected")) {
+    for (const tile of $("content").querySelectorAll(".selectable.selected")) {
       paintTile(tile, false);
     }
   }
@@ -987,7 +1504,7 @@ function clearSelection() {
 }
 
 function toggleSelectAll() {
-  const tiles = [...$("content").querySelectorAll(".tile[data-id]")];
+  const tiles = [...$("content").querySelectorAll(".selectable[data-id]")];
   if (!tiles.length) return;
   const all = tiles.every((tile) => S.selection.has(Number(tile.dataset.id)));
   for (const tile of tiles) {
@@ -1021,6 +1538,383 @@ function downloadFolder(folder) {
     `${name}.zip`
   );
 }
+
+async function copyText(text) {
+  try {
+    if (window.AndroidBridge && AndroidBridge.copyText && AndroidBridge.copyText(text)) {
+      return true;
+    }
+  } catch (_) { /* browser */ }
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function selectedIds() {
+  return [...S.selection];
+}
+
+async function refreshAfterBulk() {
+  clearSelection();
+  S.pageCache.clear();
+  await loadNav();
+  updateChrome();
+  if (S.tab === "folders") renderFolders();
+  else if (S.tab !== "more") loadItems({ reset: true });
+}
+
+function openBulkSheet() {
+  const ids = selectedIds();
+  if (!ids.length) { toast("Select at least one file."); return; }
+  const items = S.items.filter((item) => ids.includes(item.id));
+  const allFavorite = items.length > 0 && items.every((item) => item.favorite);
+  const body = document.createElement("div");
+  body.append(sheetButton(
+    "star",
+    allFavorite ? "Remove from favorites" : "Add to favorites",
+    `Applies to ${ids.length} file(s)`,
+    async () => {
+      try {
+        await api("/api/batch/favorite", {
+          method: "POST",
+          body: { item_ids: ids, favorite: !allFavorite }
+        });
+        closeSheet();
+        toast(allFavorite ? "Removed from favorites." : "Added to favorites.", "success");
+        await refreshAfterBulk();
+      } catch (error) { toast(error.message, "error"); }
+    }
+  ));
+  body.append(sheetButton("folder", "Move to folder", "Changes the folder of every selection", () => promptBulkFolder(false)));
+  body.append(sheetButton("collection", "Copy to folder", "Keeps the originals where they are", () => promptBulkFolder(true)));
+  body.append(sheetButton("edit", "Rename files", "Apply a name template to the selection", promptBulkRename));
+  body.append(sheetButton("star", "Assign stars", "Tag the selection with performers", openBulkStars));
+  const collections = (S.nav && S.nav.collections) || [];
+  if (collections.length) {
+    body.append(sheetButton("collection", "Add to collection", `${collections.length} collection(s)`, openBulkCollections));
+  }
+  body.append(sheetButton("telegram", "Copy Telegram links", "Copy one message link per file", copySelectedLinks));
+  body.append(sheetButton("eyeOff", "Remove from library", "Hides the files; restore them from Hidden", () => {
+    confirmAction(
+      `Remove ${ids.length} file(s)?`,
+      "They disappear from the library. The Telegram messages stay and can be restored from Hidden files.",
+      "Remove",
+      async () => {
+        await api("/api/batch/delete", { method: "POST", body: { item_ids: ids, remote: false } });
+        toast("Removed from the library.", "success", 5000);
+        await refreshAfterBulk();
+      }
+    );
+  }));
+  body.append(sheetButton("trash", "Delete from Telegram", "Deletes the messages for everyone", () => {
+    confirmAction(
+      `Delete ${ids.length} file(s) from Telegram?`,
+      "The channel messages are deleted for every member. This cannot be undone.",
+      "Delete",
+      async () => {
+        await api("/api/batch/delete", { method: "POST", body: { item_ids: ids, remote: true } });
+        toast("Deleted from Telegram.", "success");
+        await refreshAfterBulk();
+      }
+    );
+  }, true));
+  openSheet(`${ids.length} selected`, body);
+}
+
+function promptBulkFolder(copy) {
+  const ids = selectedIds();
+  promptText(
+    copy ? "Copy to folder" : "Move to folder",
+    "Folder",
+    S.folder || "",
+    "Top level / Sub folder",
+    copy ? "Copy here" : "Move here",
+    async (folder) => {
+      if (!folder) throw new Error("Type a folder name.");
+      const data = await api(copy ? "/api/batch/copy" : "/api/batch/move", {
+        method: "POST",
+        body: { item_ids: ids, folder },
+        timeout: 180000
+      });
+      toast(
+        copy
+          ? `Copied ${data.copied || ids.length} file(s) to ${data.folder}.`
+          : `Moved ${data.moved || ids.length} file(s) to ${data.folder}.`,
+        "success"
+      );
+      await refreshAfterBulk();
+    }
+  );
+}
+
+async function copySelectedLinks() {
+  const ids = selectedIds();
+  if (!ids.length) return;
+  try {
+    const data = await api(`/api/batch/info?ids=${ids.join(",")}`);
+    const lines = (data.items || []).map((item) =>
+      item.telegram_link ? `${item.name} — ${item.telegram_link}` : item.name
+    );
+    const ok = await copyText(lines.join("\n"));
+    closeSheet();
+    toast(ok ? `Copied ${lines.length} link(s).` : "The clipboard is not available.", ok ? "success" : "error");
+  } catch (error) { toast(error.message, "error"); }
+}
+
+function openBulkCollections() {
+  const collections = (S.nav && S.nav.collections) || [];
+  const ids = selectedIds();
+  const body = document.createElement("div");
+  if (!collections.length) {
+    body.innerHTML = "<p>No collections yet. Create one in More → Collections.</p>";
+    openSheet("Add to collection", body);
+    return;
+  }
+  for (const collection of collections) {
+    body.append(sheetButton(
+      "collection",
+      collection.name,
+      `${Number(collection.n) || 0} file(s)`,
+      async () => {
+        try {
+          await api(`/api/collections/${collection.id}/items`, {
+            method: "POST",
+            body: { item_ids: ids, remove: false }
+          });
+          closeSheet();
+          toast(`Added to ${collection.name}.`, "success");
+          await refreshAfterBulk();
+        } catch (error) { toast(error.message, "error"); }
+      }
+    ));
+  }
+  openSheet("Add to collection", body);
+}
+
+function promptBulkRename() {
+  const ids = selectedIds();
+  if (!ids.length) { toast("Select files first.", "error"); return; }
+  const body = document.createElement("div");
+  const field = editField("Name template", "{name}", "Placeholders: {name} {ext} {folder} {date} {nn}");
+  field.input.autocomplete = "off";
+  const note = document.createElement("p");
+  note.className = "muted small";
+  note.textContent = "Tap a placeholder to insert it. The original extension is added when {ext} is missing.";
+  const chips = document.createElement("div");
+  chips.className = "template-chips";
+  const preview = document.createElement("div");
+  preview.className = "batch-preview";
+  const error = document.createElement("p");
+  error.className = "form-error";
+  let timer = null;
+  const run = () => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(async () => {
+      try {
+        const data = await api("/api/batch/rename", {
+          method: "POST",
+          body: { item_ids: ids, template: field.input.value, preview: true }
+        });
+        const changed = (data.renames || []).filter((entry) => entry.from !== entry.to);
+        preview.innerHTML = "";
+        if (!changed.length) {
+          const empty = document.createElement("p");
+          empty.className = "muted small";
+          empty.textContent = "This template keeps the current names.";
+          preview.append(empty);
+          return;
+        }
+        for (const entry of changed.slice(0, 200)) {
+          const row = document.createElement("div");
+          row.className = "batch-row";
+          row.innerHTML = '<span class="batch-from"></span><span class="batch-arrow">→</span><span class="batch-to"></span>';
+          row.querySelector(".batch-from").textContent = entry.from;
+          row.querySelector(".batch-to").textContent = entry.to;
+          preview.append(row);
+        }
+        if (changed.length > 200) {
+          const rest = document.createElement("p");
+          rest.className = "muted small";
+          rest.textContent = `and ${changed.length - 200} more file(s)`;
+          preview.append(rest);
+        }
+      } catch (err) {
+        preview.innerHTML = "";
+        const p = document.createElement("p");
+        p.className = "muted small";
+        p.textContent = err.message;
+        preview.append(p);
+      }
+    }, 300);
+  };
+  for (const token of ["{name}", "{ext}", "{folder}", "{date}", "{nn}"]) {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.textContent = token;
+    chip.addEventListener("click", () => {
+      const start = field.input.selectionStart ?? field.input.value.length;
+      const end = field.input.selectionEnd ?? start;
+      const value = field.input.value;
+      field.input.value = value.slice(0, start) + token + value.slice(end);
+      field.input.focus();
+      try { field.input.setSelectionRange(start + token.length, start + token.length); } catch (_) { /* ignore */ }
+      run();
+    });
+    chips.append(chip);
+  }
+  field.input.addEventListener("input", run);
+  const actions = document.createElement("div");
+  actions.className = "sheet-buttons";
+  const go = document.createElement("button");
+  go.type = "button";
+  go.className = "btn primary";
+  go.textContent = `Rename ${ids.length === 1 ? "1 file" : `${ids.length} files`}`;
+  go.addEventListener("click", async () => {
+    go.disabled = true;
+    error.textContent = "";
+    try {
+      const data = await api("/api/batch/rename", {
+        method: "POST",
+        body: { item_ids: ids, template: field.input.value, preview: false }
+      });
+      closeSheet();
+      toast(data.applied ? `${data.applied} file(s) renamed.` : "Names already match.", "success");
+      if (data.warnings) toast(`${data.warnings} Telegram caption(s) could not be updated.`, "info", 7000);
+      await refreshAfterBulk();
+    } catch (err) {
+      error.textContent = err.message;
+      go.disabled = false;
+    }
+  });
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "btn ghost";
+  cancel.textContent = "Cancel";
+  cancel.addEventListener("click", () => closeSheet());
+  actions.append(go, cancel);
+  body.append(field.wrap, note, chips, preview, error, actions);
+  openSheet("Rename selected files", body);
+  run();
+}
+
+async function openBulkStars() {
+  const ids = selectedIds();
+  if (!ids.length) { toast("Select files first.", "error"); return; }
+  const body = document.createElement("div");
+  body.innerHTML = '<div class="spinner"></div>';
+  openSheet("Assign stars", body);
+  let stars = [];
+  try {
+    const data = await api("/api/stars?limit=2000");
+    stars = data.stars || [];
+  } catch (error) {
+    body.innerHTML = "";
+    const p = document.createElement("p");
+    p.textContent = error.message;
+    body.append(p);
+    return;
+  }
+  const chosen = new Set();
+  const search = document.createElement("input");
+  search.type = "search";
+  search.placeholder = "Search performers";
+  search.autocomplete = "off";
+  search.className = "star-search";
+  const list = document.createElement("div");
+  const render = () => {
+    const term = search.value.trim().toLowerCase();
+    list.innerHTML = "";
+    const shown = stars.filter((star) => !term
+      || String(star.name || "").toLowerCase().includes(term)
+      || String(star.aliases || "").toLowerCase().includes(term));
+    if (!shown.length) {
+      const empty = document.createElement("p");
+      empty.className = "muted small";
+      empty.textContent = stars.length
+        ? "No performers match that search."
+        : "No performers yet. Create one below.";
+      list.append(empty);
+      return;
+    }
+    for (const star of shown) {
+      const picked = chosen.has(Number(star.id));
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = "sheet-action" + (picked ? " on" : "");
+      row.innerHTML = `${svg(picked ? "check" : "user")}`
+        + '<span class="copy"><strong></strong><small></small></span>';
+      row.querySelector("strong").textContent = star.name || "Unnamed performer";
+      row.querySelector("small").textContent = picked
+        ? `Assigned · ${starMeta(star)}`
+        : starMeta(star);
+      row.addEventListener("click", () => {
+        const id = Number(star.id);
+        if (chosen.has(id)) chosen.delete(id);
+        else chosen.add(id);
+        render();
+      });
+      list.append(row);
+    }
+  };
+  search.addEventListener("input", render);
+  render();
+  const create = document.createElement("div");
+  create.className = "star-pick-new";
+  const nameInput = document.createElement("input");
+  nameInput.type = "text";
+  nameInput.placeholder = "New performer name";
+  nameInput.maxLength = 80;
+  nameInput.autocomplete = "off";
+  const createBtn = document.createElement("button");
+  createBtn.type = "button";
+  createBtn.className = "btn";
+  createBtn.textContent = "Create";
+  createBtn.addEventListener("click", async () => {
+    const name = nameInput.value.trim();
+    if (!name) { toast("Enter a name for the new performer.", "error"); return; }
+    createBtn.disabled = true;
+    try {
+      const created = await api("/api/stars", { method: "POST", body: { name } });
+      stars.push(created);
+      chosen.add(Number(created.id));
+      nameInput.value = "";
+      render();
+      toast(`Created ${created.name}. Save to assign it.`, "success", 5000);
+    } catch (error) {
+      toast(error.message, "error");
+    } finally {
+      createBtn.disabled = false;
+    }
+  });
+  create.append(nameInput, createBtn);
+  const save = document.createElement("button");
+  save.type = "button";
+  save.className = "btn primary details-save";
+  save.textContent = "Save stars";
+  save.addEventListener("click", async () => {
+    if (!chosen.size) { toast("Choose at least one performer.", "error"); return; }
+    save.disabled = true;
+    try {
+      const data = await api("/api/items/stars", {
+        method: "POST",
+        body: { item_ids: ids, star_ids: [...chosen] }
+      });
+      closeSheet();
+      toast(`Added ${data.files || ids.length} file(s) to ${data.stars || chosen.size} performer(s).`, "success");
+      await refreshAfterBulk();
+    } catch (error) {
+      save.disabled = false;
+      toast(error.message, "error");
+    }
+  });
+  body.innerHTML = "";
+  body.append(search, list, create, save);
+}
+
+$("selectMore").addEventListener("click", openBulkSheet);
 
 function withLongPress(el, onLongPress) {
   let timer = null;
@@ -1058,52 +1952,122 @@ $("content").addEventListener("scroll", () => {
 });
 
 /* ---------------------------------------------------------------- folders */
+function saveTreeOpen() {
+  storeSet("tfe_tree_open", JSON.stringify([...S.treeOpen]));
+}
+
 function renderFolders() {
   const content = $("content");
   content.innerHTML = "";
+  S.listEl = null;
+  S.moreEl = null;
   const folders = (S.nav && S.nav.folders) || [];
   if (!folders.length) {
     content.innerHTML = `<div class="empty">${svg("folder")}<strong>No folders yet</strong><p>Folders you create in the desktop app show up here after a sync.</p></div>`;
+    updateChrome();
     return;
   }
-  const list = document.createElement("div");
-  list.className = "list";
+  const byParent = new Map();
   for (const folder of folders) {
+    const parent = folder.parent || "";
+    if (!byParent.has(parent)) byParent.set(parent, []);
+    byParent.get(parent).push(folder);
+  }
+  for (const list of byParent.values()) {
+    list.sort((a, b) => String(a.name || a.folder).localeCompare(String(b.name || b.folder)));
+  }
+  const toolbar = document.createElement("div");
+  toolbar.className = "tree-toolbar";
+  const expand = document.createElement("button");
+  expand.type = "button";
+  expand.textContent = "Expand all";
+  expand.addEventListener("click", () => {
+    S.treeOpen = new Set(folders.filter((folder) => (byParent.get(folder.folder) || []).length)
+      .map((folder) => folder.folder));
+    saveTreeOpen();
+    renderFolders();
+  });
+  const collapse = document.createElement("button");
+  collapse.type = "button";
+  collapse.textContent = "Collapse all";
+  collapse.addEventListener("click", () => {
+    S.treeOpen.clear();
+    saveTreeOpen();
+    renderFolders();
+  });
+  toolbar.append(expand, collapse);
+
+  const tree = document.createElement("div");
+  tree.className = "tree";
+
+  const paint = (folder, depth) => {
+    const children = byParent.get(folder.folder) || [];
+    const hasChildren = children.length > 0;
+    const open = hasChildren && S.treeOpen.has(folder.folder);
     const row = document.createElement("div");
-    row.className = "row";
-    row.setAttribute("role", "button");
-    row.tabIndex = 0;
-    row.style.marginLeft = `${Math.min(folder.depth || 0, 4) * 12}px`;
-    row.innerHTML =
-      `<span class="thumb">${svg("folder")}</span>` +
-      `<span class="copy"><strong></strong><small></small></span>` +
-      `<span class="chev">${svg("chev")}</span>`;
-    row.querySelector("strong").textContent = folder.name || folder.folder;
-    row.querySelector("small").textContent =
-      `${folder.n || 0} file${folder.n === 1 ? "" : "s"} · ${humanSize(folder.size)}`;
-    const action = document.createElement("button");
-    action.type = "button";
-    action.className = "row-action";
-    action.setAttribute("aria-label",
-      `Download ${folder.name || folder.folder} as a ZIP file`);
-    action.innerHTML = svg("download");
-    action.addEventListener("click", (event) => {
+    row.className = "tree-row" + (open ? " open" : "");
+    row.setAttribute("role", "treeitem");
+    row.setAttribute("aria-expanded", hasChildren ? String(open) : "false");
+    row.setAttribute("aria-level", String(depth + 1));
+    row.style.paddingLeft = `${6 + Math.min(depth, 6) * 14}px`;
+    row.dataset.folder = folder.folder;
+
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "tree-toggle" + (hasChildren ? (open ? " open" : "") : " blank");
+    toggle.innerHTML = svg("chev");
+    toggle.setAttribute("aria-label", open ? "Collapse folder" : "Expand folder");
+    toggle.addEventListener("click", (event) => {
+      event.stopPropagation();
+      if (!hasChildren) return;
+      if (S.treeOpen.has(folder.folder)) S.treeOpen.delete(folder.folder);
+      else S.treeOpen.add(folder.folder);
+      saveTreeOpen();
+      renderFolders();
+    });
+
+    const icon = document.createElement("span");
+    icon.className = "tree-ico";
+    if (folder.icon) icon.textContent = folder.icon;
+    else icon.innerHTML = svg("folder");
+    const copy = document.createElement("span");
+    copy.className = "tree-copy";
+    const name = document.createElement("strong");
+    name.textContent = folder.name || folder.folder;
+    const meta = document.createElement("small");
+    const direct = folder.direct_n || 0;
+    meta.textContent = `${folder.n || 0} file${folder.n === 1 ? "" : "s"} · ${humanSize(folder.size)}`
+      + (direct && direct !== folder.n ? ` · ${direct} here` : "");
+    copy.append(name, meta);
+
+    const actions = document.createElement("span");
+    actions.className = "tree-actions";
+    const zip = document.createElement("button");
+    zip.type = "button";
+    zip.setAttribute("aria-label", `Download ${name.textContent} as a ZIP file`);
+    zip.innerHTML = svg("download");
+    zip.addEventListener("click", (event) => {
       event.stopPropagation();
       downloadFolder(folder);
     });
-    row.insertBefore(action, row.querySelector(".chev"));
-    row.addEventListener("click", (event) => {
-      if (event.target.closest("button")) return;
-      openFolder(folder.folder);
-    });
+    actions.append(zip);
+
+    row.append(toggle, icon, copy, actions);
+    row.addEventListener("click", () => openFolder(folder.folder));
     row.addEventListener("keydown", (event) => {
       if (event.key !== "Enter" && event.key !== " ") return;
       event.preventDefault();
       openFolder(folder.folder);
     });
-    list.append(row);
-  }
-  content.append(list);
+    tree.append(row);
+    if (open) {
+      for (const child of children) paint(child, depth + 1);
+    }
+  };
+
+  for (const folder of byParent.get("") || []) paint(folder, 0);
+  content.append(toolbar, tree);
+  updateChrome();
 }
 
 /* --------------------------------------------------------------- sync */
@@ -1156,8 +2120,6 @@ async function syncTick() {
     toast(error.message, "error");
   }
 }
-
-$("syncBtn").addEventListener("click", () => startSync());
 
 /* ---------------------------------------------------------------- search */
 $("searchBtn").addEventListener("click", () => {
@@ -1212,8 +2174,9 @@ function closeViewer() {
   if (window.TFEReader) {
     try { window.TFEReader.close(); } catch (_) { /* ignore */ }
   }
+  destroyImageViewer();
   const stage = $("viewerStage");
-  stage.classList.remove("reader");
+  stage.classList.remove("reader", "image-mode");
   stage.innerHTML = "";
   $("viewer").hidden = true;
   S.viewerIndex = -1;
@@ -1223,23 +2186,31 @@ function currentItem() {
   return S.items[S.viewerIndex] || null;
 }
 
-function renderViewer() {
-  const item = currentItem();
-  if (!item) { closeViewer(); return; }
-  if (item.part_of && item.part_of.count > 1) { closeViewer(); openItemInfo(item); return; }
+function updateViewerChrome(item) {
   $("viewerName").textContent = item.name || "File";
   const bits = [shortKind(item), humanSize(item.size)];
   if (item.folder) bits.push(item.folder);
   $("viewerMeta").textContent = bits.join(" · ");
-  $("viewerPrev").disabled = S.viewerIndex <= 0;
-  $("viewerNext").disabled = S.viewerIndex >= S.items.length - 1;
-  $("viewerPrev").style.opacity = S.viewerIndex <= 0 ? ".3" : "1";
-  $("viewerNext").style.opacity = S.viewerIndex >= S.items.length - 1 ? ".3" : "1";
+  const galleryNav = Boolean(S.imageViewer && S.imageGallery.length > 1);
+  const prevOn = galleryNav || S.viewerIndex > 0;
+  const nextOn = galleryNav || (S.viewerIndex >= 0 && S.viewerIndex < S.items.length - 1);
+  $("viewerPrev").disabled = !prevOn;
+  $("viewerNext").disabled = !nextOn;
+  $("viewerPrev").style.opacity = prevOn ? "1" : ".3";
+  $("viewerNext").style.opacity = nextOn ? "1" : ".3";
+  updateViewerFavorite(item);
+}
+
+function renderViewer() {
+  const item = currentItem();
+  if (!item) { closeViewer(); return; }
+  if (item.part_of && item.part_of.count > 1) { closeViewer(); openItemInfo(item); return; }
 
   const stage = $("viewerStage");
-  stage.classList.remove("reader");
+  destroyImageViewer();
+  stage.classList.remove("reader", "image-mode");
   stage.innerHTML = "";
-  updateViewerFavorite(item);
+  updateViewerChrome(item);
   const url = item.stream_url || `/api/stream/${item.id}`;
   const kind = item.kind || "document";
 
@@ -1265,11 +2236,7 @@ function renderViewer() {
     stage.append(wrap);
     audio.addEventListener("error", () => showViewerFallback(item, stage, "This audio format cannot play here. Download it instead."));
   } else if (kind === "image" || kind === "gif" || kind === "sticker") {
-    const img = document.createElement("img");
-    img.alt = item.name || "";
-    img.src = url;
-    stage.append(img);
-    img.addEventListener("error", () => showViewerFallback(item, stage, "This image cannot be shown. Download it to open in another app."));
+    openImageViewer(item, stage);
   } else if (item.reader && window.TFEReader) {
     stage.classList.add("reader");
     const reader = window.TFEReader;
@@ -1284,6 +2251,117 @@ function renderViewer() {
   } else {
     showViewerFallback(item, stage, previewHint(item));
   }
+}
+
+function destroyImageViewer() {
+  stopSlideshow();
+  if (S.imageViewer) {
+    try { S.imageViewer.destroy(); } catch (_) { /* already gone */ }
+  }
+  S.imageViewer = null;
+  S.imageGallery = [];
+}
+
+function imageGalleryItems(fallback) {
+  const gallery = S.items.filter((entry) =>
+    ["image", "gif", "sticker"].includes(entry.kind || "")
+    && !(entry.part_of && entry.part_of.count > 1));
+  if (!gallery.length) gallery.push(fallback);
+  return gallery;
+}
+
+function openImageViewer(item, stage) {
+  const galleryItems = imageGalleryItems(item);
+  const start = Math.max(0, galleryItems.findIndex((entry) => entry.id === item.id));
+  S.imageGallery = galleryItems;
+  stage.classList.add("image-mode");
+  if (!window.Viewer) {
+    stage.classList.remove("image-mode");
+    const img = document.createElement("img");
+    img.alt = item.name || "";
+    img.src = item.stream_url || `/api/stream/${item.id}`;
+    stage.append(img);
+    img.addEventListener("error", () => showViewerFallback(item, stage,
+      "This image cannot be shown. Download it to open in another app."));
+    return;
+  }
+  const holder = document.createElement("div");
+  holder.className = "image-gallery";
+  for (const entry of galleryItems) {
+    const img = document.createElement("img");
+    img.src = entry.thumb_url || entry.stream_url || `/api/stream/${entry.id}`;
+    img.dataset.original = entry.stream_url || `/api/stream/${entry.id}`;
+    img.dataset.id = String(entry.id);
+    img.alt = entry.name || "";
+    holder.append(img);
+  }
+  stage.append(holder);
+  const toolbar = {
+    zoomIn: 1, zoomOut: 1, oneToOne: 1, reset: 1,
+    rotateLeft: 1, rotateRight: 1, flipHorizontal: 1, flipVertical: 1
+  };
+  if (galleryItems.length > 1) {
+    Object.assign(toolbar, {
+      prev: 1,
+      next: 1,
+      play: {
+        // Viewer.js's own slideshow preloads every image; the app-level timer
+        // steps through Telegram streams one at a time instead.
+        click(event) { toggleSlideshow(event.currentTarget); }
+      }
+    });
+  }
+  try {
+    S.imageViewer = new Viewer(holder, {
+      inline: true,
+      initialViewIndex: start,
+      navbar: galleryItems.length > 1 ? { show: true, position: "top" } : false,
+      title: false,
+      button: false,
+      toolbar,
+      keyboard: false,
+      focus: false,
+      transition: false,
+      backdrop: false,
+      loading: true,
+      loop: true,
+      toggleOnDblclick: false,
+      url(image) { return image.dataset.original || image.src; }
+    });
+  } catch (_) {
+    S.imageViewer = null;
+    stage.classList.remove("image-mode");
+    const img = document.createElement("img");
+    img.src = item.stream_url || `/api/stream/${item.id}`;
+    stage.append(img);
+    return;
+  }
+  holder.addEventListener("view", (event) => {
+    const index = event.detail ? Number(event.detail.index) : 0;
+    const entry = galleryItems[index];
+    if (!entry) return;
+    S.viewerIndex = Math.max(0, S.items.findIndex((candidate) => candidate.id === entry.id));
+    updateViewerChrome(entry);
+  });
+  updateViewerChrome(item);
+}
+
+function toggleSlideshow(button) {
+  if (S.slideshow) { stopSlideshow(); toast("Slideshow stopped."); return; }
+  if (!S.imageViewer || S.imageGallery.length < 2) return;
+  S.slideshowDriven = true;
+  S.slideshow = setInterval(() => {
+    if (!S.imageViewer) { stopSlideshow(); return; }
+    S.imageViewer.next();
+  }, 4000);
+  if (button) button.classList.add("viewer-slideshow-on");
+  toast("Slideshow on — it advances every 4 seconds.", "success");
+}
+
+function stopSlideshow() {
+  if (S.slideshow) clearInterval(S.slideshow);
+  S.slideshow = null;
+  S.slideshowDriven = false;
 }
 
 function showVideoElement(item, stage, url) {
@@ -1401,12 +2479,19 @@ function showViewerFallback(item, stage, message) {
 }
 
 $("viewerClose").addEventListener("click", closeViewer);
-$("viewerPrev").addEventListener("click", () => {
-  if (S.viewerIndex > 0) { S.viewerIndex -= 1; renderViewer(); }
-});
-$("viewerNext").addEventListener("click", () => {
-  if (S.viewerIndex < S.items.length - 1) { S.viewerIndex += 1; renderViewer(); }
-});
+function stepViewer(delta) {
+  if (S.imageViewer && S.imageGallery.length > 1) {
+    if (delta < 0) S.imageViewer.prev();
+    else S.imageViewer.next();
+    return;
+  }
+  const next = S.viewerIndex + delta;
+  if (next < 0 || next >= S.items.length) return;
+  S.viewerIndex = next;
+  renderViewer();
+}
+$("viewerPrev").addEventListener("click", () => stepViewer(-1));
+$("viewerNext").addEventListener("click", () => stepViewer(1));
 $("viewerFavorite").addEventListener("click", async () => {
   const item = currentItem();
   if (!item) return;
@@ -2061,82 +3146,724 @@ function confirmAction(title, message, actionLabel, action) {
 
 function openItemInfo(item) {
   const body = document.createElement("div");
-  if (item.movie && item.movie.title) body.append(movieCard(item));
-  const rows = [
-    ["Name", item.name || "—"],
-    ["Type", shortKind(item)],
-    ["Size", humanSize(item.size)],
-    ["Folder", item.folder || "—"],
-    ["Date", humanDate(item.tg_date || item.added_at) || "—"],
-    ["Resolution", item.width && item.height ? `${item.width} × ${item.height}` : ""],
-    ["Duration", humanDuration(item.duration)],
-    ["Stars", (item.stars || []).map((star) => star.name).filter(Boolean).join(", ")],
-    ["Tags", item.tags || ""],
-    ["Collections", (item.collections || []).map((entry) => entry.name).filter(Boolean).join(", ")],
-    ["Caption", item.caption || ""],
-    ["Note", item.note || ""]
-  ].filter(([, value]) => value);
-  for (const [label, value] of rows) {
-    const row = document.createElement("div");
-    row.className = "info-row";
-    row.innerHTML = "<span></span><b></b>";
-    row.querySelector("span").textContent = label;
-    row.querySelector("b").textContent = value;
-    body.append(row);
+
+  const head = document.createElement("div");
+  head.className = "details-head";
+  const thumb = document.createElement("div");
+  thumb.className = "details-thumb";
+  if (item.has_thumb && item.thumb_url) {
+    const img = document.createElement("img");
+    img.alt = "";
+    img.loading = "lazy";
+    img.src = item.thumb_url;
+    thumb.append(img);
+  } else {
+    thumb.innerHTML = svg(itemIcon(item));
   }
-  if (item.part_of && item.part_of.count > 1) {
-    const row = document.createElement("div");
-    row.className = "info-row";
-    row.innerHTML = "<span>Split file</span><b></b>";
-    row.querySelector("b").textContent =
-      `${item.part_of.count} parts · ${humanSize(item.part_of.size)}`;
-    body.append(row);
-  }
-  const actions = document.createElement("div");
-  actions.className = "sheet-buttons";
-  const download = document.createElement("button");
-  download.className = "btn primary";
-  download.textContent = "Download";
-  download.addEventListener("click", () => { closeSheet(); downloadItem(item); });
-  actions.append(download);
+  const headCopy = document.createElement("div");
+  headCopy.className = "details-copy";
+  const headName = document.createElement("strong");
+  headName.textContent = item.name || "File";
+  const headMeta = document.createElement("small");
+  headMeta.textContent = [shortKind(item), humanSize(item.size),
+    humanDate(item.tg_date || item.added_at)].filter(Boolean).join(" · ");
+  headCopy.append(headName, headMeta);
+  head.append(thumb, headCopy);
+  body.append(head);
+
+  const quick = document.createElement("div");
+  quick.className = "details-actions";
 
   const favorite = document.createElement("button");
-  favorite.className = "btn";
-  favorite.textContent = item.favorite ? "Remove from favorites" : "Add to favorites";
+  favorite.type = "button";
+  favorite.innerHTML = `${svg("star")}<span>${item.favorite ? "Favorited" : "Favorite"}</span>`;
+  favorite.classList.toggle("on", Boolean(item.favorite));
   favorite.addEventListener("click", async () => {
     favorite.disabled = true;
     try {
       const next = !item.favorite;
       const data = await api(`/api/items/${item.id}`, { method: "PATCH", body: { favorite: next } });
       item.favorite = next;
-      const index = S.items.findIndex((entry) => entry.id === item.id);
-      if (index >= 0) S.items[index] = { ...S.items[index], ...(data.item || {}), favorite: next };
-      closeSheet();
-      openItemInfo(item);
+      patchItem(item, data.item || {}, { favorite: next });
+      favorite.classList.toggle("on", next);
+      favorite.querySelector("span").textContent = next ? "Favorited" : "Favorite";
+      if (!$("viewer").hidden) updateViewerFavorite(item);
       toast(next ? "Added to favorites." : "Removed from favorites.", "success");
     } catch (error) {
+      toast(error.message, "error");
+    } finally {
       favorite.disabled = false;
+    }
+  });
+  quick.append(favorite);
+
+  const download = document.createElement("button");
+  download.type = "button";
+  download.innerHTML = `${svg("download")}<span>Download</span>`;
+  download.addEventListener("click", () => { closeSheet(); downloadItem(item); });
+  quick.append(download);
+
+  if (item.telegram_link) {
+    const link = document.createElement("button");
+    link.type = "button";
+    link.innerHTML = `${svg("telegram")}<span>Telegram</span>`;
+    link.addEventListener("click", () => openExternal(item.telegram_link));
+    quick.append(link);
+  }
+  if (item.kind === "video" || item.kind === "document") {
+    const imdb = document.createElement("button");
+    imdb.type = "button";
+    imdb.innerHTML = `${svg("movie")}<span>${item.movie ? "IMDb" : "Look up"}</span>`;
+    imdb.addEventListener("click", () => promptMovie(item));
+    quick.append(imdb);
+  }
+  body.append(quick);
+
+  if (item.movie && item.movie.title) body.append(movieCard(item));
+
+  const facts = [
+    ["Type", shortKind(item)],
+    ["Size", humanSize(item.size)],
+    ["Date", humanDate(item.tg_date || item.added_at)],
+    ["Resolution", item.width && item.height ? `${item.width} × ${item.height}` : ""],
+    ["Duration", humanDuration(item.duration)],
+    ["Stars", (item.stars || []).map((star) => star.name).filter(Boolean).join(", ")],
+    ["Collections", (item.collections || []).map((entry) => entry.name).filter(Boolean).join(", ")],
+    ["Caption", item.caption || ""]
+  ].filter(([, value]) => value);
+  if (item.part_of && item.part_of.count > 1) {
+    facts.push(["Split file", `${item.part_of.count} parts · ${humanSize(item.part_of.size)}`]);
+  }
+  if (facts.length) {
+    const label = document.createElement("div");
+    label.className = "detail-section";
+    label.textContent = "Details";
+    body.append(label);
+    for (const [name, value] of facts) {
+      const row = document.createElement("div");
+      row.className = "info-row";
+      row.innerHTML = "<span></span><b></b>";
+      row.querySelector("span").textContent = name;
+      row.querySelector("b").textContent = value;
+      body.append(row);
+    }
+  }
+
+  const editLabel = document.createElement("div");
+  editLabel.className = "detail-section";
+  editLabel.textContent = "Edit";
+  body.append(editLabel);
+
+  const grid = document.createElement("div");
+  grid.className = "edit-grid";
+  const nameField = editField("Name", item.name || "", "Shown in this app only");
+  const folderField = editField("Folder", item.folder || "", "Top level / Sub folder");
+  folderField.input.setAttribute("list", "folderSuggestions");
+  const tagsField = editField("Tags", item.tags || "", "Separate tags with spaces or commas");
+  const noteField = editField("Note", item.note || "", "Private note kept in your library", "textarea");
+  grid.append(nameField.wrap, folderField.wrap, tagsField.wrap, noteField.wrap);
+
+  const folderList = document.createElement("datalist");
+  folderList.id = "folderSuggestions";
+  for (const entry of (S.nav && S.nav.folders) || []) {
+    if (!entry.folder) continue;
+    const option = document.createElement("option");
+    option.value = entry.folder;
+    folderList.append(option);
+  }
+  grid.append(folderList);
+
+  const tagList = ((S.nav && S.nav.tags) || []).slice(0, 12);
+  if (tagList.length) {
+    const suggest = document.createElement("div");
+    suggest.className = "tag-suggest";
+    for (const entry of tagList) {
+      const pill = document.createElement("button");
+      pill.type = "button";
+      pill.className = "tag-pill";
+      pill.textContent = `#${entry.tag}`;
+      pill.addEventListener("click", () => {
+        const current = tagsField.input.value.split(/[\s,]+/).filter(Boolean);
+        if (!current.includes(entry.tag)) current.push(entry.tag);
+        tagsField.input.value = current.join(" ");
+      });
+      suggest.append(pill);
+    }
+    tagsField.wrap.append(suggest);
+  }
+  body.append(grid);
+
+  const save = document.createElement("button");
+  save.type = "button";
+  save.className = "btn primary details-save";
+  save.textContent = "Save changes";
+  save.addEventListener("click", async () => {
+    const payload = {};
+    const name = nameField.input.value.trim();
+    if (name && name !== (item.name || "")) payload.name = name;
+    const folder = folderField.input.value.trim();
+    if (folder !== (item.folder || "")) payload.folder = folder;
+    const tags = tagsField.input.value.trim();
+    if (tags !== (item.tags || "")) payload.tags = tags;
+    const note = noteField.input.value.trim();
+    if (note !== (item.note || "")) payload.note = note;
+    if (!Object.keys(payload).length) { toast("Nothing changed."); return; }
+    save.disabled = true;
+    try {
+      const data = await api(`/api/items/${item.id}`, { method: "PATCH", body: payload });
+      Object.assign(item, data.item || {}, payload);
+      patchItem(item, data.item || {}, payload);
+      S.pageCache.clear();
+      closeSheet();
+      await loadNav();
+      if (S.tab === "folders") renderFolders();
+      else if (S.tab !== "more") renderItems();
+      updateChrome();
+      if (!$("viewer").hidden) updateViewerChrome(item);
+      toast("Saved.", "success");
+    } catch (error) {
+      save.disabled = false;
       toast(error.message, "error");
     }
   });
-  actions.append(favorite);
+  body.append(save);
 
-  if (item.kind === "video" || item.kind === "document") {
-    const imdb = document.createElement("button");
-    imdb.className = "btn";
-    imdb.textContent = item.movie ? "Update IMDb details" : "Look up on IMDb";
-    imdb.addEventListener("click", () => promptMovie(item));
-    actions.append(imdb);
+  const manageLabel = document.createElement("div");
+  manageLabel.className = "detail-section";
+  manageLabel.textContent = "Manage";
+  body.append(manageLabel);
+
+  if (item.hidden) {
+    body.append(sheetButton(
+      "eyeOff",
+      "Restore to library",
+      "Show this file in the lists again",
+      () => restoreItem(item)
+    ));
   }
   if (item.telegram_link) {
-    const link = document.createElement("button");
-    link.className = "btn";
-    link.textContent = "Open in Telegram";
-    link.addEventListener("click", () => openExternal(item.telegram_link));
-    actions.append(link);
+    body.append(sheetButton(
+      "telegram",
+      "Copy Telegram link",
+      "Paste it in chats or a browser",
+      async () => {
+        const ok = await copyText(item.telegram_link);
+        toast(
+          ok ? "Link copied." : "The clipboard is not available.",
+          ok ? "success" : "error"
+        );
+      }
+    ));
   }
-  body.append(actions);
+  body.append(sheetButton(
+    "user",
+    "Stars in this file",
+    (item.stars || []).map((star) => star.name).filter(Boolean).join(", ") || "Assign performers",
+    () => openItemStars(item)
+  ));
+  if (item.kind === "video") {
+    body.append(sheetButton(
+      "image",
+      "Choose thumbnail",
+      item.has_thumb ? "Pick a different frame from the video" : "Pick a frame from the video",
+      () => openThumbPicker(item)
+    ));
+  }
+  if (item.kind === "image" && item.has_thumb) {
+    body.append(sheetButton(
+      "user",
+      "Use as star portrait",
+      "Make this picture the face of a performer",
+      () => openPortraitPicker(item)
+    ));
+  }
+  body.append(sheetButton("info", "Inspect file", "Read the metadata stored inside it", () => inspectItemSheet(item)));
+  body.append(sheetButton("clock", "Other versions", "Earlier revisions of this file", () => openRevisions(item)));
+  body.append(sheetButton("collection", "Add to collection", "Group it with related files", () => openItemCollections(item)));
+  body.append(sheetButton(
+    "trash",
+    item.hidden ? "Delete…" : "Delete…",
+    "Remove from the library or from Telegram",
+    () => openItemDelete(item),
+    true
+  ));
+
   openSheet("File details", body);
+}
+
+function restoreItem(item) {
+  confirmAction(
+    "Restore to library?",
+    `${item.name || "This file"} becomes visible again in every screen.`,
+    "Restore",
+    async () => {
+      const data = await api(`/api/items/${item.id}`, {
+        method: "PATCH",
+        body: { hidden: false }
+      });
+      Object.assign(item, data.item || {}, { hidden: false });
+      closeSheet();
+      S.pageCache.clear();
+      await loadNav();
+      updateChrome();
+      if (S.tab === "folders") renderFolders();
+      else if (S.tab !== "more") renderItems();
+      toast("Restored to the library.", "success");
+    }
+  );
+}
+
+function openItemDelete(item) {
+  const body = document.createElement("div");
+  const text = document.createElement("p");
+  text.textContent = "Choose what should happen to this file.";
+  body.append(text);
+  body.append(sheetButton(
+    "eyeOff",
+    "Remove from library",
+    "Hides it here and in future syncs. The Telegram message stays.",
+    () => confirmAction(
+      "Remove from library?",
+      `${item.name || "This file"} disappears from the lists. Restore it from Hidden files.`,
+      "Remove",
+      async () => {
+        await api(`/api/items/${item.id}`, { method: "DELETE" });
+        await afterItemGone(item);
+        toast("Removed from the library.", "success", 5000);
+      }
+    )
+  ));
+  body.append(sheetButton(
+    "trash",
+    "Delete from Telegram",
+    "Deletes the channel message for every member. This cannot be undone.",
+    () => confirmAction(
+      "Delete from Telegram?",
+      `${item.name || "This file"} is deleted for every member of the channel. This cannot be undone.`,
+      "Delete",
+      async () => {
+        await api(`/api/items/${item.id}?remote=true`, { method: "DELETE" });
+        await afterItemGone(item);
+        toast("Deleted from Telegram.", "success");
+      }
+    ),
+    true
+  ));
+  openSheet(item.hidden ? "Restore or delete" : "Delete file", body);
+}
+
+async function afterItemGone(item) {
+  if (!$("viewer").hidden && currentItem() && currentItem().id === item.id) closeViewer();
+  S.items = S.items.filter((entry) => entry.id !== item.id);
+  S.pageCache.clear();
+  await loadNav();
+  updateChrome();
+  if (S.tab === "folders") renderFolders();
+  else if (S.tab !== "more") renderItems();
+}
+
+async function inspectItemSheet(item) {
+  const body = document.createElement("div");
+  body.innerHTML = '<div class="spinner"></div>'
+    + '<p class="muted small">Downloading the file to read its details…</p>';
+  openSheet("File details", body);
+  try {
+    const data = await api(`/api/items/${item.id}/inspect`, {
+      method: "POST",
+      body: {},
+      timeout: 600000
+    });
+    if (data.item) Object.assign(item, data.item);
+    const info = data.info || {};
+    const fields = info.fields || [];
+    body.innerHTML = "";
+    if (info.note) {
+      const note = document.createElement("p");
+      note.className = "muted small";
+      note.textContent = info.note;
+      body.append(note);
+    }
+    for (const pair of fields) {
+      const row = document.createElement("div");
+      row.className = "info-row";
+      row.innerHTML = "<span></span><b></b>";
+      row.querySelector("span").textContent = String(pair[0] ?? "");
+      row.querySelector("b").textContent = String(pair[1] ?? "");
+      body.append(row);
+    }
+    if (!fields.length && !info.note) {
+      const empty = document.createElement("p");
+      empty.textContent = "No extra details were found inside this file.";
+      body.append(empty);
+    }
+  } catch (error) {
+    body.innerHTML = "";
+    const p = document.createElement("p");
+    p.textContent = error.message;
+    body.append(p);
+  }
+}
+
+async function openRevisions(item) {
+  const body = document.createElement("div");
+  body.innerHTML = '<div class="spinner"></div>';
+  openSheet("Other versions", body);
+  try {
+    const data = await api(`/api/items/${item.id}/revisions`);
+    const items = data.items || [];
+    body.innerHTML = "";
+    if (!items.length) {
+      body.innerHTML = "<p>This file has no other versions.</p>";
+      return;
+    }
+    for (const entry of items) {
+      body.append(sheetButton(
+        "doc",
+        entry.name || "Version",
+        [shortKind(entry), humanSize(entry.size), humanDate(entry.tg_date || entry.added_at)]
+          .filter(Boolean).join(" · "),
+        () => openItemInfo(entry)
+      ));
+    }
+  } catch (error) {
+    body.innerHTML = "";
+    const p = document.createElement("p");
+    p.textContent = error.message;
+    body.append(p);
+  }
+}
+
+async function openItemStars(item) {
+  const body = document.createElement("div");
+  body.innerHTML = '<div class="spinner"></div>';
+  openSheet("Stars in this file", body);
+  let stars = [];
+  try {
+    const data = await api(`/api/stars?item=${item.id}`);
+    stars = data.stars || [];
+  } catch (error) {
+    body.innerHTML = "";
+    const p = document.createElement("p");
+    p.textContent = error.message;
+    body.append(p);
+    return;
+  }
+  const chosen = new Set(
+    stars.filter((star) => star.assigned).map((star) => Number(star.id))
+  );
+  const search = document.createElement("input");
+  search.type = "search";
+  search.placeholder = "Search performers";
+  search.autocomplete = "off";
+  search.className = "star-search";
+  const list = document.createElement("div");
+  const render = () => {
+    const term = search.value.trim().toLowerCase();
+    list.innerHTML = "";
+    const shown = stars.filter((star) => !term
+      || String(star.name || "").toLowerCase().includes(term)
+      || String(star.aliases || "").toLowerCase().includes(term));
+    if (!shown.length) {
+      const empty = document.createElement("p");
+      empty.className = "muted small";
+      empty.textContent = stars.length
+        ? "No performers match that search."
+        : "No performers yet. Create one below.";
+      list.append(empty);
+      return;
+    }
+    for (const star of shown) {
+      const picked = chosen.has(Number(star.id));
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = "sheet-action" + (picked ? " on" : "");
+      row.innerHTML = `${svg(picked ? "check" : "user")}`
+        + '<span class="copy"><strong></strong><small></small></span>';
+      row.querySelector("strong").textContent = star.name || "Unnamed performer";
+      row.querySelector("small").textContent = picked
+        ? `Assigned · ${starMeta(star)}`
+        : starMeta(star);
+      row.addEventListener("click", () => {
+        const id = Number(star.id);
+        if (chosen.has(id)) chosen.delete(id);
+        else chosen.add(id);
+        render();
+      });
+      list.append(row);
+    }
+  };
+  search.addEventListener("input", render);
+  render();
+
+  const create = document.createElement("div");
+  create.className = "star-pick-new";
+  const nameInput = document.createElement("input");
+  nameInput.type = "text";
+  nameInput.placeholder = "New performer name";
+  nameInput.maxLength = 80;
+  nameInput.autocomplete = "off";
+  const createBtn = document.createElement("button");
+  createBtn.type = "button";
+  createBtn.className = "btn";
+  createBtn.textContent = "Create";
+  createBtn.addEventListener("click", async () => {
+    const name = nameInput.value.trim();
+    if (!name) { toast("Enter a name for the new performer.", "error"); return; }
+    createBtn.disabled = true;
+    try {
+      const created = await api("/api/stars", { method: "POST", body: { name } });
+      stars.push(created);
+      chosen.add(Number(created.id));
+      nameInput.value = "";
+      render();
+      toast(`Created ${created.name}. Save to assign it.`, "success", 5000);
+    } catch (error) {
+      toast(error.message, "error");
+    } finally {
+      createBtn.disabled = false;
+    }
+  });
+  create.append(nameInput, createBtn);
+
+  const save = document.createElement("button");
+  save.type = "button";
+  save.className = "btn primary details-save";
+  save.textContent = "Save stars";
+  save.addEventListener("click", async () => {
+    save.disabled = true;
+    try {
+      const data = await api(`/api/items/${item.id}/stars`, {
+        method: "PUT",
+        body: { star_ids: [...chosen] }
+      });
+      item.stars = data.stars || [];
+      patchItem(item, { stars: item.stars });
+      S.pageCache.clear();
+      closeSheet();
+      await loadNav();
+      if (S.tab === "folders") renderFolders();
+      else if (S.tab !== "more") renderItems();
+      if (!$("viewer").hidden) updateViewerChrome(item);
+      toast(
+        item.stars.length
+          ? `Saved ${item.stars.length} performer(s).`
+          : "Stars cleared.",
+        "success"
+      );
+    } catch (error) {
+      save.disabled = false;
+      toast(error.message, "error");
+    }
+  });
+
+  body.innerHTML = "";
+  body.append(search, list, create, save);
+}
+
+function openThumbPicker(item) {
+  if (!(window.AndroidBridge && AndroidBridge.frameAt)) {
+    toast("Choosing a thumbnail needs the Android app.", "error");
+    return;
+  }
+  let duration = Number(item.duration) || 0;
+  const body = document.createElement("div");
+  const info = document.createElement("p");
+  info.className = "muted small";
+  info.textContent = "Reading frames from Telegram…";
+  const grid = document.createElement("div");
+  grid.className = "thumb-picker";
+  body.append(info, grid);
+  openSheet("Choose thumbnail", body);
+  const url = `/api/stream/${item.id}`;
+  if (duration < 1 && AndroidBridge.durationOf) {
+    let probed = 0;
+    try { probed = Number(AndroidBridge.durationOf(url)) || 0; } catch (_) { probed = 0; }
+    if (probed > 0) {
+      duration = probed / 1000;
+      item.duration = duration;
+    }
+  }
+  if (duration < 1) {
+    info.textContent = "This video's length could not be read, so frames cannot be picked.";
+    body.append(sheetButton(
+      "sync",
+      "Try again",
+      "Read the video length and frames once more",
+      () => openThumbPicker(item)
+    ));
+    return;
+  }
+  const times = [];
+  for (let step = 1; step <= 9; step += 1) {
+    times.push(Math.round(duration * 1000 * (step / 10)));
+  }
+  let pending = times.length;
+  let usable = 0;
+  let picked = false;
+  times.forEach((time, index) => {
+    const cell = document.createElement("button");
+    cell.type = "button";
+    cell.className = "thumb-cell";
+    cell.innerHTML = '<div class="spinner small"></div>';
+    grid.append(cell);
+    setTimeout(() => {
+      if (picked) return;
+      let data = "";
+      try { data = AndroidBridge.frameAt(url, time); } catch (_) { data = ""; }
+      pending -= 1;
+      cell.innerHTML = "";
+      if (data && data.indexOf("data:image/") === 0) {
+        usable += 1;
+        const img = document.createElement("img");
+        img.src = data;
+        img.alt = "";
+        cell.append(img);
+        const label = document.createElement("small");
+        label.textContent = humanDuration(time / 1000);
+        cell.append(label);
+        cell.addEventListener("click", () => {
+          picked = true;
+          chooseThumbFrame(item, data);
+        });
+      } else {
+        cell.classList.add("empty");
+        cell.textContent = "No frame";
+      }
+      if (!pending) {
+        info.textContent = usable
+          ? "Tap the picture you want as the thumbnail."
+          : "No frames could be read from this video.";
+      }
+    }, index * 500);
+  });
+  body.append(sheetButton(
+    "sync",
+    "Read the frames again",
+    "Try another pass over the video",
+    () => openThumbPicker(item)
+  ));
+}
+
+async function chooseThumbFrame(item, dataUrl) {
+  const body = document.createElement("div");
+  body.innerHTML = '<div class="spinner"></div><p class="muted small">Saving the thumbnail…</p>';
+  openSheet("Choose thumbnail", body);
+  try {
+    const data = await api(`/api/items/${item.id}/thumb/image`, {
+      method: "POST",
+      body: { image: dataUrl },
+      timeout: 120000
+    });
+    const updated = (data && data.item) || {};
+    Object.assign(item, updated);
+    patchItem(item, updated);
+    S.pageCache.clear();
+    closeSheet();
+    if (S.tab === "folders") renderFolders();
+    else if (S.tab !== "more") renderItems();
+    if (!$("viewer").hidden) updateViewerChrome(item);
+    toast("Thumbnail updated.", "success");
+  } catch (error) {
+    body.innerHTML = "";
+    const p = document.createElement("p");
+    p.textContent = error.message;
+    body.append(p);
+  }
+}
+
+async function openPortraitPicker(item) {
+  const body = document.createElement("div");
+  body.innerHTML = '<div class="spinner"></div>';
+  openSheet("Use as star portrait", body);
+  let stars = [];
+  try {
+    const data = await api("/api/stars?limit=2000");
+    stars = data.stars || [];
+  } catch (error) {
+    body.innerHTML = "";
+    const p = document.createElement("p");
+    p.textContent = error.message;
+    body.append(p);
+    return;
+  }
+  body.innerHTML = "";
+  if (!stars.length) {
+    body.innerHTML = "<p>No performers yet. Create one in More → Stars first.</p>";
+    return;
+  }
+  for (const star of stars) {
+    body.append(sheetButton(
+      "user",
+      star.name || "Unnamed performer",
+      `Use this picture for ${star.name || "the performer"}`,
+      async () => {
+        try {
+          const updated = await api(`/api/stars/${star.id}/image/from-item`, {
+            method: "POST",
+            body: { item_id: item.id }
+          });
+          closeSheet();
+          toast(`Portrait updated for ${updated.name || star.name}.`, "success");
+        } catch (error) { toast(error.message, "error"); }
+      }
+    ));
+  }
+  openSheet("Use as star portrait", body);
+}
+
+function openItemCollections(item) {
+  const collections = (S.nav && S.nav.collections) || [];
+  const body = document.createElement("div");
+  if (!collections.length) {
+    body.innerHTML = "<p>No collections yet. Create one in More → Collections.</p>";
+    openSheet("Add to collection", body);
+    return;
+  }
+  for (const collection of collections) {
+    body.append(sheetButton(
+      "collection",
+      collection.name,
+      `${Number(collection.n) || 0} file(s)`,
+      async () => {
+        try {
+          await api(`/api/collections/${collection.id}/items`, {
+            method: "POST",
+            body: { item_ids: [item.id], remove: false }
+          });
+          closeSheet();
+          await loadNav();
+          toast(`Added to ${collection.name}.`, "success");
+        } catch (error) { toast(error.message, "error"); }
+      }
+    ));
+  }
+  openSheet("Add to collection", body);
+}
+
+function editField(label, value, placeholder, type = "text") {
+  const wrap = document.createElement("label");
+  wrap.className = "edit-field";
+  const caption = document.createElement("span");
+  caption.textContent = label;
+  let input;
+  if (type === "textarea") {
+    input = document.createElement("textarea");
+    input.rows = 3;
+  } else {
+    input = document.createElement("input");
+    input.type = "text";
+  }
+  input.value = value;
+  if (placeholder) input.placeholder = placeholder;
+  input.autocomplete = "off";
+  wrap.append(caption, input);
+  return { wrap, input };
+}
+
+function patchItem(item, extra, fallback) {
+  const index = S.items.findIndex((entry) => entry.id === item.id);
+  if (index < 0) return;
+  S.items[index] = { ...S.items[index], ...(extra || {}), ...(fallback || {}) };
 }
 
 function movieCard(item) {
@@ -2332,6 +4059,88 @@ function promptMovie(item) {
 }
 
 /* ------------------------------------------------------------------ more */
+function themeLabel(theme) {
+  const entry = THEMES.find(([key]) => key === theme) || THEMES[0];
+  return entry[1];
+}
+
+function toggleView() {
+  S.view = S.view === "grid" ? "list" : "grid";
+  storeSet("tfe_view", S.view);
+  updateChrome();
+  if (S.tab === "folders" || S.tab === "more") return;
+  const top = $("content").scrollTop;
+  renderItems();
+  $("content").scrollTop = top;
+}
+
+function openThemeSheet() {
+  const body = document.createElement("div");
+  for (const [key, title, subtitle] of THEMES) {
+    const row = sheetButton("brush", title, subtitle, () => {
+      applyTheme(key);
+      closeSheet();
+      toast(`${title} theme applied.`, "success");
+    });
+    if (S.theme === key) {
+      row.classList.add("on");
+      const mark = document.createElement("span");
+      mark.className = "sheet-check";
+      mark.innerHTML = svg("check");
+      row.append(mark);
+    }
+    body.append(row);
+  }
+  openSheet("Appearance", body);
+}
+
+function openMenuSheet() {
+  const body = document.createElement("div");
+  const status = S.status || {};
+  body.append(sheetButton(
+    S.view === "grid" ? "list" : "grid",
+    S.view === "grid" ? "Use list view" : "Use grid view",
+    "Switch how files are shown",
+    () => { closeSheet(); toggleView(); }
+  ));
+  body.append(sheetButton(
+    "sort", "Sort files", `${sortLabel(S.sort)} · ${S.dir === "desc" ? "Descending" : "Ascending"}`,
+    () => { closeSheet(); openSortSheet(); }
+  ));
+  if (S.tab === "files" || S.tab === "favorites" || S.tab === "recent") {
+    body.append(sheetButton("select", "Select files", "Pick several files to download", () => {
+      closeSheet();
+      S.selecting = true;
+      syncSelectionChrome();
+    }));
+  }
+  body.append(sheetButton("brush", "Appearance", `Theme: ${themeLabel(S.theme)}`, () => {
+    closeSheet();
+    openThemeSheet();
+  }));
+  if (status.can_upload) {
+    body.append(sheetButton("upload", "Upload files", "Add files to this channel", () => {
+      closeSheet();
+      openUploadPicker();
+    }));
+  }
+  body.append(sheetButton("sync", "Sync now", "Fetch new files from Telegram", () => {
+    closeSheet();
+    startSync(false);
+  }));
+  if (status.pin_set) {
+    body.append(sheetButton("lock", "Lock now", "Require the PIN again", () => {
+      closeSheet();
+      lockNow();
+    }));
+  }
+  body.append(sheetButton("menu", "All settings", "Vault, tags, stars, PIN and more", () => {
+    closeSheet();
+    switchTab("more");
+  }));
+  openSheet("Options", body);
+}
+
 function renderMore() {
   const content = $("content");
   content.innerHTML = "";
@@ -2362,7 +4171,7 @@ function renderMore() {
   const nav = S.nav || {};
   list.append(moreRow("tag", "Tags", `${(nav.tags || []).length} tag(s)`, openTagsSheet));
   list.append(moreRow("collection", "Collections", `${(nav.collections || []).length} collection(s)`, openCollectionsSheet));
-  list.append(moreRow("user", "Stars", `${Number(nav.stars) || 0} performer(s)`, openStarsSheet));
+  list.append(moreRow("user", "Stars", `${Number(nav.stars) || 0} performer(s)`, () => openStarsSheet()));
   list.append(moreRow("eyeOff", "Hidden files", "Files marked hidden in the desktop app", () => useFilter("hidden", "", "Hidden files")));
 
   list.append(moreRow("sync", "Sync now", "Fetch new files from Telegram", () => startSync(false)));
@@ -2372,6 +4181,11 @@ function renderMore() {
     "Start full scan",
     () => startSync(true)
   )));
+  list.append(moreRow("info", "Server status", "Check the storage bot on your server", openServerSheet));
+  list.append(moreRow("files", "Storage report", "What this vault holds and the largest files", openStorageReport));
+  list.append(moreRow("collection", "Duplicate files", "Find copies that waste space", openDuplicatesSheet));
+  list.append(moreRow("folder", "Folders", "Create, rename and remove folders", openFoldersSheet));
+  list.append(moreRow("check", "Saved views", "Reuse folder and filter combinations", openSavedViewsSheet));
   list.append(moreRow("trash", "Clear cache", "Free space used by streaming and previews", openClearCache));
 
   if (status.pin_set) {
@@ -2443,12 +4257,364 @@ function openClearCache() {
   );
 }
 
+function infoRow(name, value) {
+  const row = document.createElement("div");
+  row.className = "info-row";
+  row.innerHTML = "<span></span><b></b>";
+  row.querySelector("span").textContent = name;
+  row.querySelector("b").textContent = value;
+  return row;
+}
+
+const SERVER_STATES = {
+  online: "Online",
+  stale: "Last seen a while ago",
+  offline: "Offline",
+  none: "No heartbeat yet",
+  unknown: "Unknown"
+};
+
+function plainAge(seconds) {
+  const value = Math.max(0, Math.round(Number(seconds) || 0));
+  if (value < 90) return `${value} second${value === 1 ? "" : "s"}`;
+  const minutes = Math.round(value / 60);
+  if (minutes < 90) return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 36) return `${hours} hour${hours === 1 ? "" : "s"}`;
+  const days = Math.round(hours / 24);
+  return `${days} day${days === 1 ? "" : "s"}`;
+}
+
+async function openServerSheet() {
+  const body = document.createElement("div");
+  body.innerHTML = '<div class="spinner"></div><p class="muted small">Checking the storage bot…</p>';
+  openSheet("Server status", body);
+  let data;
+  try {
+    data = await api("/api/server", { timeout: 30000 });
+  } catch (error) {
+    body.innerHTML = "";
+    const p = document.createElement("p");
+    p.textContent = error.message;
+    body.append(p);
+    body.append(sheetButton("sync", "Try again", "", openServerSheet));
+    return;
+  }
+  const state = data.state || "unknown";
+  const facts = [["Status", SERVER_STATES[state] || "Unknown"]];
+  if (typeof data.age === "number") {
+    facts.push(["Last heartbeat", `${plainAge(data.age)} ago`]);
+  } else if (data.reason) {
+    facts.push(["Detail", data.reason]);
+  }
+  if (data.version) facts.push(["Bot version", String(data.version)]);
+  if (data.files) facts.push(["Files indexed", String(data.files)]);
+  if (data.uptime) facts.push(["Uptime", plainAge(data.uptime)]);
+  body.innerHTML = "";
+  for (const [name, value] of facts) body.append(infoRow(name, value));
+  const note = document.createElement("p");
+  note.className = "muted small";
+  note.textContent = state === "online"
+    ? "The storage bot answered recently, so /commands and file links work from any device."
+    : "The app keeps working — the library lives in Telegram. If this stays red, the server bot is down or restarting.";
+  body.append(note);
+  body.append(sheetButton("sync", "Refresh", "Check again", openServerSheet));
+  body.append(sheetButton(
+    "telegram",
+    "Reconnect Telegram",
+    "Rebuild the connection without leaving the app",
+    async () => {
+      toast("Reconnecting…");
+      try {
+        await api("/api/reconnect", { method: "POST", timeout: 120000 });
+        toast("Telegram reconnected.", "success");
+      } catch (error) { toast(error.message, "error"); }
+    }
+  ));
+}
+
+async function openStorageReport() {
+  const body = document.createElement("div");
+  body.innerHTML = '<div class="spinner"></div><p class="muted small">Reading the library…</p>';
+  openSheet("Storage report", body);
+  try {
+    const data = await api("/api/reports/stats", { timeout: 120000 });
+    const kinds = data.kinds || [];
+    const largest = data.largest || [];
+    body.innerHTML = "";
+    const totalCount = kinds.reduce((sum, entry) => sum + (Number(entry.count) || 0), 0);
+    const totalSize = kinds.reduce((sum, entry) => sum + (Number(entry.size) || 0), 0);
+    body.append(infoRow("Files", String(totalCount)));
+    body.append(infoRow("Size", humanSize(totalSize)));
+    body.append(infoRow("Collections", String(data.collections ?? 0)));
+    body.append(infoRow("Saved views", String(data.views ?? 0)));
+    if (kinds.length) {
+      const label = document.createElement("div");
+      label.className = "detail-section";
+      label.textContent = "By type";
+      body.append(label);
+      for (const entry of kinds) {
+        body.append(infoRow(entry.label || entry.kind || "File",
+          `${entry.count} · ${humanSize(entry.size)}`));
+      }
+    }
+    if (largest.length) {
+      const label = document.createElement("div");
+      label.className = "detail-section";
+      label.textContent = "Largest files";
+      body.append(label);
+      for (const entry of largest) {
+        body.append(sheetButton(
+          itemIcon(entry),
+          entry.name || "File",
+          [shortKind(entry), humanSize(entry.size)].filter(Boolean).join(" · "),
+          () => openItemInfo(entry)
+        ));
+      }
+    }
+  } catch (error) {
+    body.innerHTML = "";
+    const p = document.createElement("p");
+    p.textContent = error.message;
+    body.append(p);
+  }
+}
+
+async function openDuplicatesSheet() {
+  const body = document.createElement("div");
+  body.innerHTML = '<div class="spinner"></div><p class="muted small">Looking for identical files…</p>';
+  openSheet("Duplicate files", body);
+  try {
+    const data = await api("/api/reports/duplicates?limit=100", { timeout: 120000 });
+    const groups = data.groups || [];
+    body.innerHTML = "";
+    if (!groups.length) {
+      body.innerHTML = "<p>No duplicate files found.</p>";
+      return;
+    }
+    body.append(infoRow("Groups", String(data.group_count ?? groups.length)));
+    body.append(infoRow("Could be saved", humanSize(data.wasted)));
+    for (const group of groups) {
+      body.append(sheetButton(
+        "doc",
+        group.name || "File",
+        `${group.count} copies · ${humanSize(group.size)} each`,
+        () => openDuplicateGroup(group)
+      ));
+    }
+  } catch (error) {
+    body.innerHTML = "";
+    const p = document.createElement("p");
+    p.textContent = error.message;
+    body.append(p);
+  }
+}
+
+function openDuplicateGroup(group) {
+  const body = document.createElement("div");
+  for (const entry of group.items || []) {
+    body.append(sheetButton(
+      itemIcon(entry),
+      entry.name || "Copy",
+      [humanDate(entry.tg_date || entry.added_at), entry.folder || "No folder"].filter(Boolean).join(" · "),
+      () => openItemInfo(entry)
+    ));
+  }
+  openSheet(`${group.count} copies`, body);
+}
+
+async function openFoldersSheet() {
+  const body = document.createElement("div");
+  body.innerHTML = '<div class="spinner"></div>';
+  openSheet("Folders", body);
+  try {
+    const data = await api("/api/nav");
+    const folders = data.folders || [];
+    body.innerHTML = "";
+    if (!folders.length) body.innerHTML = "<p>No folders yet.</p>";
+    for (const entry of folders) {
+      body.append(sheetButton(
+        "folder",
+        `${entry.icon ? entry.icon + " " : ""}${entry.folder}`,
+        `${Number(entry.n) || 0} file(s)${entry.note ? " · " + entry.note : ""}`,
+        () => openFolderActions(entry)
+      ));
+    }
+    body.append(sheetButton("folder", "New folder", "Create an empty folder", () => {
+      promptText("New folder", "Folder path", "", "Top level / Sub folder", "Create", async (name) => {
+        if (!name) throw new Error("Type a folder name.");
+        await api("/api/folders", { method: "POST", body: { name } });
+        await loadNav();
+        toast("Folder created.", "success");
+        setTimeout(openFoldersSheet, 80);
+      });
+    }));
+  } catch (error) {
+    body.innerHTML = "";
+    const p = document.createElement("p");
+    p.textContent = error.message;
+    body.append(p);
+  }
+}
+
+function openFolderActions(entry) {
+  const body = document.createElement("div");
+  const text = document.createElement("p");
+  text.className = "muted small";
+  text.textContent = `${Number(entry.n) || 0} file(s) · ${humanSize(entry.size)}`;
+  body.append(text);
+  body.append(sheetButton("folder", "Open folder", "Browse the files inside", () => {
+    closeSheet();
+    openFolder(entry.folder);
+  }));
+  body.append(sheetButton("edit", "Rename folder", "Files keep their place in the new name", () => {
+    promptText("Rename folder", "New name", entry.folder, "Top level / Sub folder", "Rename", async (name) => {
+      if (!name) throw new Error("Type a folder name.");
+      await api("/api/folders", { method: "PATCH", body: { name: entry.folder, new_name: name } });
+      await loadNav();
+      toast("Folder renamed.", "success");
+      setTimeout(openFoldersSheet, 80);
+    });
+  }));
+  body.append(sheetButton("brush", "Folder icon", "An emoji shown with the folder", () => {
+    const icons = ["", "📁", "🎬", "🖼️", "🎵", "📚", "🗄️", "⭐", "🔥", "💎"];
+    const grid = document.createElement("div");
+    grid.className = "vault-icons";
+    for (const icon of icons) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "vault-icon" + (icon === (entry.icon || "") ? " on" : "");
+      button.textContent = icon || "∅";
+      button.addEventListener("click", async () => {
+        try {
+          await api("/api/folders", {
+            method: "PATCH",
+            body: { name: entry.folder, icon }
+          });
+          await loadNav();
+          toast("Folder icon saved.", "success");
+          openFoldersSheet();
+        } catch (error) { toast(error.message, "error"); }
+      });
+      grid.append(button);
+    }
+    const wrap = document.createElement("div");
+    wrap.append(grid);
+    openSheet("Folder icon", wrap);
+  }));
+  body.append(sheetButton("edit", "Folder note", "A short reminder shown in this list", () => {
+    promptText("Folder note", "Note", entry.note || "", "Optional note", "Save", async (note) => {
+      await api("/api/folders", { method: "PATCH", body: { name: entry.folder, note } });
+      await loadNav();
+      toast("Folder note saved.", "success");
+      setTimeout(openFoldersSheet, 80);
+    });
+  }));
+  body.append(sheetButton("trash", "Remove folder", "Only empty folders can be removed", () => {
+    confirmAction(
+      "Remove folder?",
+      `${entry.folder} is deleted when it holds no files.`,
+      "Remove",
+      async () => {
+        await api(`/api/folders?name=${encodeURIComponent(entry.folder)}`, { method: "DELETE" });
+        await loadNav();
+        toast("Folder removed.", "success");
+        setTimeout(openFoldersSheet, 80);
+      }
+    );
+  }, true));
+  openSheet(entry.name || entry.folder, body);
+}
+
+async function openSavedViewsSheet() {
+  const body = document.createElement("div");
+  body.innerHTML = '<div class="spinner"></div>';
+  openSheet("Saved views", body);
+  let views = [];
+  try {
+    const data = await api("/api/saved-views");
+    views = data.views || [];
+  } catch (error) {
+    body.innerHTML = "";
+    const p = document.createElement("p");
+    p.textContent = error.message;
+    body.append(p);
+    return;
+  }
+  body.innerHTML = "";
+  if (!views.length) body.innerHTML = "<p>No saved views yet.</p>";
+  for (const view of views) {
+    body.append(sheetButton(
+      "check",
+      view.name || "View",
+      viewSummary(view),
+      () => applyMobileView(view)
+    ));
+  }
+  body.append(sheetButton("check", "Save the current view", "Store the folder, filters and search", saveMobileView));
+}
+
+function viewSummary(view) {
+  const data = (view && view.data) || {};
+  const bits = [];
+  if (data.folder) bits.push(data.folder);
+  const filters = data.filters || {};
+  if (filters.tag) bits.push(`#${filters.tag}`);
+  if (filters.kind) bits.push(filters.kind);
+  if (data.starId) bits.push("star");
+  if (data.collection) bits.push("collection");
+  return bits.join(" · ") || "All files";
+}
+
+function applyMobileView(view) {
+  const data = (view && view.data) || {};
+  const filters = data.filters || {};
+  clearFilters(false);
+  S.tab = "files";
+  S.folder = data.folder || "";
+  S.kind = filters.kind || data.kind || "all";
+  S.tag = filters.tag || data.tag || "";
+  S.filterLabel = S.tag ? `Tag: ${S.tag}` : "";
+  if (data.sort) S.sort = data.sort;
+  if (data.dir) S.dir = data.dir;
+  closeSheet();
+  for (const button of $("tabs").querySelectorAll("button")) {
+    button.classList.toggle("active", button.dataset.tab === "files");
+  }
+  resetSearch();
+  renderCrumb();
+  updateChrome();
+  renderChips();
+  loadItems({ reset: true });
+  $("content").scrollTop = 0;
+}
+
+function saveMobileView() {
+  promptText("Save this view", "View name", "", "My view", "Save", async (name) => {
+    const filters = {};
+    if (S.kind) filters.kind = S.kind;
+    if (S.tag) filters.tag = S.tag;
+    const data = { navMode: "all", folder: S.folder || "", sort: S.sort, dir: S.dir, filters };
+    await api("/api/saved-views", { method: "POST", body: { name: name || "My view", data } });
+    await loadNav();
+    toast("View saved.", "success");
+    setTimeout(openSavedViewsSheet, 80);
+  });
+}
+
+
 async function openVaultSheet() {
   const body = document.createElement("div");
   body.innerHTML = '<div class="spinner"></div>';
   openSheet("Storage vaults", body);
+  await loadVaultSheet(body, false);
+}
+
+async function loadVaultSheet(body, refresh) {
   try {
-    const data = await api("/api/vaults?refresh=true");
+    const data = await api(`/api/vaults${refresh ? "?refresh=true" : ""}`, {
+      timeout: refresh ? 120000 : 20000
+    });
     const vaults = data.vaults || [];
     body.innerHTML = "";
     if (!vaults.length) {
@@ -2457,10 +4623,14 @@ async function openVaultSheet() {
     }
     for (const vault of vaults) {
       const active = String((S.status.vault || {}).id) === String(vault.id);
+      const flags = [
+        active ? "Current vault" : "Tap to switch",
+        vault.default ? "default" : ""
+      ].filter(Boolean).join(" · ");
       const row = sheetButton(
         "vault",
-        vault.title || String(vault.id),
-        active ? "Current vault" : "Tap to switch",
+        `${vault.icon || "🗄️"}  ${vault.title || String(vault.id)}`,
+        flags,
         async () => {
           closeSheet();
           if (active) return;
@@ -2474,17 +4644,80 @@ async function openVaultSheet() {
       );
       body.append(row);
     }
+    const current = vaults.find(
+      (vault) => String(vault.id) === String(((S.status || {}).vault || {}).id)
+    );
+    if (current) {
+      body.append(sheetButton(
+        current.default ? "star" : "check",
+        current.default ? "Stop opening on launch" : "Open this vault on launch",
+        current.default
+          ? "Currently the default vault"
+          : `${current.title || "This vault"} will be selected at the PIN screen`,
+        async () => {
+          try {
+            const data = await api("/api/vaults/default", {
+              method: "POST",
+              body: { id: current.default ? "" : String(current.id) }
+            });
+            S.status = { ...(S.status || {}), vault: data.vault || S.status.vault, vaults: data.vaults || [] };
+            S.vaults = data.vaults || [];
+            toast(
+              current.default
+                ? "The last used vault opens on launch."
+                : `${current.title || "This vault"} opens on launch.`,
+              "success"
+            );
+            await loadVaultSheet(body, false);
+          } catch (error) { toast(error.message, "error"); }
+        }
+      ));
+      body.append(sheetButton("edit", "Rename this vault", "Change the channel title", () => promptVaultName(current)));
+      body.append(sheetButton("brush", "Vault icon", "Pick the emoji shown in the vault lists", () => openVaultIconSheet(current)));
+      body.append(sheetButton("key", "Add the storage bot", "Give the bot admin access to this vault", async () => {
+        try {
+          const result = await api("/api/vaults/bot", { method: "POST", body: { id: String(current.id) } });
+          toast(
+            result && result.added ? "The storage bot now has access." :
+            (result && result.message) || "The bot was not added.",
+            result && result.added ? "success" : "error"
+          );
+        } catch (error) { toast(error.message, "error"); }
+      }));
+    }
+    body.append(sheetButton("vault", "New storage vault", "Create a private channel in Telegram", openCreateVault));
+    body.append(sheetButton(
+      "sync",
+      "Refresh list",
+      "Look for vaults created elsewhere",
+      async () => {
+        body.innerHTML = '<div class="spinner"></div><p class="muted small">Looking for vaults in Telegram…</p>';
+        await loadVaultSheet(body, true);
+      }
+    ));
   } catch (error) {
     body.innerHTML = "";
     const p = document.createElement("p");
-    p.textContent = error.message;
+    p.textContent = refresh
+      ? `${error.message} Showing the known vaults instead.`
+      : error.message;
     body.append(p);
+    body.append(sheetButton(
+      refresh ? "vault" : "sync",
+      refresh ? "Show the known vaults" : "Try again",
+      "",
+      () => loadVaultSheet(body, false)
+    ));
   }
 }
 
 async function switchToVault(vault, pin) {
   toast("Switching vault…");
-  await api("/api/vaults/switch", { method: "POST", body: { id: String(vault.id), pin } });
+  await api("/api/vaults/switch", {
+    method: "POST",
+    body: { id: String(vault.id), pin },
+    timeout: 180000
+  });
   S.status = await api("/api/status");
   clearFilters(false);
   S.folder = "";
@@ -2547,6 +4780,128 @@ function openSwitchPin(vault, onPin) {
   setTimeout(() => input.focus(), 50);
 }
 
+function promptText(title, label, value, placeholder, actionLabel, onSave) {
+  const body = document.createElement("div");
+  const field = editField(label, value || "", placeholder);
+  field.input.autocomplete = "off";
+  const error = document.createElement("p");
+  error.className = "form-error";
+  const actions = document.createElement("div");
+  actions.className = "sheet-buttons";
+  const go = document.createElement("button");
+  go.type = "button";
+  go.className = "btn primary";
+  go.textContent = actionLabel;
+  const run = async () => {
+    go.disabled = true;
+    error.textContent = "";
+    try {
+      await onSave(field.input.value.trim());
+      closeSheet();
+    } catch (err) {
+      error.textContent = err.message;
+      go.disabled = false;
+    }
+  };
+  go.addEventListener("click", run);
+  field.input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") { event.preventDefault(); run(); }
+  });
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "btn ghost";
+  cancel.textContent = "Cancel";
+  cancel.addEventListener("click", () => closeSheet());
+  actions.append(go, cancel);
+  body.append(field.wrap, error, actions);
+  openSheet(title, body);
+  setTimeout(() => field.input.focus(), 50);
+}
+
+function promptVaultName(vault) {
+  promptText(
+    "Rename vault",
+    "Channel title",
+    vault.title || "",
+    "Main Storage",
+    "Rename",
+    async (title) => {
+      if (!title) throw new Error("Type a name for the vault.");
+      const data = await api("/api/vaults/rename", {
+        method: "POST",
+        body: { id: String(vault.id), title }
+      });
+      S.status = { ...(S.status || {}), vault: data.vault || S.status.vault, vaults: data.vaults || [] };
+      toast("Vault renamed.", "success");
+    }
+  );
+}
+
+const VAULT_ICONS = [
+  "🗄️", "📦", "🗃️", "💾", "🎞️",
+  "📚", "🔐", "🚀", "🌙", "🔥",
+  "💎", "🧊", "🌊", "🍀", "⚡",
+  "🎬", "🖼️", "📀", "🧰", "🧿"
+];
+
+function openVaultIconSheet(vault) {
+  const body = document.createElement("div");
+  body.className = "vault-icons";
+  for (const icon of VAULT_ICONS) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "vault-icon" + (icon === (vault.icon || "🗄️") ? " on" : "");
+    button.textContent = icon;
+    button.addEventListener("click", async () => {
+      try {
+        const data = await api("/api/vaults/icon", {
+          method: "POST",
+          body: { id: String(vault.id), icon }
+        });
+        S.status = { ...(S.status || {}), vault: data.vault || S.status.vault, vaults: data.vaults || [] };
+        closeSheet();
+        toast("Vault icon updated.", "success");
+      } catch (error) { toast(error.message, "error"); }
+    });
+    body.append(button);
+  }
+  openSheet("Vault icon", body);
+}
+
+function openCreateVault() {
+  promptText(
+    "New storage vault",
+    "Name",
+    "",
+    "Main Storage 2",
+    "Create vault",
+    async (name) => {
+      if (!name) throw new Error("Give the new vault a name.");
+      toast("Creating the channel in Telegram…");
+      const data = await api("/api/vaults/create", {
+        method: "POST",
+        body: { name },
+        timeout: 180000
+      });
+      S.status = { ...(S.status || {}), vault: data.vault || null, vaults: data.vaults || [] };
+      clearFilters(false);
+      S.folder = "";
+      await loadNav();
+      updateChrome();
+      if (S.tab === "more") renderMore();
+      else loadItems({ reset: true });
+      const bot = data.bot || {};
+      toast(
+        bot.added ? `Created ${name} and added the storage bot.` :
+        `Created ${name}. ${bot.message || ""}`.trim(),
+        "success",
+        6000
+      );
+      pollSync();
+    }
+  );
+}
+
 function sortLabel(value) {
   const found = SORTS.find(([key]) => key === value);
   return found ? found[1] : "Date modified";
@@ -2606,7 +4961,98 @@ function openTagsSheet() {
       () => useFilter("tag", tag.tag, `Tag: ${tag.tag}`)
     ));
   }
+  if (tags.length) {
+    body.append(sheetButton(
+      "edit",
+      "Tag colours and groups",
+      "Colour-code tags and group related ones",
+      openTagManager
+    ));
+  }
   openSheet("Tags", body);
+}
+
+const TAG_COLORS = ["", "#229ED9", "#7c5cff", "#e0457b", "#f0a020", "#27ae60", "#8e44ad", "#e74c3c", "#0ca678", "#6b7280"];
+
+function openTagManager() {
+  const body = document.createElement("div");
+  const tags = (S.nav && S.nav.tags) || [];
+  if (!tags.length) {
+    body.innerHTML = "<p>No tags yet. Add tags to files first.</p>";
+  }
+  for (const tag of tags) {
+    body.append(sheetButton(
+      "tag",
+      tag.tag,
+      [tag.group || "", `${tag.count} file${tag.count === 1 ? "" : "s"}`, tag.color || ""]
+        .filter(Boolean).join(" · "),
+      () => promptTagMeta(tag)
+    ));
+  }
+  openSheet("Tag colours and groups", body);
+}
+
+function promptTagMeta(tag) {
+  const body = document.createElement("div");
+  const note = document.createElement("p");
+  note.className = "muted small";
+  note.textContent = `Tag #${tag.tag}`;
+  let color = tag.color || "";
+  const colourField = document.createElement("div");
+  colourField.className = "edit-field";
+  const colourLabel = document.createElement("span");
+  colourLabel.textContent = "Colour";
+  const swatches = document.createElement("div");
+  swatches.className = "swatch-row";
+  const paint = () => {
+    swatches.innerHTML = "";
+    for (const value of TAG_COLORS) {
+      const dot = document.createElement("button");
+      dot.type = "button";
+      dot.className = "swatch" + (value ? "" : " none") + (value === color ? " active" : "");
+      dot.title = value || "No colour";
+      if (value) dot.style.setProperty("--swatch", value);
+      dot.addEventListener("click", () => { color = value; paint(); });
+      swatches.append(dot);
+    }
+  };
+  paint();
+  colourField.append(colourLabel, swatches);
+  const group = editField("Group", tag.group || "", "Optional group");
+  group.input.autocomplete = "off";
+  const error = document.createElement("p");
+  error.className = "form-error";
+  const actions = document.createElement("div");
+  actions.className = "sheet-buttons";
+  const go = document.createElement("button");
+  go.type = "button";
+  go.className = "btn primary";
+  go.textContent = "Save";
+  go.addEventListener("click", async () => {
+    go.disabled = true;
+    error.textContent = "";
+    try {
+      await api("/api/tags/meta", {
+        method: "POST",
+        body: { tag: tag.tag, color, group: group.input.value.trim() }
+      });
+      await loadNav();
+      closeSheet();
+      toast("Tag saved.", "success");
+      setTimeout(openTagManager, 80);
+    } catch (err) {
+      error.textContent = err.message;
+      go.disabled = false;
+    }
+  });
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "btn ghost";
+  cancel.textContent = "Cancel";
+  cancel.addEventListener("click", () => { closeSheet(); setTimeout(openTagManager, 80); });
+  actions.append(go, cancel);
+  body.append(note, colourField, group.wrap, error, actions);
+  openSheet("Tag colour and group", body);
 }
 
 async function openCollectionsSheet() {
@@ -2618,8 +5064,7 @@ async function openCollectionsSheet() {
     const collections = data.collections || [];
     body.innerHTML = "";
     if (!collections.length) {
-      body.innerHTML = "<p>No collections yet. Group files into collections in the desktop app.</p>";
-      return;
+      body.innerHTML = "<p>No collections yet. Create one below.</p>";
     }
     for (const collection of collections) {
       body.append(sheetButton(
@@ -2629,6 +5074,30 @@ async function openCollectionsSheet() {
         () => useFilter("collection", collection.id, `Collection: ${collection.name}`)
       ));
     }
+    body.append(sheetButton("collection", "New collection", "Create an empty collection", () => {
+      promptText("New collection", "Name", "", "Collection name", "Create", async (name) => {
+        if (!name) throw new Error("Type a name.");
+        await api("/api/collections", { method: "POST", body: { name } });
+        await loadNav();
+        if (S.tab === "more") renderMore();
+        toast("Collection created.", "success");
+        setTimeout(openCollectionsSheet, 80);
+      });
+    }));
+    if (collections.length) {
+      body.append(sheetButton("edit", "Organise collections", "Rename or remove a collection", () => {
+        const list = document.createElement("div");
+        for (const collection of collections) {
+          list.append(sheetButton(
+            "collection",
+            collection.name || "Collection",
+            `${collection.n || 0} file(s)`,
+            () => openCollectionActions(collection)
+          ));
+        }
+        openSheet("Organise collections", list);
+      }));
+    }
   } catch (error) {
     body.innerHTML = "";
     const p = document.createElement("p");
@@ -2637,37 +5106,221 @@ async function openCollectionsSheet() {
   }
 }
 
+function openCollectionActions(collection) {
+  const body = document.createElement("div");
+  body.append(sheetButton("edit", "Rename", "Change the collection name", () => {
+    promptText("Rename collection", "Name", collection.name || "", "Collection name", "Rename", async (name) => {
+      if (!name) throw new Error("Type a name.");
+      await api(`/api/collections/${collection.id}`, { method: "PATCH", body: { name } });
+      await loadNav();
+      if (S.tab === "more") renderMore();
+      toast("Collection renamed.", "success");
+      setTimeout(openCollectionsSheet, 80);
+    });
+  }));
+  body.append(sheetButton("trash", "Delete collection", "Files stay where they are", () => {
+    confirmAction(
+      "Delete collection?",
+      `${collection.name || "This collection"} is removed. The files inside stay untouched.`,
+      "Delete",
+      async () => {
+        await api(`/api/collections/${collection.id}`, { method: "DELETE" });
+        await loadNav();
+        if (S.tab === "more") renderMore();
+        toast("Collection deleted.", "success");
+        setTimeout(openCollectionsSheet, 80);
+      }
+    );
+  }, true));
+  openSheet(collection.name || "Collection", body);
+}
+
+const STAR_OPEN_KEY = "tfe_star_open";
+
+function starInitials(name) {
+  const words = String(name || "").trim().split(/\s+/).filter(Boolean);
+  if (!words.length) return "★";
+  const first = (words[0][0] || "").toUpperCase();
+  const last = words.length > 1 ? (words[words.length - 1][0] || "").toUpperCase() : "";
+  return first + last;
+}
+
+function starLetter(name) {
+  const match = String(name || "").trim().match(/^[a-z]/i);
+  return match ? match[0].toUpperCase() : "#";
+}
+
+function starLetters(stars) {
+  const letters = [...new Set(stars.map((star) => starLetter(star.name)))];
+  return letters.sort((a, b) => (a === "#" ? 1 : b === "#" ? -1 : a.localeCompare(b)));
+}
+
+function starMeta(star) {
+  const n = Number(star.n) || 0;
+  const bits = [`${n} file${n === 1 ? "" : "s"}`];
+  const videos = Number(star.videos) || 0;
+  const images = Number(star.images) || 0;
+  if (videos) bits.push(`${videos} video${videos === 1 ? "" : "s"}`);
+  if (images) bits.push(`${images} image${images === 1 ? "" : "s"}`);
+  return bits.join(" · ");
+}
+
+function starAvatar(star) {
+  const avatar = document.createElement("span");
+  avatar.className = "star-avatar";
+  const fallback = () => {
+    avatar.classList.add("initial");
+    avatar.textContent = starInitials(star.name);
+  };
+  if (star.image_url) {
+    const image = document.createElement("img");
+    image.src = star.image_url;
+    image.alt = "";
+    image.loading = "lazy";
+    image.decoding = "async";
+    image.addEventListener("error", () => { image.remove(); fallback(); });
+    avatar.append(image);
+  } else {
+    fallback();
+  }
+  return avatar;
+}
+
+function starRow(star) {
+  const row = document.createElement("button");
+  row.type = "button";
+  row.className = "star-row";
+  const copy = document.createElement("span");
+  copy.className = "star-copy";
+  const name = document.createElement("strong");
+  name.textContent = star.name || "Unnamed performer";
+  const meta = document.createElement("small");
+  meta.textContent = starMeta(star);
+  copy.append(name, meta);
+  row.append(starAvatar(star), copy);
+  if (star.favorite) {
+    const fav = document.createElement("span");
+    fav.className = "star-fav";
+    fav.innerHTML = svg("star");
+    row.append(fav);
+  }
+  row.addEventListener("click", () => useFilter("star", star.id, `Star: ${star.name}`));
+  return row;
+}
+
 async function openStarsSheet(query = "") {
   const body = document.createElement("div");
   const search = document.createElement("input");
   search.type = "search";
   search.placeholder = "Find a performer";
   search.autocomplete = "off";
+  search.className = "star-search";
   search.value = query;
-  search.style.marginBottom = "10px";
+  const tools = document.createElement("div");
+  tools.className = "tree-toolbar";
+  const expand = document.createElement("button");
+  expand.type = "button";
+  expand.textContent = "Expand all";
+  const collapse = document.createElement("button");
+  collapse.type = "button";
+  collapse.textContent = "Collapse all";
+  tools.append(expand, collapse);
   const list = document.createElement("div");
   list.innerHTML = '<div class="spinner"></div>';
-  body.append(search, list);
+  body.append(search, tools, list);
   openSheet("Stars", body);
+
+  let stars = [];
+  let openSet = null;
+  const saved = storeGet(STAR_OPEN_KEY, null);
+  if (saved !== null) {
+    try { openSet = new Set(JSON.parse(saved) || []); } catch (_) { openSet = new Set(); }
+  }
+  const persistOpen = () => {
+    storeSet(STAR_OPEN_KEY, JSON.stringify([...(openSet || [])]));
+  };
+
+  const paintGroups = () => {
+    list.innerHTML = "";
+    const letters = starLetters(stars);
+    const groups = new Map();
+    for (const star of stars) {
+      const letter = starLetter(star.name);
+      if (!groups.has(letter)) groups.set(letter, []);
+      groups.get(letter).push(star);
+    }
+    for (const letter of letters) {
+      const members = groups.get(letter);
+      const open = openSet ? openSet.has(letter) : true;
+      const section = document.createElement("section");
+      section.className = "star-group" + (open ? " open" : "");
+      const head = document.createElement("button");
+      head.type = "button";
+      head.className = "star-letter";
+      head.setAttribute("aria-expanded", String(open));
+      head.innerHTML = `<span class="star-chev">${svg("chev")}</span>`
+        + '<span class="star-letter-name"></span><span class="star-letter-count"></span>';
+      head.querySelector(".star-letter-name").textContent = letter;
+      head.querySelector(".star-letter-count").textContent =
+        `${members.length} performer${members.length === 1 ? "" : "s"}`;
+      head.addEventListener("click", () => {
+        if (!openSet) openSet = new Set(letters);
+        if (openSet.has(letter)) openSet.delete(letter);
+        else openSet.add(letter);
+        persistOpen();
+        paintGroups();
+      });
+      const rows = document.createElement("div");
+      rows.className = "star-rows";
+      if (open) for (const star of members) rows.append(starRow(star));
+      section.append(head, rows);
+      list.append(section);
+    }
+  };
+
+  const paintResults = () => {
+    list.innerHTML = "";
+    const box = document.createElement("div");
+    box.className = "star-results";
+    for (const star of stars) box.append(starRow(star));
+    list.append(box);
+  };
+
+  const paint = (text) => {
+    if (!stars.length) {
+      list.innerHTML = "<p>No performers found.</p>";
+      tools.hidden = true;
+      return;
+    }
+    tools.hidden = !!text;
+    if (text) paintResults();
+    else paintGroups();
+  };
+
+  expand.addEventListener("click", () => {
+    openSet = new Set(starLetters(stars));
+    persistOpen();
+    paintGroups();
+  });
+  collapse.addEventListener("click", () => {
+    openSet = new Set();
+    persistOpen();
+    paintGroups();
+  });
+
+  let token = 0;
   const load = async (text) => {
+    const mine = ++token;
     list.innerHTML = '<div class="spinner"></div>';
+    tools.hidden = true;
     try {
       const data = await api(`/api/stars?q=${encodeURIComponent(text)}`);
-      const stars = data.stars || [];
-      list.innerHTML = "";
-      if (!stars.length) {
-        list.innerHTML = "<p>No performers found.</p>";
-        return;
-      }
-      for (const star of stars) {
-        list.append(sheetButton(
-          "user",
-          star.name,
-          `${star.n || 0} file${star.n === 1 ? "" : "s"}${star.favorite ? " · favorite" : ""}`,
-          () => useFilter("star", star.id, `Star: ${star.name}`)
-        ));
-      }
+      if (mine !== token) return;
+      stars = (data.stars || []).slice().sort((a, b) =>
+        String(a.name || "").localeCompare(String(b.name || "")));
+      paint(text);
     } catch (error) {
+      if (mine !== token) return;
       list.innerHTML = "";
       const p = document.createElement("p");
       p.textContent = error.message;
@@ -2790,10 +5443,10 @@ function openExternal(url) {
 }
 
 /* --------------------------------------------------------------- buttons */
+setIcon($("backBtn"), "back");
 setIcon($("searchBtn"), "search");
-setIcon($("syncBtn"), "sync");
 setIcon($("selectBtn"), "select");
-setIcon($("lockBtn"), "lock");
+setIcon($("menuBtn"), "menu");
 setIcon($("uploadFab"), "upload");
 setIcon($("selectCancel"), "close");
 setIcon($("searchClose"), "close");
@@ -2810,7 +5463,13 @@ for (const button of $("tabs").querySelectorAll("button[data-tab]")) {
   if (span) span.innerHTML = svg(span.dataset.icon);
 }
 
-$("lockBtn").addEventListener("click", lockNow);
+$("backBtn").addEventListener("click", () => {
+  if (S.folder || S.filterLabel) { openFolder(""); return; }
+  if (S.q) { $("searchClose").click(); return; }
+  updateChrome();
+});
+$("viewBtn").addEventListener("click", toggleView);
+$("menuBtn").addEventListener("click", openMenuSheet);
 $("uploadFab").addEventListener("click", openUploadPicker);
 $("uploadInput").addEventListener("change", () => {
   const input = $("uploadInput");
@@ -2835,6 +5494,11 @@ $("dlToggle").addEventListener("click", () => {
 
 /* Android back button: close the top layer, then step out of a folder. */
 window.mobileBack = function mobileBack() {
+  if (document.documentElement.classList.contains("kb-open")) {
+    const field = document.activeElement;
+    if (field && typeof field.blur === "function") field.blur();
+    return true;
+  }
   const model = document.getElementById("viewer3dOverlay");
   if (model && !model.hidden) { if (window.TFE3D) window.TFE3D.close(); return true; }
   if (!$("viewer").hidden) {
@@ -2862,7 +5526,9 @@ async function closeApp() {
     toast("Saving the library to Telegram…");
     clearTimeout(S.toastTimer);
     try {
-      await api("/api/vault/save", { method: "POST" });
+      // A phone on mobile data can need minutes for the ~45 MB snapshot,
+      // and the default 60 s abort here would drop the close save.
+      await api("/api/vault/save", { method: "POST", timeout: 620000 });
     } catch (error) {
       toast(error.message || "The library could not be saved.", "error");
       await new Promise((resolve) => setTimeout(resolve, 1600));

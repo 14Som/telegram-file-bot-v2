@@ -1186,6 +1186,12 @@
     } else if (state.format && BOOK_FORMATS[state.format]) {
       shell.append(h("div", "reader-fail-note", "The book may be damaged, use an unsupported layout, or be protected by DRM. Download it to read it in another app."));
     }
+    if (state.item && state.host) {
+      const retry = h("button", "btn primary", "Try again");
+      retry.type = "button";
+      retry.addEventListener("click", () => open(state.host, state.item));
+      shell.append(retry);
+    }
     state.body.replaceChildren(shell);
     setStatus("");
   }
@@ -1599,24 +1605,53 @@
     body.classList.remove("book", "article", "frame");
     body.classList.add("pdf");
     setProgress(0, false);
-    const panel = showStatePanel(options && options.buffer ? "Preparing document…" : "Opening PDF…");
+    const buffered = Boolean(options && options.buffer);
+    const panel = showStatePanel(
+      buffered ? "Preparing document…" : "Opening PDF…",
+      buffered ? "" : "Reading from Telegram…"
+    );
+    const detail = panel.querySelector(".reader-state-detail");
+    // Telethon waits for a reply with no timeout, so one dropped read would
+    // leave this panel on screen forever. Stop the task when bytes stop.
+    let loading = null;
+    let lastByte = Date.now();
+    let stalled = false;
+    const watchdog = setInterval(() => {
+      if (Date.now() - lastByte < 45000) return;
+      clearInterval(watchdog);
+      stalled = true;
+      try { if (loading) loading.destroy(); } catch (_) {}
+    }, 5000);
     const lib = await pdfjs();
-    if (token !== state.token) return;
+    if (token !== state.token) { clearInterval(watchdog); return; }
     const params = {
       cMapUrl: "/static/vendor/pdfjs/cmaps/",
       cMapPacked: true,
       standardFontDataUrl: "/static/vendor/pdfjs/standard_fonts/",
-      wasmUrl: "/static/vendor/pdfjs/wasm/"
+      wasmUrl: "/static/vendor/pdfjs/wasm/",
+      // Match the server's 2 MiB cache blocks: fewer round trips per page.
+      rangeChunkSize: 2 * 1024 * 1024,
+      onProgress: ({ loaded }) => {
+        lastByte = Date.now();
+        if (detail && loaded) {
+          detail.textContent = `Downloaded ${Math.round(loaded / 1048576)} MB`;
+        }
+      }
     };
     let doc;
     try {
-      const source = options && options.buffer
+      loading = buffered
         ? lib.getDocument({ data: options.buffer, ...params })
         : lib.getDocument({ url: fileUrl(item), ...params });
-      doc = await source.promise;
+      doc = await loading.promise;
     } catch (error) {
+      clearInterval(watchdog);
+      if (stalled) {
+        throw new Error("Telegram stopped sending this PDF. Check your connection, then try again.");
+      }
       throw new Error(error && error.message ? `The PDF could not be opened: ${error.message}` : "The PDF could not be opened.");
     }
+    clearInterval(watchdog);
     if (token !== state.token) {
       try { doc.destroy(); } catch (_) {}
       return;

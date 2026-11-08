@@ -390,6 +390,10 @@ class Catalog:
         self._cache: Dict[Any, Tuple[float, Any]] = {}
         self.init(chat_id)
 
+    def invalidate(self) -> None:
+        """Drop cached counts after the database file is replaced."""
+        self._cache.clear()
+
     @contextmanager
     def connect(self):
         conn = sqlite3.connect(self.path, timeout=15)

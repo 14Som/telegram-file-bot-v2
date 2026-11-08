@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import shutil
 import time
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict
@@ -17,14 +16,16 @@ from typing import Any, AsyncIterator, Dict
 from . import appconfig
 
 BLOCK = 2 * 1024 * 1024
-MAX_BYTES = 2 * 1024 ** 3
+# Streams, PDFs and book pages all land here; a large disk budget means a
+# second open of the same file comes from the phone instead of Telegram.
+MAX_BYTES = 24 * 1024 ** 3
 
 # A player only drains its socket while it has picture to show, so the serve
 # loop spends most of a slow link idle. The builder keeps pulling blocks past
 # the current window on its own task, which is what gives playback its runway.
-PREFETCH_AHEAD = 192 * 1024 * 1024
-PREFETCH_RUN = 16  # blocks per pass, so seeks are picked up within ~32 MiB
-PRUNE_INTERVAL = 60.0
+PREFETCH_AHEAD = 768 * 1024 * 1024
+PREFETCH_RUN = 32  # blocks per pass, so seeks are picked up within ~64 MiB
+PRUNE_INTERVAL = 120.0
 
 DIR = appconfig.HOME / "cache" / "stream"
 
@@ -259,36 +260,12 @@ async def _build(service: Any, message: Any, key: str) -> None:
             state["task"] = None
 
 
-def _clear_sync() -> None:
-    try:
-        shutil.rmtree(DIR)
-        return
-    except FileNotFoundError:
-        return
-    except OSError:
-        pass
-    # Windows refuses to unlink a block a closing player still holds open, and
-    # one open file aborts the whole rmtree. Drop the rest anyway; the purge on
-    # the next boot removes whatever is left.
-    for path in list(DIR.rglob("*")):
-        try:
-            if path.is_file():
-                path.unlink()
-            else:
-                path.rmdir()
-        except OSError:
-            continue
-    try:
-        DIR.rmdir()
-    except OSError:
-        pass
-
-
 async def shutdown() -> None:
-    """Stop every builder and drop the streamed bytes.
+    """Stop every builder and keep the complete blocks on disk.
 
-    The cache only exists to smooth playback, so it is thrown away when the
-    app closes; prepared/converted movies in the play cache are kept.
+    Blocks are written atomically, so whatever was finished can serve the next
+    launch; only partial files are dropped. The size cap prunes the oldest
+    blocks on its own.
     """
     global _active_key
     _active_key = None
@@ -301,19 +278,30 @@ async def shutdown() -> None:
     _builders.clear()
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
-    await asyncio.to_thread(_clear_sync)
+    await asyncio.to_thread(_drop_partials)
+
+
+def _drop_partials() -> None:
+    if not DIR.exists():
+        return
+    for path in DIR.rglob("*.part"):
+        try:
+            path.unlink()
+        except OSError:
+            pass
 
 
 async def purge() -> None:
-    """Drop streamed bytes left behind by a previous run.
+    """Drop half-written blocks left behind by a previous run.
 
     Android can kill the app from the recents screen before the lifespan
-    shutdown runs, so the cache is also emptied when the app starts.
+    shutdown runs, which can leave *.part files behind. Complete blocks are
+    kept so the next launch starts with a warm cache.
     """
     global _active_key
     _active_key = None
     _builders.clear()
-    await asyncio.to_thread(_clear_sync)
+    await asyncio.to_thread(_drop_partials)
 
 
 async def read(
