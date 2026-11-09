@@ -122,6 +122,7 @@ button { touch-action: manipulation; }
 }
 .btn:active { transform: scale(.985); }
 .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+.btn.danger { background: var(--danger); border-color: var(--danger); color: var(--panel); }
 .btn.ghost { background: transparent; }
 .btn[disabled] { opacity: .55; }
 .btn + .btn { margin-top: 10px; }
@@ -883,8 +884,22 @@ html.kb-open .content { padding-bottom: calc(24px + var(--kb)); }
 .info-row { display: flex; gap: 14px; padding: 7px 2px; border-bottom: 1px solid var(--border); font-size: 13px; }
 .info-row span { color: var(--muted); width: 92px; flex: none; }
 .info-row b { font-weight: 500; overflow-wrap: anywhere; }
-.sheet-buttons { display: grid; gap: 8px; margin-top: 14px; }
-.sheet-buttons .btn { width: 100%; }
+.sheet-buttons {
+  display: flex;
+  flex-direction: row-reverse;
+  justify-content: flex-start;
+  gap: 8px;
+  margin-top: 14px;
+}
+.sheet-buttons .btn {
+  width: auto;
+  min-width: 92px;
+  min-height: 40px;
+  padding: 0 16px;
+  border-radius: 10px;
+  font-size: 14px;
+}
+.sheet-buttons .btn + .btn { margin-top: 0; }
 
 .toast {
   position: fixed; left: 50%; bottom: calc(84px + var(--safe-bottom) + var(--kb));

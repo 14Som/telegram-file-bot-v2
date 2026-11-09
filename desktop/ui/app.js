@@ -7666,13 +7666,40 @@ async function downloadFolder(folder) {
     toast(error.message || "The folder download could not start.", "error", 6000);
   }
 }
+function subfolderCount(folder) {
+  const prefix = `${folder.folder.toLowerCase()}/`;
+  return ((S.nav && S.nav.folders) || []).filter(
+    (entry) => String(entry.folder || "").toLowerCase().startsWith(prefix)
+  ).length;
+}
 function promptDeleteFolder(folder) {
+  const files = Number(folder.n || 0);
+  const subs = subfolderCount(folder);
+  const parts = [];
+  if (files) parts.push(plural(files, "file"));
+  if (subs) parts.push(plural(subs, "subfolder"));
+  const summary = parts.length
+    ? `${parts.join(" in ")} will be deleted from Telegram.`
+    : "This empty folder will be removed.";
+  const refresh = async () => {
+    const target = folder.folder.toLowerCase();
+    if (S.selectedFolderPath && S.selectedFolderPath.toLowerCase() === target) S.selectedFolderPath = null;
+    if (S.folder.toLowerCase() === target || S.folder.toLowerCase().startsWith(target + "/")) {
+      const cut = folder.folder.lastIndexOf("/");
+      S.folder = cut > 0 ? folder.folder.slice(0, cut) : "";
+      await loadNav();
+      await loadItems({ reset: true });
+    } else {
+      await loadNav();
+      renderItems();
+    }
+  };
   openModal({
-    title: "Delete folder?",
+    title: "Delete folder",
     subtitle: folder.folder,
     content: h("div", {},
-      h("p", { text: "Only empty folders can be deleted. The files stay in Telegram and keep their names." }),
-      h("p", { class: "modal-note", text: "To delete a folder with files, move or delete the files first. Subfolders must also be empty." })
+      h("p", { text: summary }),
+      h("p", { class: "modal-note", text: "The folder, every subfolder and their files are deleted. This cannot be undone." })
     ),
     actions: [
       { label: "Cancel", onClick: closeModal },
@@ -7681,21 +7708,24 @@ function promptDeleteFolder(folder) {
         class: "danger",
         onClick: async () => {
           try {
-            await api(`/api/folders?name=${encodeURIComponent(folder.folder)}`, { method: "DELETE" });
+            const data = await api(
+              `/api/folders?name=${encodeURIComponent(folder.folder)}`,
+              { method: "DELETE" }
+            );
             closeModal();
-            const target = folder.folder.toLowerCase();
-            if (S.selectedFolderPath && S.selectedFolderPath.toLowerCase() === target) S.selectedFolderPath = null;
-            if (S.folder.toLowerCase() === target || S.folder.toLowerCase().startsWith(target + "/")) {
-              const cut = folder.folder.lastIndexOf("/");
-              S.folder = cut > 0 ? folder.folder.slice(0, cut) : "";
-              await loadNav();
-              await loadItems({ reset: true });
-            } else {
-              await loadNav();
-              renderItems();
-            }
-            toast("Folder removed.", "success");
-          } catch (error) { toast(error.message, "error"); }
+            await refresh();
+            const gone = Number((data.removed || {}).files || 0);
+            toast(
+              gone
+                ? `Folder deleted. ${plural(gone, "file")} removed from Telegram.`
+                : "Folder deleted.",
+              "success"
+            );
+          } catch (error) {
+            closeModal();
+            await refresh();
+            toast(error.message, "error");
+          }
         }
       }
     ]
@@ -7711,10 +7741,9 @@ function openFolderMenu(event, folder) {
     { label: "Rename folder…", icon: "edit", onClick: () => promptRenameFolder(folder) },
     { separator: true },
     {
-      label: "Delete empty folder",
+      label: "Delete folder…",
       icon: "trash",
       danger: true,
-      disabled: folder.n > 0,
       onClick: () => promptDeleteFolder(folder)
     }
   ]);

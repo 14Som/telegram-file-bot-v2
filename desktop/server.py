@@ -79,7 +79,7 @@ log = logging.getLogger("tfe.server")
 
 QUIT = threading.Event()
 COOKIE = "tfe_session"
-APP_VERSION = "2.6.26"
+APP_VERSION = "2.6.28"
 # The Android build extracts the interface next to its writable data and runs
 # the same server there; the desktop EXE keeps using the bundled copy.
 UI_DIR = Path(
@@ -1523,12 +1523,32 @@ async def folder_info(request: Request, name: str = Query(..., max_length=180)):
 @app.delete("/api/folders")
 async def delete_folder(request: Request, name: str = Query(..., max_length=180)):
     state = _state(request)
-    removed = await run_in_threadpool(
-        state.catalog.delete_folder, name, _chat_id(state)
-    )
-    if not removed:
-        raise TGError("Only empty folders can be removed.")
-    return {"deleted": True, "folders": _folders_with_covers(state, _chat_id(state))}
+    chat_id = _chat_id(state)
+    files = 0
+    while True:
+        items = await run_in_threadpool(
+            state.catalog.folder_items, name, chat_id, True
+        )
+        if not items:
+            break
+        files += len(items)
+        targets = await run_in_threadpool(_expand_parts, state, items)
+        await state.service.delete_messages(
+            [target["message_id"] for target in targets], chat_id
+        )
+        for target in targets:
+            await run_in_threadpool(state.catalog.delete, target["id"])
+            if state.service.is_bot_vault():
+                Catalog.clear_bot_vault(state.bot_db, target["message_id"])
+    removed = await run_in_threadpool(state.catalog.delete_folder, name, chat_id)
+    if removed is None:
+        raise HTTPException(status_code=404, detail="Folder not found.")
+    removed["files"] = files
+    return {
+        "deleted": True,
+        "removed": removed,
+        "folders": _folders_with_covers(state, chat_id),
+    }
 
 
 ZIP64_LIMIT = 0xFFFFFFFF

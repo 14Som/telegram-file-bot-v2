@@ -4437,7 +4437,7 @@ async function openFoldersSheet() {
         "folder",
         `${entry.icon ? entry.icon + " " : ""}${entry.folder}`,
         `${Number(entry.n) || 0} file(s)${entry.note ? " · " + entry.note : ""}`,
-        () => openFolderActions(entry)
+        () => openFolderActions(entry, folders)
       ));
     }
     body.append(sheetButton("folder", "New folder", "Create an empty folder", () => {
@@ -4457,7 +4457,7 @@ async function openFoldersSheet() {
   }
 }
 
-function openFolderActions(entry) {
+function openFolderActions(entry, folders) {
   const body = document.createElement("div");
   const text = document.createElement("p");
   text.className = "muted small";
@@ -4510,20 +4510,75 @@ function openFolderActions(entry) {
       setTimeout(openFoldersSheet, 80);
     });
   }));
-  body.append(sheetButton("trash", "Remove folder", "Only empty folders can be removed", () => {
-    confirmAction(
-      "Remove folder?",
-      `${entry.folder} is deleted when it holds no files.`,
-      "Remove",
-      async () => {
-        await api(`/api/folders?name=${encodeURIComponent(entry.folder)}`, { method: "DELETE" });
-        await loadNav();
-        toast("Folder removed.", "success");
-        setTimeout(openFoldersSheet, 80);
-      }
-    );
+  body.append(sheetButton("trash", "Delete folder", "Removes the folder and its subfolders", () => {
+    openFolderDeleteSheet(entry, folders);
   }, true));
   openSheet(entry.name || entry.folder, body);
+}
+
+function openFolderDeleteSheet(entry, folders) {
+  const files = Number(entry.n) || 0;
+  const prefix = `${entry.folder.toLowerCase()}/`;
+  const subs = (folders || []).filter(
+    (item) => String(item.folder || "").toLowerCase().startsWith(prefix)
+  ).length;
+  const body = document.createElement("div");
+  const parts = [];
+  if (files) parts.push(`${files} file${files === 1 ? "" : "s"}`);
+  if (subs) parts.push(`${subs} subfolder${subs === 1 ? "" : "s"}`);
+  const summary = document.createElement("p");
+  summary.textContent = parts.length
+    ? `${parts.join(" in ")} will be deleted from Telegram.`
+    : "This empty folder will be removed.";
+  body.append(summary);
+  const note = document.createElement("p");
+  note.className = "muted small";
+  note.textContent = "The folder, every subfolder and their files are deleted. This cannot be undone.";
+  body.append(note);
+  const actions = document.createElement("div");
+  actions.className = "sheet-buttons";
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.className = "btn danger";
+  remove.textContent = "Delete";
+  remove.addEventListener("click", async () => {
+    remove.disabled = true;
+    try {
+      const data = await api(
+        `/api/folders?name=${encodeURIComponent(entry.folder)}`,
+        { method: "DELETE" }
+      );
+      const target = entry.folder.toLowerCase();
+      const inside = S.folder.toLowerCase() === target ||
+        S.folder.toLowerCase().startsWith(target + "/");
+      closeSheet();
+      await loadNav();
+      if (inside) {
+        openFolder(entry.parent || "");
+      } else {
+        await loadItems({ reset: true });
+        setTimeout(openFoldersSheet, 80);
+      }
+      const gone = Number((data.removed || {}).files || 0);
+      toast(
+        gone
+          ? `Folder deleted. ${gone} file(s) removed from Telegram.`
+          : "Folder deleted.",
+        "success"
+      );
+    } catch (error) {
+      remove.disabled = false;
+      toast(error.message, "error");
+    }
+  });
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "btn ghost";
+  cancel.textContent = "Cancel";
+  cancel.addEventListener("click", () => closeSheet());
+  actions.append(remove, cancel);
+  body.append(actions);
+  openSheet("Delete folder", body);
 }
 
 async function openSavedViewsSheet() {

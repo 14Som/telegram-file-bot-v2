@@ -1148,14 +1148,46 @@ class Catalog:
                 )
         return target
 
-    def delete_folder(self, name: str, chat_id: Optional[int] = None) -> bool:
+    def folder_exists(self, name: str, chat_id: Optional[int] = None) -> bool:
         folder = clean_folder_path(name, "")
         if not folder:
             return False
         scope = int(chat_id or 0)
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM folders WHERE chat_id = ? AND name = ? COLLATE NOCASE"
+                " UNION ALL SELECT 1 FROM items WHERE chat_id = ?"
+                " AND folder = ? COLLATE NOCASE LIMIT 1",
+                (scope, folder, scope, folder),
+            ).fetchone()
+        return row is not None
+
+    def delete_folder(
+        self,
+        name: str,
+        chat_id: Optional[int] = None,
+    ) -> Optional[Dict[str, int]]:
+        """Drop a folder, every subfolder and their catalog rows.
+
+        Telegram messages are deleted by the caller before this runs, so the
+        returned ``files`` count is what remained at that point. Returns None
+        when the folder does not exist.
+        """
+        folder = clean_folder_path(name, "")
+        if not folder:
+            return None
+        scope = int(chat_id or 0)
         prefix = f"{_like(folder.lower())}/%"
         with self.connect() as conn:
-            items = int(
+            exists = conn.execute(
+                "SELECT 1 FROM folders WHERE chat_id = ? AND name = ? COLLATE NOCASE"
+                " UNION ALL SELECT 1 FROM items WHERE chat_id = ?"
+                " AND folder = ? COLLATE NOCASE LIMIT 1",
+                (scope, folder, scope, folder),
+            ).fetchone()
+            if exists is None:
+                return None
+            files = int(
                 conn.execute(
                     "SELECT COUNT(*) AS n FROM items WHERE chat_id = ?"
                     " AND (folder = ? COLLATE NOCASE"
@@ -1163,20 +1195,26 @@ class Catalog:
                     (scope, folder, prefix),
                 ).fetchone()["n"]
             )
-            children = int(
+            folder_count = int(
                 conn.execute(
                     "SELECT COUNT(*) AS n FROM folders WHERE chat_id = ?"
-                    " AND lower(name) LIKE ? ESCAPE '\\'",
-                    (scope, prefix),
+                    " AND (name = ? COLLATE NOCASE"
+                    " OR lower(name) LIKE ? ESCAPE '\\')",
+                    (scope, folder, prefix),
                 ).fetchone()["n"]
             )
-            if items or children:
-                return False
-            cur = conn.execute(
-                "DELETE FROM folders WHERE chat_id = ? AND name = ? COLLATE NOCASE",
-                (scope, folder),
+            conn.execute(
+                "DELETE FROM items WHERE chat_id = ? AND (folder = ? COLLATE NOCASE"
+                " OR lower(folder) LIKE ? ESCAPE '\\')",
+                (scope, folder, prefix),
             )
-            return cur.rowcount > 0
+            conn.execute(
+                "DELETE FROM folders WHERE chat_id = ? AND (name = ? COLLATE NOCASE"
+                " OR lower(name) LIKE ? ESCAPE '\\')",
+                (scope, folder, prefix),
+            )
+        self._cache.clear()
+        return {"folders": max(folder_count, 1), "files": files}
 
     def adopt_unscoped_folders(self, chat_id: int) -> int:
         """Claim folder rows migrated before a vault was chosen."""

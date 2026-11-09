@@ -1800,6 +1800,24 @@ class TelegramService:
             raise TGError(friendly_error(exc))
         self._message_cache.pop(int(message_id), None)
 
+    async def delete_messages(
+        self, message_ids: List[int], chat_id: Optional[int] = None
+    ) -> None:
+        """Delete many messages in Telegram-side batches of 100."""
+        client = self._require_ready()
+        active = self._active_chat_id()
+        if chat_id is not None and active is not None and int(chat_id) != active:
+            raise TGError("That folder belongs to another vault. Switch back to it first.")
+        ids = [int(value) for value in message_ids]
+        for start in range(0, len(ids), 100):
+            chunk = ids[start : start + 100]
+            try:
+                await client.delete_messages(self._entity, chunk)
+            except Exception as exc:
+                raise TGError(friendly_error(exc))
+        for value in ids:
+            self._message_cache.pop(value, None)
+
     async def copy_messages(self, message_ids: List[int]) -> List[Dict[str, Any]]:
         client = self._require_ready()
         if self._vault is None:
