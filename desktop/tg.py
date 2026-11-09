@@ -561,7 +561,7 @@ class TelegramService:
         if self.sync_state.get("running"):
             return "Wait for the current sync to finish before changing vaults."
         for transfer in self.transfers.values():
-            if transfer.get("busy") or transfer.get("state") in ACTIVE_TRANSFER_STATES:
+            if transfer.get("state") in ACTIVE_TRANSFER_STATES:
                 return "Wait for the current uploads and downloads to finish before changing vaults."
         return None
 

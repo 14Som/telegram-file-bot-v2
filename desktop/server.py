@@ -67,6 +67,7 @@ from .catalog import (
 )
 from .splitmerge import merge_parts, parse_part_name, split_file
 from .tg import (
+    ACTIVE_TRANSFER_STATES,
     PART_SIZE,
     TGError,
     TelegramService,
@@ -79,7 +80,7 @@ log = logging.getLogger("tfe.server")
 
 QUIT = threading.Event()
 COOKIE = "tfe_session"
-APP_VERSION = "2.6.28"
+APP_VERSION = "2.6.29"
 # The Android build extracts the interface next to its writable data and runs
 # the same server there; the desktop EXE keeps using the bundled copy.
 UI_DIR = Path(
@@ -1164,9 +1165,7 @@ def _transfers_busy(state: Any) -> bool:
     if state.service.sync_state.get("running"):
         return True
     for transfer in state.service.transfers.values():
-        if transfer.get("busy"):
-            return True
-        if str(transfer.get("state") or "") not in {"done", "cancelled", "error"}:
+        if str(transfer.get("state") or "") in ACTIVE_TRANSFER_STATES:
             return True
     return False
 

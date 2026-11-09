@@ -798,7 +798,7 @@ function vaultBusyReason() {
   if (S.localUpload) {
     return "Wait for the current upload to finish before switching vaults.";
   }
-  if (S.transfers.some((transfer) => transferActive(transfer.state) || transfer.busy)) {
+  if (S.transfers.some((transfer) => transferActive(transfer.state))) {
     return "Wait for the current uploads and downloads to finish before switching vaults.";
   }
   return "";
@@ -815,6 +815,9 @@ function toggleVaultMenu() {
   $("vaultChip").setAttribute("aria-expanded", "true");
   renderVaultMenu();
   if (!S.vaults.length) loadVaults(false);
+  fetchTransfers(false).then(() => {
+    if (S.vaultMenuOpen) renderVaultMenu();
+  });
 }
 
 function closeVaultMenu() {
