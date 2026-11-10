@@ -2014,17 +2014,6 @@ class TelegramService:
             message = friendly_error(exc)
             transfer.update(state="error", error=message)
             raise TGError(message)
-        finally:
-            try:
-                path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            parent = path.parent
-            try:
-                if parent.is_dir() and not any(parent.iterdir()):
-                    parent.rmdir()
-            except OSError:
-                pass
 
     def _cleanup_cache(self) -> None:
         appconfig.ensure_dirs()

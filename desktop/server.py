@@ -80,7 +80,7 @@ log = logging.getLogger("tfe.server")
 
 QUIT = threading.Event()
 COOKIE = "tfe_session"
-APP_VERSION = "2.6.29"
+APP_VERSION = "2.6.30"
 # The Android build extracts the interface next to its writable data and runs
 # the same server there; the desktop EXE keeps using the bundled copy.
 UI_DIR = Path(
@@ -123,13 +123,20 @@ SPLIT_HARD_CAP = 64 * 1024 ** 3
 # Phones have no bundled 7-Zip, so they only take what Telegram accepts whole.
 UPLOAD_LIMIT = PART_SIZE if MOBILE else SPLIT_HARD_CAP
 # Uploads are RTT-bound (Telegram takes 512 KiB parts), so a few files or
-# volumes can be in flight at once. Stay modest to avoid FloodWait.
+# volumes can be in flight at once. Telegram starts answering SaveBigFilePart
+# with FloodWait when the account sends parts too fast, so the number of
+# streams shrinks on a flood wait and climbs back after a quiet period.
 UPLOAD_CONCURRENCY = 4
+UPLOAD_MIN_STREAMS = 1
+UPLOAD_FLOOD_COOLDOWN = 180.0
 # Telethon waits for a reply with no timeout of its own, so one dropped
 # save-part request can leave an upload spinning forever. Stop it when the
-# byte counter has not moved for this long and let the user retry.
+# byte counter has not moved for this long, pause, and send it again.
 UPLOAD_STALL_SECONDS = 90.0
 UPLOAD_WATCH_INTERVAL = 3.0
+UPLOAD_RETRIES = 1
+UPLOAD_RETRY_PAUSE = 20.0
+UPLOAD_RECOVERY_INTERVAL = 30.0
 # A phone on mobile data can need minutes for the ~45 MB snapshot, and
 # cancelling it midway would abort the upload without saving the marker.
 VAULT_SAVE_TIMEOUT = 600.0
@@ -138,13 +145,100 @@ VAULT_SAVE_TIMEOUT = 600.0
 # A normal mobile restore takes about five minutes; after this the library
 # opens from local data and the next launch retries the restore.
 VAULT_RESTORE_TIMEOUT = 540.0
-_upload_gate: Optional[asyncio.Semaphore] = None
+_upload_gate: Optional["_UploadGate"] = None
+_upload_recovery: Optional[asyncio.Task] = None
 
 
-def _upload_semaphore() -> asyncio.Semaphore:
-    global _upload_gate
+class _UploadGate:
+    """Upload slots that shrink when Telegram asks the account to slow down.
+
+    Four parallel files trip Telegram's per-account part-save limit, and
+    Telethon then sleeps 11-12 s on every SaveBigFilePart it sends, so the
+    uploads crawl instead of finishing. Halving the slots when a flood wait
+    appears costs less than the cascade, and the slots grow back once the
+    throttling stops.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.active = 0
+        self.last_flood = 0.0
+        self._loop = asyncio.get_running_loop()
+        self._waiters: List[asyncio.Event] = []
+
+    async def acquire(self) -> None:
+        while self.active >= self.limit:
+            event = asyncio.Event()
+            self._waiters.append(event)
+            try:
+                await event.wait()
+            finally:
+                if event in self._waiters:
+                    self._waiters.remove(event)
+        self.active += 1
+
+    def release(self) -> None:
+        self.active = max(0, self.active - 1)
+        self._wake()
+
+    def _wake(self) -> None:
+        waiters, self._waiters = self._waiters, []
+        for event in waiters:
+            event.set()
+
+    def note_flood(self) -> None:
+        self.last_flood = time.time()
+        try:
+            self._loop.call_soon_threadsafe(self._shrink)
+        except RuntimeError:
+            pass
+
+    def _shrink(self) -> None:
+        if self.limit <= UPLOAD_MIN_STREAMS:
+            return
+        self.limit = max(UPLOAD_MIN_STREAMS, self.limit // 2)
+        log.info("Upload streams lowered to %s after a Telegram flood wait.", self.limit)
+        self._wake()
+
+    def grow(self) -> None:
+        if self.limit >= UPLOAD_CONCURRENCY:
+            return
+        self.limit = min(UPLOAD_CONCURRENCY, self.limit * 2)
+        log.info("Upload streams back up to %s.", self.limit)
+        self._wake()
+
+
+class _FloodWaitLog(logging.Handler):
+    """Telethon sleeps through FloodWait on its own, so watch its log line."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            if _upload_gate is None or "flood wait" not in record.getMessage().lower():
+                return
+            _upload_gate.note_flood()
+        except Exception:
+            pass
+
+
+async def _recover_upload_gate(gate: _UploadGate) -> None:
+    while True:
+        await asyncio.sleep(UPLOAD_RECOVERY_INTERVAL)
+        if time.time() - gate.last_flood > UPLOAD_FLOOD_COOLDOWN:
+            gate.grow()
+
+
+def _upload_semaphore() -> "_UploadGate":
+    global _upload_gate, _upload_recovery
     if _upload_gate is None:
-        _upload_gate = asyncio.Semaphore(UPLOAD_CONCURRENCY)
+        _upload_gate = _UploadGate(UPLOAD_CONCURRENCY)
+        telethon_log = logging.getLogger("telethon")
+        # Phones only raise the tfe.* logger, so Telethon's INFO flood-wait
+        # lines would never reach the handler without this.
+        if not telethon_log.isEnabledFor(logging.INFO):
+            telethon_log.setLevel(logging.INFO)
+        if not any(isinstance(item, _FloodWaitLog) for item in telethon_log.handlers):
+            telethon_log.addHandler(_FloodWaitLog())
+        _upload_recovery = asyncio.create_task(_recover_upload_gate(_upload_gate))
     return _upload_gate
 CSP = (
     "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; "
@@ -3692,49 +3786,87 @@ async def _run_uploads(state: Any, entries: List[Dict[str, Any]]) -> None:
     )
 
 
+async def _pause_upload(transfer: Optional[Dict[str, Any]], seconds: float) -> bool:
+    """Wait between attempts; True when the user cancelled meanwhile."""
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if transfer is not None and transfer.get("cancel"):
+            return True
+        await asyncio.sleep(1.0)
+    return bool(transfer is not None and transfer.get("cancel"))
+
+
 async def _watch_transfer(transfer: Optional[Dict[str, Any]], action: Any) -> None:
-    """Run an upload and abort it when the byte counter stops moving.
+    """Run an upload and retry it when the byte counter stops moving.
 
     Telethon awaits the reply to each save-part request with no timeout, so a
     connection that dies mid-upload leaves the task pending forever: the
-    transfer bar sits still and the file never reaches the vault.
+    transfer bar sits still and the file never reaches the vault. The cancelled
+    attempt never created a message, so sending the file again is safe.
     """
-    task = asyncio.create_task(action)
-    last_sent = -1
-    last_change = time.time()
-    try:
-        while not task.done():
-            await asyncio.sleep(UPLOAD_WATCH_INTERVAL)
-            if task.done():
-                break
-            if transfer is None or transfer.get("state") != "uploading":
-                # Queued behind other uploads, or still splitting the file.
-                last_sent = -1
-                last_change = time.time()
-                continue
-            sent = int(transfer.get("sent") or 0)
-            if sent != last_sent:
-                last_sent = sent
-                last_change = time.time()
-                continue
-            if time.time() - last_change > UPLOAD_STALL_SECONDS:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-                raise TGError(
-                    "The upload stopped making progress and was cancelled. "
-                    "Check your connection and add the file again."
-                )
-        await task
-    finally:
-        if not task.done():
+    for attempt in range(UPLOAD_RETRIES + 1):
+        if transfer is not None and transfer.get("cancel"):
+            raise TransferCancelled()
+        task = asyncio.create_task(action())
+        last_sent = -1
+        last_change = time.time()
+        stalled = False
+        try:
+            while not task.done():
+                await asyncio.sleep(UPLOAD_WATCH_INTERVAL)
+                if task.done():
+                    break
+                if transfer is None or transfer.get("state") != "uploading":
+                    # Waiting for a free slot, or still splitting the file.
+                    last_sent = -1
+                    last_change = time.time()
+                    continue
+                sent = int(transfer.get("sent") or 0)
+                if sent != last_sent:
+                    last_sent = sent
+                    last_change = time.time()
+                    continue
+                if _upload_gate is not None and _upload_gate.last_flood > last_change:
+                    # Telethon slept through a flood wait instead of saving a
+                    # part. Telegram is asking us to wait, so this is not the
+                    # dead connection the watchdog is meant to catch.
+                    last_change = _upload_gate.last_flood
+                    continue
+                if time.time() - last_change > UPLOAD_STALL_SECONDS:
+                    stalled = True
+                    break
+            if not stalled:
+                await task
+                return task.result()
             task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+        finally:
+            if not task.done():
+                task.cancel()
+        if attempt >= UPLOAD_RETRIES:
+            break
+        log.warning(
+            "Upload of %s made no progress for %ss; sending it again.",
+            "a file" if transfer is None else transfer.get("name"),
+            int(UPLOAD_STALL_SECONDS),
+        )
+        if transfer is not None:
+            transfer.update(state="uploading", error=None, retry=attempt + 1)
+        if await _pause_upload(transfer, UPLOAD_RETRY_PAUSE):
+            raise TransferCancelled()
+    raise TGError(
+        "The upload stopped making progress twice and was cancelled. "
+        "Check your connection and add the file again."
+    )
 
 
 async def _run_upload_entry(
-    state: Any, entry: Dict[str, Any], gate: asyncio.Semaphore
+    state: Any, entry: Dict[str, Any], gate: "_UploadGate"
 ) -> None:
     transfer = state.service.transfers.get(entry["transfer_id"])
     original = Path(entry["path"])
@@ -3761,12 +3893,13 @@ async def _run_upload_entry(
                     pass
 
                 async def upload_volume(index: int, volume: Path) -> None:
-                    async with gate:
+                    await gate.acquire()
+                    try:
                         if transfer is not None and transfer.get("cancel"):
                             raise TransferCancelled()
                         await _watch_transfer(
                             transfer,
-                            state.service.upload_one(
+                            lambda: state.service.upload_one(
                                 {
                                     **entry,
                                     "path": str(volume),
@@ -3777,6 +3910,8 @@ async def _run_upload_entry(
                                 state.catalog,
                             ),
                         )
+                    finally:
+                        gate.release()
 
                 results = await asyncio.gather(
                     *(
@@ -3798,10 +3933,13 @@ async def _run_upload_entry(
             finally:
                 shutil.rmtree(workdir, ignore_errors=True)
         else:
-            async with gate:
+            await gate.acquire()
+            try:
                 await _watch_transfer(
-                    transfer, state.service.upload_one(entry, state.catalog)
+                    transfer, lambda: state.service.upload_one(entry, state.catalog)
                 )
+            finally:
+                gate.release()
     except TransferCancelled:
         if transfer is not None:
             transfer.update(state="cancelled", error=None)
