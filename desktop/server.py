@@ -80,7 +80,7 @@ log = logging.getLogger("tfe.server")
 
 QUIT = threading.Event()
 COOKIE = "tfe_session"
-APP_VERSION = "2.6.37"
+APP_VERSION = "2.6.41"
 # The Android build extracts the interface next to its writable data and runs
 # the same server there; the desktop EXE keeps using the bundled copy.
 UI_DIR = Path(

@@ -102,6 +102,7 @@ const S = {
   hidden: false,
   filterLabel: "",
   items: [],
+  total: 0,
   cursor: "",
   done: false,
   loading: false,
@@ -215,6 +216,9 @@ function toast(message, kind = "") {
   S.toastTimer = setTimeout(() => { el.hidden = true; }, 4200);
 }
 
+/* Keep-alive sockets can go dead while the phone sleeps: the old socket never
+   answers, while a fresh one replies instantly. A slow GET therefore starts a
+   second request on a new socket, and whichever answer arrives first is used. */
 async function api(path, options = {}) {
   const method = options.method || "GET";
   const headers = { Accept: "application/json" };
@@ -224,28 +228,77 @@ async function api(path, options = {}) {
     headers["Content-Type"] = "application/json";
     init.body = JSON.stringify(options.body);
   }
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), options.timeout || 60000);
-  init.signal = controller.signal;
-  let res;
+  const timeout = options.timeout || 60000;
+  const attempt = () => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeout);
+    const done = (async () => {
+      let res;
+      try {
+        res = await fetch(path, { ...init, signal: controller.signal });
+      } finally {
+        clearTimeout(timer);
+      }
+      let data = {};
+      try { data = await res.json(); } catch (_) { /* empty body */ }
+      if (!res.ok) {
+        if (res.status === 403) throw new Error("Session expired. Reopen the app.");
+        if (res.status === 423) { S.status = { ...(S.status || {}), locked: true }; showPin(); }
+        throw new Error(data.detail || `Request failed (${res.status})`);
+      }
+      return data;
+    })();
+    return { done, controller };
+  };
+  if (method !== "GET") {
+    try {
+      return await attempt().done;
+    } catch (error) {
+      throw error instanceof Error ? error : new Error("The app is not answering. Try again.");
+    }
+  }
+  const runs = [];
+  let hedge = 0;
+  const firstAnswer = new Promise((resolve, reject) => {
+    const errors = [];
+    let pending = 0;
+    let settled = false;
+    const launch = () => {
+      const run = attempt();
+      runs.push(run);
+      pending += 1;
+      run.done.then(
+        (value) => {
+          if (settled) return;
+          settled = true;
+          resolve(value);
+        },
+        (error) => {
+          errors.push(error);
+          pending -= 1;
+          if (!settled && pending === 0) {
+            settled = true;
+            reject({ errors });
+          }
+        }
+      );
+    };
+    launch();
+    hedge = setTimeout(() => { if (!settled) launch(); },
+      options.hedgeAfter === undefined ? 6000 : options.hedgeAfter);
+  });
   try {
-    res = await fetch(path, init);
-  } catch (error) {
-    if (error && error.name === "AbortError") {
+    return await firstAnswer;
+  } catch (failure) {
+    const errors = (failure && failure.errors) || [failure];
+    if (errors.some((entry) => entry && entry.name === "AbortError")) {
       throw new Error("The app took too long to answer. Try again.");
     }
     throw new Error("The app is not answering. Try again.");
   } finally {
-    clearTimeout(timer);
+    clearTimeout(hedge);
+    for (const run of runs) run.done.then(() => run.controller.abort(), () => run.controller.abort());
   }
-  let data = {};
-  try { data = await res.json(); } catch (_) { /* empty body */ }
-  if (!res.ok) {
-    if (res.status === 403) throw new Error("Session expired. Reopen the app.");
-    if (res.status === 423) { S.status = { ...(S.status || {}), locked: true }; showPin(); }
-    throw new Error(data.detail || `Request failed (${res.status})`);
-  }
-  return data;
 }
 
 function humanSize(size) {
@@ -867,10 +920,22 @@ function updateChrome() {
     : S.folder ? S.folder.split("/").pop()
     : "All files";
   const name = [user.first_name, user.last_name].filter(Boolean).join(" ");
-  const total = Number((status.stats && status.stats.count) || 0);
+  const here = S.tab === "files" && S.folder
+    ? (((S.nav && S.nav.folders) || []).find((entry) => entry.folder === S.folder))
+    : null;
+  const total = here ? Number(here.n) || 0
+    : S.folder ? S.total
+    : Number((status.stats && status.stats.count) || 0);
+  const folderSize = here ? humanSize(here.size) : "";
   const shown = S.items.length;
-  const countText = S.tab === "files" && !S.q && !S.filterLabel
-    ? (total ? `${total.toLocaleString()} file${total === 1 ? "" : "s"}` : "")
+  const folders = (S.nav && S.nav.folders) || [];
+  const countText = S.tab === "folders"
+    ? (folders.length ? `${folders.length.toLocaleString()} folder${folders.length === 1 ? "" : "s"}` : "")
+    : S.tab === "files" && !S.q && !S.filterLabel
+    ? [
+        total ? `${total.toLocaleString()} file${total === 1 ? "" : "s"}` : "",
+        folderSize
+      ].filter(Boolean).join(" · ")
     : shown ? `${shown} shown` : "";
   $("topSub").textContent = [vault.title || name || "Telegram File Explorer", countText]
     .filter(Boolean).join(" · ");
@@ -1122,6 +1187,7 @@ async function loadItems({ reset = false } = {}) {
   if (reset) S.cursor = "";
   const key = reset ? itemQuery().toString() : "";
   S.loading = true;
+  let painted = false;
   if (reset) {
     const cached = S.pageCache.get(key);
     if (cached && Date.now() - cached.at < 45000) {
@@ -1129,13 +1195,13 @@ async function loadItems({ reset = false } = {}) {
       S.cursor = cached.cursor;
       S.done = cached.done;
       renderItems();
+      painted = true;
     } else {
       S.items = [];
       S.cursor = "";
       S.done = false;
-      $("content").innerHTML = '<div class="spinner"></div>';
+      renderLoading();
       $("content").scrollTop = 0;
-      renderCrumb();
     }
   }
   try {
@@ -1152,13 +1218,14 @@ async function loadItems({ reset = false } = {}) {
         && cached.items.length === items.length
         && cached.items.every((entry, index) => entry.id === items[index].id));
       S.items = items;
+      S.total = Number(data.total) || 0;
       S.cursor = nextCursor;
       S.done = done;
       S.pageCache.set(key, { items: items.slice(), cursor: nextCursor, done, at: Date.now() });
       if (S.pageCache.size > 24) {
         S.pageCache.delete(S.pageCache.keys().next().value);
       }
-      if (!same) {
+      if (!same || !painted) {
         const top = $("content").scrollTop;
         renderItems();
         $("content").scrollTop = top;
@@ -1189,6 +1256,28 @@ async function loadItems({ reset = false } = {}) {
   }
 }
 
+/* While a folder is still fetching, show its subfolders straight from the nav
+   snapshot so the structure is on screen even if the file list is slow. */
+function renderLoading() {
+  if (S.tab === "folders" || S.tab === "more") return;
+  renderCrumb();
+  renderChips();
+  const content = $("content");
+  content.innerHTML = "";
+  S.listEl = null;
+  S.moreEl = null;
+  S.rendered = 0;
+  if (S.tab === "files" && !S.q && !S.filterLabel) {
+    const panel = folderPanel();
+    if (panel) content.append(panel);
+  }
+  const wait = document.createElement("div");
+  wait.className = "loading-wait";
+  wait.innerHTML = `<div class="spinner"></div><span>Loading files…</span>`;
+  content.append(wait);
+  updateChrome();
+}
+
 function renderItems() {
   if (S.tab === "folders" || S.tab === "more") return;
   renderCrumb();
@@ -1208,10 +1297,12 @@ function renderItems() {
     const title = S.tab === "folders" ? "No folders yet"
       : S.tab === "favorites" ? "No favorites yet"
       : S.q ? "No matches"
+      : S.folder ? "No files in this folder"
       : "Library is empty";
     const text = S.tab === "favorites"
       ? "Star files in the desktop app and they appear here."
       : S.q ? "Try a different word."
+      : S.folder ? "Open a subfolder above, or sync to bring in new files."
       : "Sync with Telegram to bring your channel into this app.";
     empty.innerHTML = `${svg(S.tab === "folders" ? "folder" : "files")}<strong></strong><p></p>`;
     empty.querySelector("strong").textContent = title;
@@ -1291,8 +1382,9 @@ function folderPanel() {
       `<span class="fold-ico">${svg("folder")}</span>` +
       `<span class="fold-copy"><strong></strong><small></small></span>`;
     card.querySelector("strong").textContent = folder.name || folder.folder;
+    const total = Number(folder.n) || 0;
     card.querySelector("small").textContent =
-      `${folder.direct_n || folder.n || 0} file${(folder.direct_n || folder.n) === 1 ? "" : "s"}`;
+      total ? `${total} file${total === 1 ? "" : "s"}` : "Empty";
     card.addEventListener("click", () => openFolder(folder.folder));
     cards.append(card);
   }
